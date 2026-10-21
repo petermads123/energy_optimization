@@ -320,7 +320,12 @@ def plan_sessions(
         timezone: IANA name; only sets the zone of `PlannedQuarter.start`.
 
     Returns:
-        Each session's plan, keyed by charger id.
+        Each session's plan, keyed by charger id. A request whose `max_current` is 0
+        plans nothing and is unreachable.
+
+    Raises:
+        ValueError: If `now` or a deadline is naive.
+        ZoneInfoNotFoundError: If `timezone` is not a known zone.
     """
     zone = ZoneInfo(timezone)
     horizons = {
@@ -337,7 +342,13 @@ def plan_sessions(
         per_quarter = energy_per_quarter_kwh(
             request.max_current, len(request.phases), voltage
         )
-        needed = math.ceil(request.need_kwh / per_quarter - _EPS)
+        # A request that cannot draw anything (a user limit of 0) can never be
+        # served: it is the least slack there is, and plans nothing.
+        needed = (
+            math.ceil(request.need_kwh / per_quarter - _EPS)
+            if per_quarter > 0
+            else math.inf
+        )
         slack = len(horizons[request.charger_id]) - max(needed, 0)
         return slack, request.deadline.astimezone(UTC), request.charger_id
 

@@ -146,6 +146,8 @@ def _classify(
     item.deadline = next_occurrence(
         session.ready_time, session.plugged_in_at or ctx.now, ctx.settings.timezone
     )
+    if item.need <= _EPS:
+        item.need = 0.0  # float residue from summed deliveries is no need at all
     if item.group is _Group.RESERVED:
         return item
     if not session.smart_charging:
@@ -296,7 +298,9 @@ def _expected_finish(item: _Item, ctx: _Context) -> datetime | None:
 def _capped_by(item: _Item, ctx: _Context, raw: dict[Phase, float]) -> str | None:
     """Say what holds an allocated charger below its own maximum, if anything."""
     top = _top_current(item.charger)
-    if item.allocation <= 0 or item.allocation >= top - _EPS:
+    if item.group is _Group.RESERVED or item.allocation <= 0:
+        return None
+    if item.allocation >= top - _EPS:
         return None
     if item.allocation >= item.eff_max - _EPS:
         limit = item.session.user_current_limit if item.session else None

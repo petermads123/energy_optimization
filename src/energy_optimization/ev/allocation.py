@@ -145,7 +145,10 @@ def present_draw(charger: Charger, state: ChargerState, voltage: float) -> float
 
     Used for the phase-guard calculation. The smaller of setting and measured draw
     is taken, so a car drawing less than it is set to does not inflate the free
-    current.
+    current. A fixed or unavailable charger counts at the draw that is already inside
+    the phase measurement (its measured draw, else its reservation); the rest of its
+    reservation is left to the caller to hold back, so a reserved charger that is not
+    drawing its level yet still shrinks what the others may take.
 
     Args:
         charger: The charger.
@@ -153,12 +156,14 @@ def present_draw(charger: Charger, state: ChargerState, voltage: float) -> float
         voltage: Phase voltage in V.
 
     Returns:
-        The draw in A: the reserved current for a fixed or unavailable charger, 0
-        for a paused charger or one without a car, else the smaller of its nominal
-        current and its measured draw.
+        The draw in A: for a fixed or unavailable charger its measured draw, else
+        its reserved current; 0 for a paused charger or one without a car, else the
+        smaller of its nominal current and its measured draw.
     """
     if charger.kind is ChargerKind.FIXED or not state.available:
-        return reserved_current(charger, state, voltage)
+        if state.measured_power_w is None:
+            return reserved_current(charger, state, voltage)
+        return _measured_per_phase(state, len(charger.phases), voltage)
     if state.paused or not state.car_connected:
         return 0.0
     if charger.kind is ChargerKind.ADJUSTABLE:

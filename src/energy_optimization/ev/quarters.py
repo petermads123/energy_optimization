@@ -31,14 +31,23 @@ def floor_to_quarter(moment: datetime) -> datetime:
     return utc.replace(minute=utc.minute - utc.minute % 15, second=0, microsecond=0)
 
 
+def _utc(moment: datetime, name: str) -> datetime:
+    """Return an aware moment in UTC; a naive one would be read in the host's zone."""
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError(f"{name} must be timezone-aware, got {moment.isoformat()}")
+    return moment.astimezone(UTC)
+
+
 def next_occurrence(ready_time: time, after: datetime, timezone: str) -> datetime:
     """Return the first moment after `after` at which the local time is `ready_time`.
 
-    A ready time inside a spring-forward gap is shifted forward by the gap's length;
-    one inside a fall-back fold is the first occurrence.
+    A ready time inside a spring-forward gap is shifted forward by the gap's length.
+    One inside a fall-back fold happens twice; the first occurrence is returned
+    unless `after` already lies at or past it, in which case the second is. The
+    `fold` attribute of `ready_time` is ignored.
 
     Args:
-        ready_time: A naive local time of day.
+        ready_time: A local time of day; its `fold` is ignored.
         after: An aware datetime; the result is strictly later.
         timezone: IANA name of the zone `ready_time` is local to.
 
@@ -47,16 +56,27 @@ def next_occurrence(ready_time: time, after: datetime, timezone: str) -> datetim
 
     Raises:
         ValueError: If `after` is naive.
+        ZoneInfoNotFoundError: If `timezone` is not a known zone.
     """
-    if after.tzinfo is None or after.utcoffset() is None:
-        raise ValueError(f"after must be timezone-aware, got {after.isoformat()}")
+    after_utc = _utc(after, "after")
     zone = ZoneInfo(timezone)
-    after_utc = after.astimezone(UTC)
+    wall = ready_time.replace(tzinfo=None, fold=0)
     day = after_utc.astimezone(zone).date()
     while True:
-        candidate = datetime.combine(day, ready_time, tzinfo=zone).astimezone(UTC)
-        if candidate > after_utc:
-            return candidate
+        naive = datetime.combine(day, wall)
+        first = naive.replace(tzinfo=zone)
+        candidates = [first.astimezone(UTC)]
+        second = first.replace(fold=1).astimezone(UTC)
+        # In a fold both readings are real; in a gap the fold=1 reading lands before
+        # the gap, where the wall clock shows a different time.
+        if (
+            second != candidates[0]
+            and second.astimezone(zone).replace(tzinfo=None) == naive
+        ):
+            candidates.append(second)
+        for candidate in candidates:
+            if candidate > after_utc:
+                return candidate
         day += timedelta(days=1)
 
 
@@ -70,11 +90,15 @@ def quarter_starts(start: datetime, end: datetime) -> list[datetime]:
     Returns:
         UTC quarter starts from the quarter containing `start` while before `end`;
         empty when `end <= start`.
+
+    Raises:
+        ValueError: If `start` or `end` is naive.
     """
-    if end.astimezone(UTC) <= start.astimezone(UTC):
+    start_utc = _utc(start, "start")
+    end_utc = _utc(end, "end")
+    if end_utc <= start_utc:
         return []
-    current = floor_to_quarter(start)
-    end_utc = end.astimezone(UTC)
+    current = floor_to_quarter(start_utc)
     starts: list[datetime] = []
     while current < end_utc:
         starts.append(current)
@@ -112,8 +136,11 @@ def prices_fresh(series: PriceSeries, now: datetime, max_age: timedelta) -> bool
     Returns:
         `abs(now - series.updated_at) <= max_age`; a timestamp far in the future is
         as untrustworthy as one far in the past.
+
+    Raises:
+        ValueError: If `now` is naive.
     """
-    return abs(now.astimezone(UTC) - series.updated_at.astimezone(UTC)) <= max_age
+    return abs(_utc(now, "now") - series.updated_at.astimezone(UTC)) <= max_age
 
 
 def main() -> None:

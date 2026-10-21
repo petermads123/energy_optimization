@@ -69,9 +69,15 @@ def _num(value: object, path: str) -> float:
     """Convert a JSON number to a finite float."""
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ConfigError(path, f"must be a number, got {value!r}")
-    if not math.isfinite(value):
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ConfigError(
+            path, "must be finite, got an integer too large for a float"
+        ) from None
+    if not math.isfinite(number):
         raise ConfigError(path, f"must be finite, got {value!r}")
-    return float(value)
+    return number
 
 
 def _int(value: object, path: str) -> int:
@@ -121,7 +127,11 @@ def _time(value: object, path: str) -> time:
 
 def _seconds(value: object, path: str) -> timedelta:
     """Convert a number of seconds to a timedelta."""
-    return timedelta(seconds=_num(value, path))
+    seconds = _num(value, path)
+    try:
+        return timedelta(seconds=seconds)
+    except OverflowError:
+        raise ConfigError(path, f"too large for a duration, got {value!r}") from None
 
 
 def _list(value: object, path: str) -> list[object]:
@@ -493,8 +503,11 @@ def snapshot_from_dict(data: Mapping[str, object]) -> Snapshot:
     """Build a snapshot from a plain dict.
 
     Args:
-        data: A dict as produced by `snapshot_to_dict`. Optional fields may be
-            omitted or null.
+        data: A dict as produced by `snapshot_to_dict`. A field typed `| None` may
+            be omitted or null. A field with a default (`available`, `delivered_kwh`,
+            `charge_now`, `smart_charging`, `voltage` and the other settings) may be
+            omitted to take it, but not null: a null there is rejected rather than
+            guessed.
 
     Returns:
         The snapshot.

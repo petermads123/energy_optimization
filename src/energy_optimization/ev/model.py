@@ -57,7 +57,12 @@ def _number(field: str, value: object, ctx: str = "") -> float:
     """Return `value` as a finite float; reject bools, non-numbers, NaN and inf."""
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise _fail(field, f"must be a number, got {value!r}", ctx)
-    result = float(value)
+    try:
+        result = float(value)
+    except OverflowError:
+        raise _fail(
+            field, "must be finite, got an integer too large for a float", ctx
+        ) from None
     if not math.isfinite(result):
         raise _fail(field, f"must be finite, got {value!r}", ctx)
     return result
@@ -113,7 +118,8 @@ class Charger:
 
     Attributes:
         id: Non-empty identifier.
-        phases: The phases it is wired to; it is counted on each.
+        phases: The phases it is wired to; it is counted on each. Non-empty,
+            every member a `Phase`, none listed twice.
         kind: What it can do.
         min_current: Lowest non-zero current in A (adjustable).
         max_current: Highest current in A (adjustable).
@@ -135,12 +141,16 @@ class Charger:
         ctx = f"charger {self.id!r}: "
         if isinstance(self.phases, str) or not isinstance(self.phases, Iterable):
             raise _fail("phases", f"must be a set of phases, got {self.phases!r}", ctx)
-        phases = frozenset(self.phases)
-        if not phases:
+        listed = list(self.phases)
+        if not listed:
             raise _fail("phases", "must not be empty", ctx)
-        for phase in phases:
+        for phase in listed:
             if not isinstance(phase, Phase):
                 raise _fail("phases", f"unknown phase {phase!r}", ctx)
+        phases = frozenset(listed)
+        if len(phases) != len(listed):
+            duplicate = next(p for p in listed if listed.count(p) > 1)
+            raise _fail("phases", f"duplicate phase {duplicate.value!r}", ctx)
         _set(self, "phases", phases)
         if not isinstance(self.kind, ChargerKind):
             raise _fail("kind", f"unknown kind {self.kind!r}", ctx)
@@ -330,7 +340,7 @@ class PriceInterval:
         """Validate the interval."""
         start = _aware("start", self.start)
         end = _aware("end", self.end)
-        if end <= start:
+        if end.astimezone(UTC) <= start.astimezone(UTC):
             raise _fail(
                 "end", f"must be after start {start.isoformat()}, got {end.isoformat()}"
             )
@@ -358,6 +368,8 @@ class PriceSeries:
 
     def __post_init__(self) -> None:
         """Validate the series."""
+        if isinstance(self.intervals, str) or not isinstance(self.intervals, Iterable):
+            raise _fail("intervals", f"must be a sequence, got {self.intervals!r}")
         intervals = tuple(self.intervals)
         for interval in intervals:
             if not isinstance(interval, PriceInterval):
