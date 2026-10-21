@@ -1,6 +1,6 @@
 # EV charging decision core
 
-<!-- claude-plan step=4 status=active -->
+<!-- claude-plan step=5 status=active -->
 
 | Field | Value |
 |---|---|
@@ -16,7 +16,7 @@
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done |
-| 4 | Verify | `/verify` | in `/build` | pending |
+| 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
@@ -655,12 +655,29 @@ additions or choices inside it, none of which touches an acceptance criterion:
 
 | Check | Result |
 |---|---|
-| `ruff check .` | |
-| `ruff format --check .` | |
-| `mypy` | |
-| Plan completeness | every signature in the Public API table exists as written |
-| `STRUCTURE.md` | in sync |
-| `python -m <package>.<module>` | |
+| `ruff check .` | `All checks passed!` (before and after the step's edits) |
+| `ruff format --check .` | `45 files already formatted` |
+| `mypy` | `Success: no issues found in 17 source files` |
+| `pytest` | `307 passed` (existing hook suites; the `tests/test_ev_*.py` files are step 5) |
+| Plan completeness | every signature in the Public API table exists as written, checked with `inspect` over all seven `ev/` modules (parameter names, defaults, annotations, return types, enum members and values, `ev.__all__`). Missing: none. Deviation: none. Unplanned: `type Params` in `result.py` (justified in section 3) and `ConfigError.message` (recorded in section 3). `codec.Converter` was an unplanned public alias; made private as `_Converter`. |
+| `STRUCTURE.md` | in sync after the auditor's four findings were applied (below); stop gate's `structure_problems`, `stray_test_files`, `missing_init_files` all empty |
+| `python -m energy_optimization.ev.<module>` | `model`, `result`, `quarters`, `planning`, `allocation`, `decide`, `codec` all exit 0 with readable output, plus the expected `RuntimeWarning` from the package re-export |
+
+Structure-auditor findings and what was done:
+
+1. `Reason`/`Event` rows showed `params: Params = {}`; code uses `field(default_factory=dict)`.
+   **Applied:** both rows now say `field(default_factory=dict)`.
+2. `Params` had no row and the `ev/__init__.py` section claimed it re-exports everything in
+   `result`. **Applied:** a `type Params = ...` row in `result.py`'s table; the `__init__`
+   section now says it re-exports every public type in `model` and `result` except `Params`.
+3. `codec.py` public `type Converter[T]` used only by private helpers. **Applied:** renamed to
+   `_Converter` (preferred option), so it stays out of STRUCTURE.md.
+4. `## Growth` stale for `ev/`. **Applied:** one sentence saying `ev/` is the exception for now.
+
+Showcase form: each `main()` runs and prints something a reader can learn from. The function
+under showcase is called on its own line with named inputs in every module; the nested
+constructors that build the larger inputs (`Snapshot` in `decide` and `codec`, `Action` in
+`result`) use inline literals, left as is because they are the input data, not the call.
 
 ---
 
