@@ -1,6 +1,6 @@
 # EV charging core: behaviour over time
 
-<!-- claude-plan step=3 status=active -->
+<!-- claude-plan step=4 status=active -->
 
 | Field | Value |
 |---|---|
@@ -15,7 +15,7 @@
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
-| 3 | Implement | `/implement` | in `/build` | pending |
+| 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | pending |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
@@ -536,6 +536,39 @@ an existing param.
 > Written in step 3. Only deviations from the plan above, each with its reason. "Built as
 > planned" is a complete and good entry. On a fix round, also the reproduction test's red
 > run, pasted here before the fix was written — step 6 cites it.
+
+Built as planned: the Public API table is unchanged. Choices the plan left to the
+implementer, and small additions, each recorded here:
+
+- **Invalid-memory marker (guide 6.1).** `model.py` holds a private module constant
+  `_INVALID_MEMORY` (a `Memory` dated year 1). `snapshot_from_dict` puts it in
+  `Snapshot.memory` when the dict's `"memory"` cannot be decoded; `decide` recognises it
+  by identity and reports `MEMORY_RESET` with reason `"invalid"`.
+- **"Future" timestamps** are checked only on charger entries whose id is in the snapshot
+  (plus the top-level `green_since` and `emergency_at`), so an entry for an unknown
+  charger is ignored entirely, as guide 6.1 says, even when its timestamps are bad.
+- **`regulate` while stopped.** A charger whose `regulated_cap` is 0 (and whose probe has
+  not yet passed) is not re-evaluated even if it is not yet paused: both timers are
+  cleared and the cap is kept, so a pause still on its way cannot restart the cycle.
+- **A charger stopped for under-use is not planned.** An item with `regulated_cap == 0`
+  is left out of `plan_sessions`, so it reserves no planning capacity for others while it
+  waits for the probe; its `priority` is None and its reason code `UNDER_USE`.
+- **Emergency scope.** The emergency step of the lowering pass applies to every acting
+  charger (smart, smart-off, and idle chargers that act), setting the reason code
+  `EMERGENCY` only when it changed something (share or present setting above 0).
+- **`stopped_for_capacity`** is also set when the final code is `MINIMUM_PAUSE` (a held-off
+  charger the caller started by hand and that is stopped again).
+- **Memory `session_start`** stores the call that first saw the car, not `plugged_in_at`;
+  the deadline still uses `plugged_in_at` when the caller gives it.
+- **Codec.** `snapshot_to_dict`/`decision_to_dict` always write `"memory"` (and for a
+  decision `"guard_level"`, `"next_check"`); on decoding these keys are optional.
+  `Settings` decodes the new `reduction` by value and `emergency_threshold` as nullable.
+- **Round-1 test changes (guide 8, Risk 2).** `tests/test_ev_decide.py`: a `warm(now)`
+  helper (saved a minute ago, green for an hour, no charger entries) passed by `snap`; the
+  exact-`Decision` equality in `test_an_empty_installation_decides_nothing` now compares
+  the round-1 fields and checks the memory separately. `tests/test_ev_result.py`: the exact
+  `ReasonCode`, `Status` and `EventKind` member sets gained the new names. No expected value
+  changed; the full suite is green (1142 passed; the plan's 1141 was round 1's count).
 
 ---
 

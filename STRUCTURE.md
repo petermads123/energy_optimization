@@ -68,23 +68,27 @@ it will not install.
 ### Subpackage `src/energy_optimization/ev/`
 
 The smart EV charging decision core: a pure function from one complete snapshot (time,
-prices, chargers, sessions, measured phase currents, settings) to one decision (ordered
-actions, a plan and a reason per charger, available amps, status, events). No I/O, never
-reads the clock, standard library only. Every public type is a frozen dataclass; input
+prices, chargers, sessions, measured phase currents, settings, the previous decision's
+memory) to one decision (ordered actions, a plan and a reason per charger, available amps,
+status, events, the memory for the next call, the phase-guard level, the next check). No
+I/O, never reads the clock, standard library only. Memory missing, malformed, out of date
+or future-dated is a conservative start (nothing increased), never an error. Every public type is a frozen dataclass; input
 types validate themselves on construction and raise `ConfigError` naming the field.
 Wherever output depends on a set of phases, phases are iterated in `Phase` order
 (L1, L2, L3), never in `frozenset` order. Every module is runnable with
 `python -m energy_optimization.ev.<module>` and ends in a `main()` showcase.
 
-Dependency order: `model` and `result` are leaves; `quarters` uses `model`; `planning`
-uses `model`, `quarters`, `result`; `allocation` uses `model`; `decide` uses all of those;
-`codec` uses `model` and `result`.
+Dependency order: `model` is the leaf; `result` uses `model`; `quarters` uses `model`;
+`guard` uses `model`; `regulation` uses `model`; `planning` uses `model`, `quarters`,
+`result`; `allocation` uses `model`; `decide` uses all of those; `codec` uses `model` and
+`result`.
 
 ### `src/energy_optimization/ev/__init__.py`
 
 Re-exports the public API with `__all__`: every public type in `model` and `result` (except
-the `Params` alias, importable from `result`), `decide`, and the four codec functions. The
-helpers in `quarters`, `planning` and `allocation` are importable from their own modules.
+the `Params` alias, importable from `result`), `decide`, and the six codec functions
+(snapshot, decision and memory, each way). The helpers in `quarters`, `planning`,
+`allocation`, `guard` and `regulation` are importable from their own modules.
 
 ### `src/energy_optimization/ev/model.py`
 
@@ -103,9 +107,13 @@ ints.
 | `Session(charger_id: str, ready_time: time, energy_need_kwh: float \| None = None, soc_percent: float \| None = None, target_soc_percent: float \| None = None, battery_capacity_kwh: float \| None = None, delivered_kwh: float = 0.0, charge_now: bool = False, smart_charging: bool = True, user_current_limit: int \| None = None, plugged_in_at: datetime \| None = None)` | The car on one charger; `ready_time` is naive local time. |
 | `PriceInterval(start: datetime, end: datetime, price: float)` | One priced interval on quarter boundaries. |
 | `PriceSeries(intervals: tuple[PriceInterval, ...], updated_at: datetime)` | The price series; intervals must not overlap. |
+| `class Reduction(StrEnum)`: `TO_USE`, `HALVE` | How an under-use cut is computed. |
+| `class GuardLevel(StrEnum)`: `GREEN`, `YELLOW`, `RED`, `EMERGENCY` | The phase guard's level. |
 | `PhaseCurrents(measured_at: datetime, l1: float \| None, l2: float \| None, l3: float \| None)`; `get(self, phase: Phase) -> float \| None` | Measured current per phase for the whole connection. |
-| `Settings(phase_budget: float, phase_threshold: float, fallback_current: int, timezone: str, voltage: float = 230.0, min_block_quarters: int = 2, price_cap: float \| None = None, default_energy_need_kwh: float = 30.0, max_price_age: timedelta = timedelta(minutes=60), max_measurement_age: timedelta = timedelta(seconds=60))` | Installation settings; budget, threshold, fallback and timezone are required. |
-| `Snapshot(now: datetime, settings: Settings, chargers: tuple[Charger, ...], states: tuple[ChargerState, ...], sessions: tuple[Session, ...], prices: PriceSeries, phase_currents: PhaseCurrents \| None = None)` | One call's input; cross-checks ids between chargers, states and sessions. |
+| `ChargerMemory(charger_id: str, session_start: datetime \| None = None, car_connected: bool = False, session_key: str = "", running: bool = False, switched_at: datetime \| None = None, stopped_for_capacity: bool = False, selected: bool = False, regulated_cap: int \| None = None, under_use_since: datetime \| None = None, full_use_since: datetime \| None = None, under_use_stop_at: datetime \| None = None, last_target: float \| None = None, last_action_at: datetime \| None = None, decreased_at: datetime \| None = None)` | What one charger carries between calls; datetimes aware. |
+| `Memory(saved_at: datetime, chargers: tuple[ChargerMemory, ...] = (), level: GuardLevel \| None = None, green_since: datetime \| None = None, emergency_at: datetime \| None = None)`; `charger(self, charger_id: str) -> ChargerMemory \| None` | Everything carried between calls; charger ids unique. |
+| `Settings(phase_budget: float, phase_threshold: float, fallback_current: int, timezone: str, voltage: float = 230.0, min_block_quarters: int = 2, price_cap: float \| None = None, default_energy_need_kwh: float = 30.0, max_price_age: timedelta = timedelta(minutes=60), max_measurement_age: timedelta = timedelta(seconds=60), emergency_threshold: float \| None = None, emergency_calm: timedelta = timedelta(minutes=5), yellow_margin: float = 2.0, green_hold: timedelta = timedelta(seconds=60), deadband: float = 2.0, ramp_step: int = 2, ramp_period: timedelta = timedelta(minutes=5), under_use_period: timedelta = timedelta(minutes=15), reduction: Reduction = Reduction.TO_USE, under_use_margin: float = 1.0, min_pause: timedelta = timedelta(minutes=15), hysteresis: timedelta = timedelta(minutes=30), resume_probe: timedelta = timedelta(minutes=60), min_action_interval: timedelta = timedelta(seconds=30), max_memory_age: timedelta = timedelta(minutes=30))` | Installation settings; budget, threshold, fallback and timezone are required; the rest govern behaviour over time (emergency off when unset). |
+| `Snapshot(now: datetime, settings: Settings, chargers: tuple[Charger, ...], states: tuple[ChargerState, ...], sessions: tuple[Session, ...], prices: PriceSeries, phase_currents: PhaseCurrents \| None = None, memory: Memory \| None = None)` | One call's input; cross-checks ids between chargers, states and sessions (memory entries for unknown chargers are allowed and dropped by `decide`). |
 | `main() -> None` | Showcase: build a snapshot, then trigger a `ConfigError`. |
 
 ### `src/energy_optimization/ev/result.py`
@@ -118,15 +126,15 @@ Output types. No logic beyond `PhaseAmps.get`.
 | `class Stage(StrEnum)`: `DOWN`, `UP` | Which phase of execution an action belongs to. |
 | `class ActionKind(StrEnum)`: `SET_CURRENT`, `PAUSE`, `RESUME` | What to do to a charger. |
 | `Action(charger_id: str, kind: ActionKind, target_current: float, stage: Stage)` | One change with an absolute target. |
-| `class ReasonCode(StrEnum)`: `CHARGE_NOW`, `IN_PLAN`, `READY_TIME_PASSED`, `PLAN_COMPLETED`, `PRICES_STALE`, `PLANNED_LATER`, `WAITING_FOR_HIGHER_PRIORITY`, `WAITING_FOR_CAPACITY`, `TARGET_REACHED`, `BELOW_MINIMUM`, `SMART_CHARGING_OFF`, `FIXED`, `UNAVAILABLE`, `NO_CAR`, `NO_SESSION` | Stable reason codes; values are the lower-case names. |
+| `class ReasonCode(StrEnum)`: `CHARGE_NOW`, `IN_PLAN`, `READY_TIME_PASSED`, `PLAN_COMPLETED`, `PRICES_STALE`, `PLANNED_LATER`, `WAITING_FOR_HIGHER_PRIORITY`, `WAITING_FOR_CAPACITY`, `TARGET_REACHED`, `BELOW_MINIMUM`, `SMART_CHARGING_OFF`, `FIXED`, `UNAVAILABLE`, `NO_CAR`, `NO_SESSION`, `MINIMUM_PAUSE`, `UNDER_USE`, `EMERGENCY` | Stable reason codes; values are the lower-case names. |
 | `Reason(code: ReasonCode, text: str, params: Params = field(default_factory=dict))` | Why a charger got what it got. |
 | `PlannedQuarter(start: datetime, price: float \| None, current: float)` | One planned quarter; `price` None means unpriced. |
 | `ChargerDecision(charger_id: str, allocation: float, priority: int \| None, reason: Reason, plan: tuple[PlannedQuarter, ...] = (), remaining_need_kwh: float \| None = None, deadline: datetime \| None = None, expected_finish: datetime \| None = None, reaches_target: bool \| None = None)` | Everything decided for one charger. |
-| `class Status(StrEnum)`: `NORMAL`, `LIMITED_BY_BUDGET`, `LIMITED_BY_PHASE`, `WAITING_FOR_CAPACITY`, `PHASE_DATA_STALE`, `PRICES_STALE` | Overall status. |
-| `class EventKind(StrEnum)`: `TARGET_UNREACHABLE`, `PRICE_CAP_EXCEEDED`, `CHARGE_NOW_NEED_COVERED`, `PHASE_DATA_STALE`, `PRICES_STALE` | Notification-worthy events. |
+| `class Status(StrEnum)`: `EMERGENCY`, `NORMAL`, `LIMITED_BY_BUDGET`, `LIMITED_BY_PHASE`, `WAITING_FOR_CAPACITY`, `PHASE_DATA_STALE`, `PRICES_STALE` | Overall status. |
+| `class EventKind(StrEnum)`: `TARGET_UNREACHABLE`, `PRICE_CAP_EXCEEDED`, `CHARGE_NOW_NEED_COVERED`, `PHASE_DATA_STALE`, `PRICES_STALE`, `MEMORY_RESET`, `PHASE_GUARD_INTERVENED` | Notification-worthy events. |
 | `Event(kind: EventKind, text: str, charger_id: str \| None = None, params: Params = field(default_factory=dict))` | One event. |
 | `PhaseAmps(l1: float, l2: float, l3: float)`; `get(self, phase: Phase) -> float` | Amps per phase. |
-| `Decision(actions: tuple[Action, ...], chargers: tuple[ChargerDecision, ...], available: PhaseAmps, status: Status, events: tuple[Event, ...])` | One call's answer; `chargers` in snapshot charger order. |
+| `Decision(actions: tuple[Action, ...], chargers: tuple[ChargerDecision, ...], available: PhaseAmps, status: Status, events: tuple[Event, ...], memory: Memory \| None = None, guard_level: GuardLevel \| None = None, next_check: datetime \| None = None)` | One call's answer; `chargers` in snapshot charger order; `decide` always sets `memory`, `guard_level` is None under stale measurements unless an emergency is latched, `next_check` is in the settings timezone. |
 | `main() -> None` | Showcase: build a small decision by hand. |
 
 ### `src/energy_optimization/ev/quarters.py`
@@ -159,6 +167,37 @@ quarters.
 | `plan_sessions(requests: Sequence[PlanRequest], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str) -> dict[str, SessionPlan]` | Plan every request against shared per-phase capacity, most urgent first. |
 | `main() -> None` | Showcase: two cars on a shared phase; a default need. |
 
+### `src/energy_optimization/ev/guard.py`
+
+The phase guard over time. One reading is classified green / yellow / red / emergency;
+the level is then carried across calls through `Memory`: increases need the phases
+continuously green for the green hold, red and emergency count as an intervention, and an
+emergency latches until the calm period has passed (it survives stale data). Under stale
+or missing measurements increases stay allowed, because round 1's fallback cap governs
+them, unless an emergency is latched.
+
+| Signature | Description |
+|---|---|
+| `instant_level(currents: PhaseCurrents, phases: frozenset[Phase], settings: Settings) -> GuardLevel` | Level of one reading over `phases`; a missing value is skipped. |
+| `GuardState(level: GuardLevel \| None, green_since: datetime \| None, emergency_at: datetime \| None, increases_allowed: bool, intervened: bool)` | The guard after one call. |
+| `advance_guard(memory: Memory \| None, instant: GuardLevel \| None, now: datetime, settings: Settings) -> GuardState` | One step of the guard over time. |
+| `main() -> None` | Showcase: a red reading, then green calls until increases are allowed. |
+
+### `src/energy_optimization/ev/regulation.py`
+
+Regulation of one adjustable charger to what its car actually draws: after a whole
+under-use period the charger is cut to its measured draw plus a margin (or halved), a cut
+below the minimum becomes 0, each whole ramp period of full use then raises the cap one
+step, and a charger cut to 0 is offered current again after the resume probe or when the
+session is reset. On/off chargers and chargers without a power reading are never
+regulated.
+
+| Signature | Description |
+|---|---|
+| `Regulation(regulated_cap: int \| None, under_use_since: datetime \| None, full_use_since: datetime \| None, under_use_stop_at: datetime \| None, cut: bool)` | One charger's regulation after one call; cap 0 means stopped for under-use. |
+| `regulate(previous: ChargerMemory \| None, charger: Charger, state: ChargerState, reset: bool, now: datetime, settings: Settings) -> Regulation` | One step of under-use cut, ramp and resume probe. |
+| `main() -> None` | Showcase: a cut, a cut to zero, a steady draw inside the deadband, a ramp step. |
+
 ### `src/energy_optimization/ev/allocation.py`
 
 Phase capacity, draw and reservations, measurement freshness and max-min-fair sharing.
@@ -170,24 +209,28 @@ Phase capacity, draw and reservations, measurement freshness and max-min-fair sh
 | `measurements_fresh(currents: PhaseCurrents \| None, now: datetime, max_age: timedelta, phases: frozenset[Phase]) -> bool` | Measurement present, recent and complete for `phases`. |
 | `present_draw(charger: Charger, state: ChargerState, voltage: float) -> float` | What a charger is taken to draw now on each phase, for the phase guard: 0 when paused or without a car, the smaller of setting and measured draw otherwise; a fixed or unavailable charger counts at its measured draw (its reservation when power is missing), the rest of its reservation being held back by `decide`. |
 | `reserved_current(charger: Charger, state: ChargerState, voltage: float) -> float` | What a fixed or unavailable charger is reserved at on each phase. |
-| `phase_capacity(snapshot: Snapshot, fresh: bool) -> dict[Phase, float]` | Per phase, budget intersected with the phase guard when `fresh`; may be negative. |
+| `phase_capacity(snapshot: Snapshot, fresh: bool, settling: frozenset[str] = frozenset()) -> dict[Phase, float]` | Per phase, budget intersected with the phase guard when `fresh`; may be negative. A charger in `settling` (sent a decrease a moment ago) counts at its measured draw instead of the smaller of setting and measured. |
 | `main() -> None` | Showcase: sharing on mixed phases and on a tight phase. |
 
 ### `src/energy_optimization/ev/decide.py`
 
-The decision core: classification, priority tiers, planning, sharing, actions, reasons,
-status and events.
+The decision core: memory usability, classification, regulation, priority tiers with
+anti-flapping (minimum pause, hysteresis), planning, sharing, the lowering steps
+(emergency, no increases, pacing), actions with in-flight suppression, reasons, status,
+events, the new memory and the next check.
 
 | Signature | Description |
 |---|---|
-| `decide(snapshot: Snapshot) -> Decision` | Decide what every charger should be set to now. |
-| `main() -> None` | Showcase: three chargers and two sessions, then the same snapshot without phase measurements. |
+| `decide(snapshot: Snapshot) -> Decision` | Decide what every charger should be set to now; the decision's `memory` goes into the next snapshot. |
+| `main() -> None` | Showcase: three chargers and two sessions, a follow-up call fed with the memory, then the same snapshot without phase measurements. |
 
 ### `src/energy_optimization/ev/codec.py`
 
 Snapshot and decision to and from plain JSON-compatible dicts. Keys are field names, enums
 go by value, datetimes are ISO 8601 with offset, `time` is `time.isoformat()`, `timedelta`
-is seconds, phase sets are sorted lists. Decoding rejects missing, unknown and wrongly
+is seconds, phase sets are sorted lists. A snapshot's `memory` that cannot be decoded
+does not fail the snapshot: `decide` sees it as invalid and starts conservatively. Inside a
+decision the memory is decoded strictly, like every other field. Decoding rejects missing, unknown and wrongly
 typed fields with a `ConfigError` whose `field` is a dotted path such as
 `chargers[1].max_current`.
 
@@ -197,7 +240,9 @@ typed fields with a `ConfigError` whose `field` is a dotted path such as
 | `snapshot_from_dict(data: Mapping[str, object]) -> Snapshot` | Dict to snapshot; `ConfigError` with a dotted path on bad input. |
 | `decision_to_dict(decision: Decision) -> dict[str, object]` | Decision to a plain dict. |
 | `decision_from_dict(data: Mapping[str, object]) -> Decision` | Dict to decision, same error rules. |
-| `main() -> None` | Showcase: snapshot to JSON and back; a rejected bad field. |
+| `memory_to_dict(memory: Memory) -> dict[str, object]` | Memory to a plain dict. |
+| `memory_from_dict(data: object) -> Memory \| None` | Dict to memory; never raises, anything malformed gives None. |
+| `main() -> None` | Showcase: snapshot to JSON and back; memory to JSON and back; a rejected bad field. |
 
 ## Tests: `tests/`
 
@@ -255,7 +300,9 @@ actions and their order, events, expected finish and `reaches_target`, DST night
 float-residue and `user_current_limit=0` regressions, determinism across hash seeds, the
 standard-library-only AST scan, the 100 ms performance check, and a `hypothesis` property
 (T17) whose invariants are computed independently of the module's helpers; and the `main`
-showcase.
+showcase. Its `snap` helper hands every snapshot a warm memory (saved a minute ago, green
+for an hour, no charger history) so the round-1 scenarios run in steady state instead of
+the conservative start.
 
 ### `tests/test_ev_codec.py`
 

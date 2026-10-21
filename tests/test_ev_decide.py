@@ -27,6 +27,7 @@ from energy_optimization.ev import (
     ChargerState,
     Decision,
     EventKind,
+    Memory,
     Phase,
     PhaseAmps,
     PhaseCurrents,
@@ -122,6 +123,13 @@ def hourly(
     return PriceSeries(intervals, start if updated_at is None else updated_at)
 
 
+def warm(now: datetime) -> Memory:
+    """Memory of a steady state: saved a minute ago, green for an hour, no history."""
+    return Memory(
+        saved_at=now - timedelta(minutes=1), green_since=now - timedelta(hours=1)
+    )
+
+
 def snap(
     chargers: list[Charger],
     states: list[ChargerState] | None = None,
@@ -155,6 +163,7 @@ def snap(
         tuple(sessions or []),
         prices if prices is not None else PriceSeries((), now),
         currents,
+        warm(now),
     )
 
 
@@ -1461,7 +1470,11 @@ def test_an_empty_installation_decides_nothing() -> None:
 
     result = decide(snap([], [], [], currents=currents))
 
-    assert result == Decision((), (), PhaseAmps(22.0, 25.0, 25.0), Status.NORMAL, ())
+    assert replace(result, memory=None, guard_level=None, next_check=None) == Decision(
+        (), (), PhaseAmps(22.0, 25.0, 25.0), Status.NORMAL, ()
+    )
+    assert result.memory is not None
+    assert result.memory.chargers == ()
 
 
 def test_stale_phase_data_outranks_stale_prices_in_the_status() -> None:

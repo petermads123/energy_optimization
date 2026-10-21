@@ -1059,7 +1059,25 @@ def main() -> None:
     for action in decision.actions:
         print(f"action: {action.kind} {action.charger_id} {action.target_current} A")
 
-    # Without phase measurements every charger is capped at the fallback current.
+    # The first call had no memory, so it was a conservative start: nothing was
+    # increased. Feed its memory into the next snapshot and the chargers start.
+    follow_up = timedelta(minutes=5)
+    later = replace(
+        snapshot,
+        now=now + follow_up,
+        phase_currents=PhaseCurrents(now + follow_up, l1=12.0, l2=10.0, l3=4.0),
+        memory=decision.memory,
+    )
+
+    follow_up_decision = decide(later)
+
+    print(f"after {follow_up}: status {follow_up_decision.status}")
+    for charger in follow_up_decision.chargers:
+        print(f"{charger.charger_id}: {charger.allocation} A - {charger.reason.text}")
+    print(f"next check: {follow_up_decision.next_check}")
+
+    # Without phase measurements every charger is capped at the fallback current
+    # (this snapshot carries no memory, so it is a conservative start as well).
     stale = replace(snapshot, phase_currents=None)
 
     decision = decide(stale)

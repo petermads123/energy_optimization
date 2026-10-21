@@ -914,6 +914,23 @@ def main() -> None:
     print(text)
     print(f"round trip equal: {restored == snapshot}")
 
+    # Memory travels the same way; malformed memory decodes to None, never an error.
+    memory = Memory(
+        saved_at=now,
+        chargers=(ChargerMemory("carport", car_connected=True, running=True),),
+        level=GuardLevel.GREEN,  # GREEN, YELLOW, RED, EMERGENCY
+        green_since=now,
+    )
+    memory_text = json.dumps(memory_to_dict(memory))
+    garbage = {"saved_at": "yesterday"}
+
+    restored_memory = memory_from_dict(json.loads(memory_text))
+    rejected_memory = memory_from_dict(garbage)
+
+    print(memory_text)
+    print(f"memory round trip equal: {restored_memory == memory}")
+    print(f"malformed memory decodes to: {rejected_memory}")
+
     # A wrongly typed field is rejected with its dotted path.
     broken = json.loads(text)
     broken["chargers"][0]["max_current"] = "sixteen"
