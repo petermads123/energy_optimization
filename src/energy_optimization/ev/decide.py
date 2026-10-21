@@ -316,11 +316,11 @@ def _holders(items: list[_Item], ctx: _Context) -> tuple[str, ...]:
     is already running. That is the flapping the minimum on-time and the selection
     hysteresis prevent, and they hold in this tier as they do in the ranked ones: a
     charger that started less than the minimum pause ago ranks first, then the
-    ready times in order with a selected charger's taken the hysteresis earlier. A
-    session takes part when it is protected or selected, or when its ready time is
-    more than the hysteresis earlier than that of a selected charger it shares a
-    phase with, since only such a session can take that charger's place. A charger
-    held off by the minimum pause never takes part.
+    deadlines (the next occurrence of the ready time) in order, with a selected
+    charger's taken the hysteresis earlier. A session takes part when it is protected
+    or selected, or when its deadline is more than the hysteresis earlier than that
+    of a selected charger it shares a phase with, since only such a session can take
+    that charger's place. A charger held off by the minimum pause never takes part.
 
     The planner lets each of them keep the current quarter, if its own plan has it
     there, in this order; every later quarter is planned most urgent first.
