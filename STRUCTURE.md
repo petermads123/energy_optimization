@@ -138,10 +138,10 @@ compared directly because that ignores `fold`.
 |---|---|
 | `QUARTER: timedelta` | The planning step, 15 minutes. |
 | `floor_to_quarter(moment: datetime) -> datetime` | Start of the quarter containing an aware moment, in UTC; `ValueError` if naive. |
-| `next_occurrence(ready_time: time, after: datetime, timezone: str) -> datetime` | First moment strictly after `after` at which local time is `ready_time`, in UTC; a gap time shifts forward, a fold time is the first occurrence. |
-| `quarter_starts(start: datetime, end: datetime) -> list[datetime]` | UTC quarter starts from the quarter containing `start` while before `end`. |
+| `next_occurrence(ready_time: time, after: datetime, timezone: str) -> datetime` | First moment strictly after `after` at which local time is `ready_time`, in UTC; a gap time shifts forward, a fold time is the first occurrence unless `after` is already past it (then the second); `ready_time.fold` is ignored; `ValueError` if `after` is naive. |
+| `quarter_starts(start: datetime, end: datetime) -> list[datetime]` | UTC quarter starts from the quarter containing `start` while before `end`; `ValueError` if either is naive. |
 | `quarter_prices(series: PriceSeries) -> dict[datetime, float]` | Every interval split into quarters, keyed by UTC start. |
-| `prices_fresh(series: PriceSeries, now: datetime, max_age: timedelta) -> bool` | `abs(now - updated_at) <= max_age`. |
+| `prices_fresh(series: PriceSeries, now: datetime, max_age: timedelta) -> bool` | `abs(now - updated_at) <= max_age`; `ValueError` if `now` is naive. |
 | `main() -> None` | Showcase: deadlines and quarter counts across the 2026 DST nights. |
 
 ### `src/energy_optimization/ev/planning.py`
@@ -168,7 +168,7 @@ Phase capacity, draw and reservations, measurement freshness and max-min-fair sh
 | `Claim(charger_id: str, phases: frozenset[Phase], min_current: float, max_current: float)` | One charger asking for current; equal min and max means all-or-nothing. |
 | `share(claims: Sequence[Claim], capacity: Mapping[Phase, float]) -> dict[str, float]` | Share capacity among claims given in ranking order: 0/min selection, then max-min-fair 1 A steps. |
 | `measurements_fresh(currents: PhaseCurrents \| None, now: datetime, max_age: timedelta, phases: frozenset[Phase]) -> bool` | Measurement present, recent and complete for `phases`. |
-| `present_draw(charger: Charger, state: ChargerState, voltage: float) -> float` | What a charger is taken to draw now on each phase, for the phase guard. |
+| `present_draw(charger: Charger, state: ChargerState, voltage: float) -> float` | What a charger is taken to draw now on each phase, for the phase guard: 0 when paused or without a car, the smaller of setting and measured draw otherwise; a fixed or unavailable charger counts at its measured draw (its reservation when power is missing), the rest of its reservation being held back by `decide`. |
 | `reserved_current(charger: Charger, state: ChargerState, voltage: float) -> float` | What a fixed or unavailable charger is reserved at on each phase. |
 | `phase_capacity(snapshot: Snapshot, fresh: bool) -> dict[Phase, float]` | Per phase, budget intersected with the phase guard when `fresh`; may be negative. |
 | `main() -> None` | Showcase: sharing on mixed phases and on a tight phase. |
@@ -204,6 +204,65 @@ typed fields with a `ConfigError` whose `field` is a dotted path such as
 All tests live here and nowhere else — `testpaths = ["tests"]` in `pyproject.toml` means
 `pytest` collects nothing outside this directory, and the stop gate blocks on a test file
 found anywhere else.
+
+### `tests/test_ev_model.py`
+
+Covers `src/energy_optimization/ev/model.py` (T1): every invalid case in A1 for every type, direct construction,
+asserting the `ConfigError.field` — a missing budget, threshold or fallback passed as
+`None`, bools and non-finite or huge numbers, fields that do not belong to a kind,
+duplicate phases given as a list, an unloadable timezone, naive timestamps, overlapping or
+misaligned price intervals (judged in UTC, including across the fall-back fold), snapshot
+cross-links — plus the accepted boundaries, normalisation to tuples, ints and floats, and
+the `main` showcase.
+
+### `tests/test_ev_result.py`
+
+Covers `src/energy_optimization/ev/result.py`: the exact enum member sets and lower-case values, `PhaseAmps.get`,
+the defaults and tuple normalisation of the output dataclasses, frozenness, and the `main`
+showcase.
+
+### `tests/test_ev_quarters.py`
+
+Covers `src/energy_optimization/ev/quarters.py` (T11): `floor_to_quarter` in UTC including the fold,
+`next_occurrence` across both 2026 Copenhagen DST nights (gap shifts forward, fold gives the
+first occurrence and then the second, `fold` on the ready time ignored), the 92- and
+100-quarter days, `quarter_starts` and `prices_fresh` compared in UTC with naive input
+refused, `quarter_prices` splitting, and the `main` showcase.
+
+### `tests/test_ev_planning.py`
+
+Covers `src/energy_optimization/ev/planning.py` (T8-T10, T12): `remaining_need_kwh` and `energy_per_quarter_kwh`
+tables, the cheapest-block planner against a brute-force optimum on hand-checked series,
+the finishing rule, the price-cap precedence and boundary, unpriced quarters used last and
+latest first, shared capacity with the least-slack session first, whole-amp flooring, a
+zero `max_current` as unreachable, DST horizons, and a `hypothesis` property over generated
+requests; and the `main` showcase.
+
+### `tests/test_ev_allocation.py`
+
+Covers `src/energy_optimization/ev/allocation.py` (T4, T7, T13, T14): `share` (zero-or-min in ranking order,
+max-min fairness on mixed phases, all-or-nothing claims, tolerance, empty and negative
+capacity, purity), `measurements_fresh` boundaries, `reserved_current`, `present_draw`
+(smaller of setting and measured, paused, no car, fixed at its measured draw) and
+`phase_capacity` (negative values, missing phases, fixed reservations); and the `main`
+showcase.
+
+### `tests/test_ev_decide.py`
+
+Covers `src/energy_optimization/ev/decide.py` (T3, T5-T7, T9, T13-T18, T20): doc scenarios through `decide`, the
+priority tiers and reason codes, reservations and smart charging off, the fallback table,
+actions and their order, events, expected finish and `reaches_target`, DST nights, the
+float-residue and `user_current_limit=0` regressions, determinism across hash seeds, the
+standard-library-only AST scan, the 100 ms performance check, and a `hypothesis` property
+(T17) whose invariants are computed independently of the module's helpers; and the `main`
+showcase.
+
+### `tests/test_ev_codec.py`
+
+Covers `src/energy_optimization/ev/codec.py` (T2, T19): JSON round trips of snapshots and decisions (negative
+prices, odd offsets, `None` measurements, every enum, parameter types kept), plain-type
+output, and rejection of missing, unknown, wrongly typed, huge, null-on-defaulted and
+invalid fields with the exact dotted path; and the `main` showcase.
 
 ### `tests/test_guard_git.py`
 

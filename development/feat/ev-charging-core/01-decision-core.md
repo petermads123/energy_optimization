@@ -1,6 +1,6 @@
 # EV charging decision core
 
-<!-- claude-plan step=5 status=active -->
+<!-- claude-plan step=6 status=active -->
 
 | Field | Value |
 |---|---|
@@ -17,7 +17,7 @@
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | done |
-| 5 | Test | `/test` | in `/build` | pending |
+| 5 | Test | `/test` | in `/build` | done |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
@@ -292,10 +292,10 @@ charger, its id: `ConfigError("max_current", "charger 'carport': must be ≥ min
 |---|---|---|
 | `QUARTER: timedelta = timedelta(minutes=15)` | The planning step | A4 |
 | `floor_to_quarter(moment: datetime) -> datetime` | Start of the quarter containing an aware moment, in UTC; `ValueError` if naive | A4 |
-| `next_occurrence(ready_time: time, after: datetime, timezone: str) -> datetime` | First moment strictly after `after` whose local time in `timezone` is `ready_time`, in UTC. A ready time inside a spring-forward gap is shifted forward by the gap's length, as `astimezone` gives (02:30 on 2026-03-29 in Copenhagen → 03:30 CEST = 01:30 UTC); inside a fall-back fold it is the first occurrence (02:30 on 2026-10-25 → 02:30 CEST = 00:30 UTC). `ValueError` if `after` is naive | A4 |
-| `quarter_starts(start: datetime, end: datetime) -> list[datetime]` | UTC quarter starts from `floor_to_quarter(start)` while `< end`; empty when `end <= start` | A4 |
+| `next_occurrence(ready_time: time, after: datetime, timezone: str) -> datetime` | First moment strictly after `after` whose local time in `timezone` is `ready_time`, in UTC. A ready time inside a spring-forward gap is shifted forward by the gap's length, as `astimezone` gives (02:30 on 2026-03-29 in Copenhagen → 03:30 CEST = 01:30 UTC); inside a fall-back fold it is the first occurrence (02:30 on 2026-10-25 → 02:30 CEST = 00:30 UTC) *unless `after` is already at or past it, when the second occurrence (01:30 UTC) is the first moment strictly after* (step 5). `ready_time.fold` is ignored. `ValueError` if `after` is naive | A4 |
+| `quarter_starts(start: datetime, end: datetime) -> list[datetime]` | UTC quarter starts from `floor_to_quarter(start)` while `< end`; empty when `end <= start`; `ValueError` if either is naive (step 5) | A4 |
 | `quarter_prices(series: PriceSeries) -> dict[datetime, float]` | Every interval split into quarters, keyed by UTC quarter start | A4 |
-| `prices_fresh(series: PriceSeries, now: datetime, max_age: timedelta) -> bool` | `abs(now - series.updated_at) <= max_age` — a timestamp far in the future is as untrustworthy as one far in the past | A5 |
+| `prices_fresh(series: PriceSeries, now: datetime, max_age: timedelta) -> bool` | `abs(now - series.updated_at) <= max_age` — a timestamp far in the future is as untrustworthy as one far in the past; `ValueError` if `now` is naive (step 5) | A5 |
 
 **`ev/planning.py`**
 
@@ -416,7 +416,8 @@ Every module also has `main() -> None`, the showcase the conventions require.
      `current_setting` (adjustable) or `assumed_current` (on/off). If `measured_power_w`
      is known, measured per-phase draw = `measured_power_w / (voltage × len(phases))`, and
      the result is `min(nominal, measured)`; else nominal. For a fixed or unavailable
-     charger `present_draw` returns `reserved_current`. (The doc §13 formula subtracts the
+     charger `present_draw` returns `reserved_current` (changed in step 5: its measured
+     draw when power is known, `reserved_current` otherwise — see section 3). (The doc §13 formula subtracts the
      *setting*; taking the smaller of setting and measured draw estimates the other load
      as at least as large, so the free current is never larger than A3's bound — a car
      drawing less than it is set to no longer inflates the free current.)
@@ -647,6 +648,39 @@ additions or choices inside it, none of which touches an acceptance criterion:
   left to step 5, because the stop gate blocks on a path named in STRUCTURE.md that does
   not exist on disk yet.
 
+### Changed in step 5
+
+Bugs the step-5 tests found, fixed in the code. None changes a public signature or an
+acceptance criterion; the rows below are the behaviour that differs from section 2 or from
+what step 3 built.
+
+- `present_draw` for a fixed or unavailable charger (guide 7): it returned
+  `reserved_current`, `phase_capacity` added it back as "draw" and `decide` subtracted the
+  reservation again, so the reservation cancelled out of the phase-guard term and a fixed
+  charger that was not drawing its level yet could start and push a phase past the
+  threshold. It now returns the charger's *measured* per-phase draw when power is known
+  (the part already inside the phase reading), else `reserved_current`; `decide` holds the
+  full reservation back once. A3's bound is met more tightly, never more loosely.
+- `next_occurrence`: ignores `ready_time.fold` (it moved a gap time an hour backward and
+  chose the second occurrence of a fold time), and returns the second occurrence of a
+  fold-hour ready time when `after` lies between the two (it skipped a whole day). The
+  second is decided by the row's own definition, "first moment strictly after `after`".
+- `quarter_starts` and `prices_fresh` raise `ValueError` for a naive moment instead of
+  reading it in the host's timezone.
+- `plan_sessions`: a request with `max_current == 0` (a `user_current_limit` of 0)
+  divided by zero while ordering by urgency; it now sorts as least slack and plans nothing
+  (guide 8.6).
+- `decide`: a remaining need within 1e-9 kWh is 0 everywhere (it was 0 for the planner but
+  not for the priority rule, so float residue demoted a finished car to priority 4);
+  `capped_by` is never reported for a fixed or unavailable charger.
+- `model`: `PriceInterval` orders `start`/`end` in UTC (it compared wall clocks for a shared
+  `ZoneInfo`); `PriceSeries` rejects a non-sequence `intervals` with `ConfigError`;
+  `Charger` rejects a duplicate phase given as a list (A1); a huge integer is a
+  `ConfigError`, not an `OverflowError`.
+- `codec`: a huge integer or duration is a `ConfigError` naming its path;
+  `snapshot_from_dict` documents that a field that only has a default may be omitted but
+  not null.
+
 ---
 
 ## 4. Verification log
@@ -687,10 +721,85 @@ constructors that build the larger inputs (`Snapshot` in `decide` and `codec`, `
 
 | Intent | Test names | Result |
 |---|---|---|
+| T1 | `test_ev_model.py`: `test_adjustable_charger_rejects_invalid_configuration`, `test_single_level_charger_rejects_invalid_configuration`, `test_charger_state_rejects_invalid_values`, `test_session_rejects_invalid_values`, `test_price_interval_rejects_misaligned_reversed_empty_and_naive_bounds`, `test_price_series_rejects_overlapping_intervals`, `test_settings_require_budget_threshold_fallback_and_timezone`, `test_settings_reject_invalid_values`, `test_snapshot_rejects_bad_links_and_types`, `test_charger_rejects_a_duplicate_phase_given_as_a_list`, the fold and huge-integer tests | pass (206 cases) |
+| T2 | `test_ev_codec.py`: `test_snapshot_from_dict_rejects_a_missing_required_field_with_its_path`, `..._a_wrongly_typed_field_with_its_path`, `..._an_unknown_key_with_its_path`, `..._prefixes_a_model_error_with_the_path`, `..._rejects_duplicate_and_unknown_phases`, `test_decision_from_dict_rejects_bad_fields_with_their_path`, `test_both_decoders_reject_a_non_object_with_the_field_data` | pass |
+| T3 | `test_ev_decide.py`: `test_doc_scenarios_2_to_5_split_equally_and_cut_the_latest_ready_time`, `test_equal_ready_times_rank_the_larger_remaining_need_first`, `test_only_the_highest_occupied_tier_gets_current` | pass |
+| T4 | `test_ev_allocation.py`: the `test_share_*` group (42 cases: zero-or-min order, later claim on another phase, floor and 1 A remainder, max, all-or-nothing, empty / zero / negative capacity, purity) | pass |
+| T5 | `test_ev_decide.py`: the priority group — `test_charge_now_*`, `test_the_current_quarter_in_the_plan_is_priority_two`, `test_a_passed_ready_time_*`, `test_a_covered_need_below_full_charge_is_plan_completed`, `test_a_full_battery_is_target_reached_*`, `test_a_plan_for_later_quarters_is_priority_four_*`, `test_a_tier_is_occupied_only_by_chargers_that_can_run`, `test_a_session_on_a_fixed_charger_is_accepted_and_changes_nothing` | pass |
+| T6 | `test_the_phase_guard_binds_before_the_budget` (doc scenario 7), `test_doc_scenario_12_a_shared_phase_is_held_to_the_budget`, `test_doc_scenario_20_an_on_off_charger_is_all_or_nothing` | pass |
+| T7 | `test_ev_decide.py`: `test_a_fixed_charger_is_reserved_*`, `test_an_unavailable_*`, `test_smart_charging_off_*`; `test_ev_allocation.py`: `test_present_draw_*`, `test_reserved_current_*` | pass |
+| T8 | `test_ev_planning.py`: `test_plan_scenario_14_twenty_kwh_at_eleven_kilowatts_in_eight_hours`, `test_plan_matches_the_hand_checked_cheapest_selection_with_runs_of_two` (brute-force optimum), `test_plan_without_a_cap_never_leaves_a_run_shorter_than_the_block_length`, `test_plan_an_odd_need_extends_a_block_*` | pass |
+| T9 | `test_plan_unreachable_plans_every_usable_quarter`, `test_a_target_that_cannot_be_reached_raises_an_event_with_the_reachable_kwh` | pass |
+| T10 | `test_plan_uses_unpriced_quarters_last_and_latest_first`, `test_plan_supplying_the_missing_prices_changes_the_plan`, `test_plan_a_priced_single_quarter_is_taken_before_an_unpriced_block`, `test_unpriced_quarters_in_the_plan_are_flagged_with_no_price` | pass |
+| T11 | `test_ev_quarters.py`: `test_next_occurrence_returns_the_first_matching_moment_after`, `test_dst_days_give_92_and_100_quarters_between_two_seven_oclocks`, the fold tests; `test_ev_decide.py`: `test_the_dst_nights_reach_planning_with_the_right_number_of_quarters`, `test_the_current_quarter_is_found_in_utc_inside_the_fall_back_hour` | pass |
+| T12 | `test_ev_planning.py`: the cap group (`..._price_equal_to_the_cap_*`, `..._cap_is_not_broken_*`, `..._cap_is_broken_only_for_the_missing_energy`, `..._isolated_quarters_under_the_cap_beat_a_block_over_it`), `test_plan_hourly_intervals_split_*`, the shared-capacity group, `test_plan_unreachable_with_unpriced_quarters_is_flagged` | pass |
+| T13 | `test_ev_decide.py`: `test_without_phase_data_every_controllable_charger_is_capped_at_its_fallback` (10 rows), `test_measurement_age_boundary_*`, the missing-phase group, `test_in_fallback_*`, the stale-price group; `test_ev_allocation.py`: `test_measurements_fresh_*` | pass |
+| T14 | `test_a_paused_charger_with_measured_power_adds_to_the_other_load`, `test_measured_draw_above_the_setting_does_not_raise_the_free_current`, `test_a_charger_without_a_car_counts_as_drawing_nothing`, `test_missing_charger_power_is_taken_as_drawing_the_setting`, `test_a_covered_need_below_full_charge_is_plan_completed` | pass |
+| T15 | `test_every_decrease_and_pause_comes_before_every_increase_and_resume`, `test_the_action_is_chosen_by_comparing_the_target_with_the_present_state`, `test_pause_targets_zero_and_every_target_is_absolute`, `test_executing_the_actions_makes_the_next_decision_a_no_op` | pass |
+| T16 | `test_reasons_carry_the_priority_allocation_and_need_source`, `test_capped_by_is_only_ever_one_of_the_named_limits`, `test_expected_finish_*`, `test_result_datetimes_are_in_the_settings_timezone`, `test_the_available_amps_are_reported_per_phase_after_reservations` | pass |
+| T17 | `test_the_invariants_hold_for_generated_snapshots` (300 generated snapshots, `derandomize=True`; checks computed independently in `assert_invariants`); mutation-checked: dropping the phase guard, the reservation subtraction, the down-before-up order or the fallback cap each turns it red | pass |
+| T18 | `test_the_same_snapshot_gives_equal_decisions`, `test_decide_leaves_the_snapshot_equal_to_a_deep_copy_taken_before`, `test_the_output_does_not_depend_on_the_hash_seed` (three `PYTHONHASHSEED`s in subprocesses), `test_the_package_imports_only_the_standard_library_and_itself` | pass |
+| T19 | `test_ev_codec.py`: `test_snapshot_variants_round_trip_through_json`, `test_hand_built_decision_round_trips_through_json`, `test_a_real_decision_round_trips_through_json`, `test_decision_round_trip_keeps_param_types`, `test_generated_snapshots_survive_the_dict_round_trip_and_decide_the_same` | pass |
+| T20 | `test_ten_chargers_and_a_48_hour_series_decide_in_under_100_ms` (cap below every price, two unreachable sessions, best of five) | pass |
 
-Edge cases considered and deliberately skipped, with reasons:
+Final run: `ruff check .`, `ruff format --check .`, `mypy` clean; `pytest` 1110 passed (803 in
+the seven new `tests/test_ev_*.py` files, 307 existing). The new suite run against the step-4
+source (commit `1fec06b`) fails 41 tests — the red run for the bugs in section 3's "Changed in
+step 5" — and passes all of them on the fixed code.
 
----
+### Reader reports: each finding judged
+
+Four `test-designer` reports (input-space and contract, on model/quarters/codec and on
+planning/allocation/decide) were merged; duplicates dropped, every contradiction decided.
+
+**Applied (bug, settled by section 1 or section 2 — fixed, regression test added)**
+
+| Finding | Settled by | Fix | Tests |
+|---|---|---|---|
+| `user_current_limit=0` raised `ZeroDivisionError` in `plan_sessions` (both reports) | guide 8.6: such a session "plans nothing, so it is unreachable" | a request with `max_current == 0` sorts as least slack and plans nothing | `test_a_user_limit_of_zero_*`, `test_plan_with_zero_max_current_*` |
+| `PriceInterval` compared wall clocks for a shared `ZoneInfo` | guide 5, "never compare … convert to UTC first" | compare `.astimezone(UTC)` | `test_price_interval_*fold*` |
+| `next_occurrence` inherited `ready_time.fold` | the row: gap shifts forward, fold is the first occurrence | candidate built from the fold-0 wall time | `test_next_occurrence_ignores_the_fold_attribute_*` |
+| `next_occurrence` with `after` between the two fold occurrences skipped a day | the row's definition, "first moment strictly after `after` whose local time is `ready_time`", and A4's "next occurrence" | the second occurrence is returned once the first is at or before `after` | `test_next_occurrence_in_the_fold_goes_to_the_second_occurrence_*` |
+| `OverflowError` instead of `ConfigError` for huge ints and durations | A9: wrongly typed or invalid fields are `ConfigError` naming the field | caught in `model._number`, `codec._num`, `codec._seconds` | `test_snapshot_from_dict_turns_a_huge_number_into_a_config_error`, model overflow cases |
+| `PriceSeries(intervals=None)` raised `TypeError` | A1/T1: `ConfigError` naming the field | iterable check | `test_price_series_rejects_a_non_sequence_of_intervals` |
+| Duplicate phases accepted on direct construction | A1 ("unknown or duplicate phases"), T1 ("for direct construction") | `Charger` rejects a duplicate in a list | `test_charger_rejects_a_duplicate_phase_*` |
+| Float residue of the need not treated as 0 | A2: need 0 → priority 3 plan completed | `_classify` snaps `need <= 1e-9` to 0 | `test_a_float_residue_*` |
+| `capped_by` reported for an unavailable charger | guide 8.12: only for an allocated charger below its own max | `_capped_by` is `None` for reserved chargers | `test_a_reserved_charger_is_never_capped_by_a_limit` |
+| A fixed charger's reservation cancelled out of the phase-guard term | section 1: "reserved first, on their phases"; "safety always wins" | see section 3, "Changed in step 5" | `test_phase_capacity_does_not_credit_a_fixed_charger_*`, `test_a_fixed_charger_that_is_not_drawing_its_level_*`, `test_a_fixed_charger_drawing_its_level_is_held_back_once_not_twice` |
+| `quarter_starts` / `prices_fresh` read a naive moment in the host timezone | A8: deterministic output | `ValueError` for a naive input, like the other two functions | `test_quarter_starts_rejects_a_naive_moment_*`, `test_prices_fresh_rejects_a_naive_now` |
+| `next_occurrence`, `plan_sessions` lacked `Raises` entries (unknown zone, naive input) | conventions | docstrings completed; behaviour pinned | `test_next_occurrence_raises_for_an_unknown_zone` |
+
+**Rebutted or pinned as built (a decision, with the reason)**
+
+| Finding | Decision | Why |
+|---|---|---|
+| A partly used quarter (the one holding `now`, or the last one before an off-grid ready time) is credited as a whole quarter of energy; `reaches_target` can then read False for a car that finishes just in time | pinned as built, untested as a requirement | The plan chose whole-quarter granularity on purpose and says so three times: guide 6.1 (horizon = `quarter_starts`), 6.4 (energy per quarter), 8.9 ("the end of the first quarter"), and A4's own formula counts whole quarters. Every call re-plans, so the first quarter corrects itself; ready times are on the 15-minute grid in practice. The error is bounded by one quarter and, for `reaches_target`, in the conservative direction. Noted for step 8 |
+| `null` for a field that only has a default (`available`, `delivered_kwh`, `charge_now`, `smart_charging`, `voltage`, …; `plan: null`) is rejected | pinned (tests added) and the docstring fixed | A1: "an error naming the offending field, never a best guess". Reading a null `available` as available, or a null `voltage` as 230, is a guess. Omitting the key takes the default; `| None` fields take null or omitted alike |
+| An on/off charger's `present_draw` is the smaller of assumed and measured power (section 1 says "accounted at the assumed value") | pinned | The allocation and budget are accounted at the assumed value; only the phase-guard "other load" uses the reading, and a smaller draw makes the other load larger and the capacity smaller. The direction is conservative (plan critic finding 5) |
+| `_plan_requests` applies the user limit to an on/off charger (guide 8.6 says `assumed_current` for both) | pinned | A limit below the assumed current means the charger cannot run, which is the guide's own "a limit below the minimum plans nothing" sentence applied to min = assumed; the other reading plans a charger that can never run |
+| `PRICE_CAP_EXCEEDED` also fires for an unreachable plan | pinned | Guide 6.6: the flag is set "in the unreachable case of step 5 too" |
+| `share` skips a higher-ranked claim whose minimum does not fit and admits a lower-ranked one | pinned (`test_share_an_unfit_higher_ranked_claim_does_not_block_a_lower_one`) | Guide 7 pass 1, "include it … if it fits"; the alternative leaves capacity unused |
+| A carless charger with a session reports no need, source or deadline | pinned (`test_a_charger_without_a_car_gets_nothing_and_no_action`) | Section 1: a session exists "when a car is connected"; with no car the session is stale data and is ignored |
+| `capped_by="max"` in guide 8.12 is never produced | pinned (`test_capped_by_is_only_ever_one_of_the_named_limits`) | An allocated charger at its max is not "below its own max"; the value was vacuous |
+| The "(assumed need N kWh)" note appears only for smart sessions, not for smart-charging-off or reserved ones | left as built, untested | The default is *used* only where a plan or priority depends on it; elsewhere the need is only reported |
+| `LIMITED_BY_PHASE` is chosen when any phase of a short charger has a guard below the budget, even if another phase is the binding one | left as built, untested | Low-risk attribution heuristic; the status is informational and section 1 only lists the status names |
+| `ZoneInfo` datetimes inside the fall-back hour are not `==` to the same instant in a fixed offset (PEP 495), so a decoded value is not `==` to the original | pinned (`test_round_trip_keeps_the_instants_of_datetimes_inside_the_fall_back_hour`) | The instant and offset survive, which is all A9 can mean for a string that carries no zone name; the test compares instants and the encoded form |
+
+**Considered and deliberately skipped**
+
+- `plugged_in_at` later than `now` (clock skew) shifts the deadline by a day when the ready
+  time falls in between. Section 1 does not decide it and it is not a plausible input; left
+  unchanged and untested so no assertion buries a guess. For step 8's `DEVELOPMENT.md`.
+- `ConfigError` is not picklable (two-argument `__init__`); nothing in the contract or its
+  callers needs it.
+- A lower-case timezone name (`europe/copenhagen`) loads or not depending on the platform's
+  file system; not reproducible here.
+- NFC / NFD variants of a charger id: different strings by design.
+- Very long strings, idempotency of the validating constructors, and purity of the
+  converters beyond the decoders: no length limit is promised and the dataclasses are frozen.
+- Duplicate ids inside `share` / `plan_sessions`: `decide` cannot produce them.
+- A mutation of tier exclusivity was not caught by the property because the mutant did not
+  change behaviour; the tier rule is pinned by the explicit tier tests instead.
 
 ## 6. Concept check
 
