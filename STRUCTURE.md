@@ -34,6 +34,9 @@ one line per subpackage in this file, and move per-subpackage detail into
 when Claude works in that subpackage. Split rather than delete — there is no length limit
 here, but everything in this file is in context every session.
 
+`ev/` is the exception for now: its tables stay here until a round that may touch `.claude/`
+moves them, because the `structure-auditor` and the stop gate read only this file.
+
 ## Tree
 
 ```
@@ -79,9 +82,9 @@ uses `model`, `quarters`, `result`; `allocation` uses `model`; `decide` uses all
 
 ### `src/energy_optimization/ev/__init__.py`
 
-Re-exports the public API with `__all__`: everything in `model`, `result`, `decide`, and
-the four codec functions. The helpers in `quarters`, `planning` and `allocation` are
-importable from their own modules.
+Re-exports the public API with `__all__`: every public type in `model` and `result` (except
+the `Params` alias, importable from `result`), `decide`, and the four codec functions. The
+helpers in `quarters`, `planning` and `allocation` are importable from their own modules.
 
 ### `src/energy_optimization/ev/model.py`
 
@@ -107,21 +110,21 @@ ints.
 
 ### `src/energy_optimization/ev/result.py`
 
-Output types. No logic beyond `PhaseAmps.get`. `Params` is the alias
-`dict[str, str | float | int | bool]`.
+Output types. No logic beyond `PhaseAmps.get`.
 
 | Signature | Description |
 |---|---|
+| `type Params = dict[str, str \| float \| int \| bool]` | Parameter values carried by `Reason.params` and `Event.params`. |
 | `class Stage(StrEnum)`: `DOWN`, `UP` | Which phase of execution an action belongs to. |
 | `class ActionKind(StrEnum)`: `SET_CURRENT`, `PAUSE`, `RESUME` | What to do to a charger. |
 | `Action(charger_id: str, kind: ActionKind, target_current: float, stage: Stage)` | One change with an absolute target. |
 | `class ReasonCode(StrEnum)`: `CHARGE_NOW`, `IN_PLAN`, `READY_TIME_PASSED`, `PLAN_COMPLETED`, `PRICES_STALE`, `PLANNED_LATER`, `WAITING_FOR_HIGHER_PRIORITY`, `WAITING_FOR_CAPACITY`, `TARGET_REACHED`, `BELOW_MINIMUM`, `SMART_CHARGING_OFF`, `FIXED`, `UNAVAILABLE`, `NO_CAR`, `NO_SESSION` | Stable reason codes; values are the lower-case names. |
-| `Reason(code: ReasonCode, text: str, params: Params = {})` | Why a charger got what it got. |
+| `Reason(code: ReasonCode, text: str, params: Params = field(default_factory=dict))` | Why a charger got what it got. |
 | `PlannedQuarter(start: datetime, price: float \| None, current: float)` | One planned quarter; `price` None means unpriced. |
 | `ChargerDecision(charger_id: str, allocation: float, priority: int \| None, reason: Reason, plan: tuple[PlannedQuarter, ...] = (), remaining_need_kwh: float \| None = None, deadline: datetime \| None = None, expected_finish: datetime \| None = None, reaches_target: bool \| None = None)` | Everything decided for one charger. |
 | `class Status(StrEnum)`: `NORMAL`, `LIMITED_BY_BUDGET`, `LIMITED_BY_PHASE`, `WAITING_FOR_CAPACITY`, `PHASE_DATA_STALE`, `PRICES_STALE` | Overall status. |
 | `class EventKind(StrEnum)`: `TARGET_UNREACHABLE`, `PRICE_CAP_EXCEEDED`, `CHARGE_NOW_NEED_COVERED`, `PHASE_DATA_STALE`, `PRICES_STALE` | Notification-worthy events. |
-| `Event(kind: EventKind, text: str, charger_id: str \| None = None, params: Params = {})` | One event. |
+| `Event(kind: EventKind, text: str, charger_id: str \| None = None, params: Params = field(default_factory=dict))` | One event. |
 | `PhaseAmps(l1: float, l2: float, l3: float)`; `get(self, phase: Phase) -> float` | Amps per phase. |
 | `Decision(actions: tuple[Action, ...], chargers: tuple[ChargerDecision, ...], available: PhaseAmps, status: Status, events: tuple[Event, ...])` | One call's answer; `chargers` in snapshot charger order. |
 | `main() -> None` | Showcase: build a small decision by hand. |

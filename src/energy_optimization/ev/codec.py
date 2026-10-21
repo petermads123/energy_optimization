@@ -43,7 +43,7 @@ from .result import (
     Status,
 )
 
-type Converter[T] = Callable[[object, str], T]
+type _Converter[T] = Callable[[object, str], T]
 
 
 def _join(path: str, key: str) -> str:
@@ -131,7 +131,7 @@ def _list(value: object, path: str) -> list[object]:
     return value
 
 
-def _enum[E: StrEnum](cls: type[E]) -> Converter[E]:
+def _enum[E: StrEnum](cls: type[E]) -> _Converter[E]:
     """Build a converter for the values of an enum."""
 
     def convert(value: object, path: str) -> E:
@@ -190,14 +190,14 @@ class _Reader:
         """Say whether the key is present, even as null."""
         return key in self.data
 
-    def req[T](self, key: str, convert: Converter[T]) -> T:
+    def req[T](self, key: str, convert: _Converter[T]) -> T:
         """Read a required key."""
         path = _join(self.path, key)
         if key not in self.data:
             raise ConfigError(path, "required")
         return convert(self.data[key], path)
 
-    def opt[T](self, key: str, convert: Converter[T]) -> T | None:
+    def opt[T](self, key: str, convert: _Converter[T]) -> T | None:
         """Read an optional key; omitted and null both give None."""
         value = self.data.get(key)
         if value is None:
@@ -205,7 +205,7 @@ class _Reader:
         return convert(value, _join(self.path, key))
 
     def given[T](
-        self, key: str, convert: Converter[T], into: dict[str, object]
+        self, key: str, convert: _Converter[T], into: dict[str, object]
     ) -> None:
         """Copy a key into `into` when present, leaving a default alone otherwise."""
         if key in self.data:
@@ -360,7 +360,7 @@ def _currents_from(data: object, path: str) -> PhaseCurrents:
     )
 
 
-_SETTINGS_FIELDS: dict[str, Converter[object]] = {
+_SETTINGS_FIELDS: dict[str, _Converter[object]] = {
     "voltage": _num,
     "min_block_quarters": _int,
     "price_cap": _num,
