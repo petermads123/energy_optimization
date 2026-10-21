@@ -1,0 +1,653 @@
+"""The EV charging decision core: one snapshot in, one decision out.
+
+`decide` recomputes everything on every call. It classifies each charger, assigns
+priority tiers, plans the cheapest quarters, shares the capacity of the shared grid
+connection among the chargers of the highest occupied tier and returns the actions
+that get there in a safe order, with a plain-language reason for each charger.
+"""
+
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, time, timedelta
+from enum import StrEnum
+from zoneinfo import ZoneInfo
+
+from .allocation import (
+    Claim,
+    measurements_fresh,
+    phase_capacity,
+    reserved_current,
+    share,
+)
+from .model import (
+    Charger,
+    ChargerKind,
+    ChargerState,
+    Phase,
+    PhaseCurrents,
+    PriceInterval,
+    PriceSeries,
+    Session,
+    Settings,
+    Snapshot,
+)
+from .planning import (
+    NeedSource,
+    PlanRequest,
+    SessionPlan,
+    energy_per_quarter_kwh,
+    plan_sessions,
+    remaining_need_kwh,
+)
+from .quarters import (
+    QUARTER,
+    floor_to_quarter,
+    next_occurrence,
+    prices_fresh,
+    quarter_prices,
+)
+from .result import (
+    Action,
+    ActionKind,
+    ChargerDecision,
+    Decision,
+    Event,
+    EventKind,
+    Params,
+    PhaseAmps,
+    Reason,
+    ReasonCode,
+    Stage,
+    Status,
+)
+
+_EPS = 1e-9
+_TIERS = (1, 2, 3)
+
+
+class _Group(StrEnum):
+    """How a charger is treated."""
+
+    RESERVED = "reserved"
+    IDLE = "idle"
+    SMART_OFF = "smart_off"
+    SMART = "smart"
+
+
+@dataclass
+class _Item:
+    """Working record for one charger during a call."""
+
+    charger: Charger
+    state: ChargerState
+    session: Session | None
+    group: _Group
+    code: ReasonCode
+    acts: bool = True
+    priority: int | None = None
+    need: float | None = None
+    source: NeedSource | None = None
+    deadline: datetime | None = None
+    eff_max: float = 0.0
+    can_run: bool = False
+    allocation: float = 0.0
+    plan: SessionPlan | None = None
+    final_code: ReasonCode | None = None
+    covered_event: bool = False
+
+
+@dataclass(frozen=True)
+class _Context:
+    """Per-call values shared by the steps."""
+
+    now: datetime
+    zone: ZoneInfo
+    settings: Settings
+    prices_ok: bool
+    fallback: bool
+
+
+def _top_current(charger: Charger) -> float:
+    """Return a controllable charger's highest current."""
+    if charger.kind is ChargerKind.ADJUSTABLE:
+        return float(charger.max_current or 0)
+    return float(charger.assumed_current or 0.0)
+
+
+def _low_current(charger: Charger) -> float:
+    """Return a controllable charger's lowest non-zero current."""
+    if charger.kind is ChargerKind.ADJUSTABLE:
+        return float(charger.min_current or 0)
+    return float(charger.assumed_current or 0.0)
+
+
+def _classify(
+    charger: Charger, state: ChargerState, session: Session | None, ctx: _Context
+) -> _Item:
+    """Classify one charger by the first rule that applies."""
+    if not state.available:
+        item = _Item(charger, state, session, _Group.RESERVED, ReasonCode.UNAVAILABLE)
+        item.acts = False
+    elif charger.kind is ChargerKind.FIXED:
+        item = _Item(charger, state, session, _Group.RESERVED, ReasonCode.FIXED)
+        item.acts = False
+    elif not state.car_connected:
+        item = _Item(charger, state, session, _Group.IDLE, ReasonCode.NO_CAR)
+        item.acts = False
+        return item
+    elif session is None:
+        return _Item(charger, state, session, _Group.IDLE, ReasonCode.NO_SESSION)
+    else:
+        item = _Item(charger, state, session, _Group.SMART, ReasonCode.IN_PLAN)
+    if session is None:
+        return item
+    item.need, item.source = remaining_need_kwh(
+        session, ctx.settings.default_energy_need_kwh
+    )
+    item.deadline = next_occurrence(
+        session.ready_time, session.plugged_in_at or ctx.now, ctx.settings.timezone
+    )
+    if item.group is _Group.RESERVED:
+        return item
+    if not session.smart_charging:
+        item.group = _Group.SMART_OFF
+        item.code = ReasonCode.SMART_CHARGING_OFF
+    elif session.soc_percent is not None and session.soc_percent >= 100:
+        item.group = _Group.IDLE
+        item.code = ReasonCode.TARGET_REACHED
+        item.need = 0.0
+    elif session.charge_now:
+        item.priority = 1
+        item.code = ReasonCode.CHARGE_NOW
+        item.covered_event = item.need == 0
+    elif item.need == 0:
+        item.priority = 3
+        item.code = ReasonCode.PLAN_COMPLETED
+    elif not ctx.prices_ok:
+        item.priority = 3
+        item.code = ReasonCode.PRICES_STALE
+    elif item.deadline <= ctx.now.astimezone(UTC):
+        item.priority = 3
+        item.code = ReasonCode.READY_TIME_PASSED
+    return item
+
+
+def _set_limits(item: _Item, ctx: _Context) -> None:
+    """Work out a controllable charger's effective maximum and whether it can run."""
+    charger = item.charger
+    top = _top_current(charger)
+    eff = top
+    if item.session is not None and item.session.user_current_limit is not None:
+        eff = min(eff, float(item.session.user_current_limit))
+    if ctx.fallback:
+        cap = charger.fallback_current
+        eff = min(eff, float(ctx.settings.fallback_current if cap is None else cap))
+    item.eff_max = eff
+    if charger.kind is ChargerKind.ADJUSTABLE:
+        item.can_run = eff >= _low_current(charger)
+    else:
+        item.can_run = eff >= top
+
+
+def _claim(item: _Item) -> Claim:
+    """Build a sharing claim for a charger that can run."""
+    low = _low_current(item.charger)
+    if item.charger.kind is ChargerKind.ADJUSTABLE:
+        return Claim(item.charger.id, item.charger.phases, low, item.eff_max)
+    return Claim(item.charger.id, item.charger.phases, low, low)
+
+
+def _rank_key(item: _Item) -> tuple[datetime, float, str]:
+    """Rank earliest deadline first, then largest remaining need, then id."""
+    deadline = item.deadline or datetime.max.replace(tzinfo=UTC)
+    return deadline, -(item.need or 0.0), item.charger.id
+
+
+def _subtract(cap: dict[Phase, float], phases: frozenset[Phase], amount: float) -> None:
+    """Take current off the capacity of every phase in `phases`."""
+    for phase in phases:
+        cap[phase] -= amount
+
+
+def _clip(cap: dict[Phase, float]) -> dict[Phase, float]:
+    """Return the capacity with negative values raised to 0."""
+    return {phase: max(0.0, value) for phase, value in cap.items()}
+
+
+def _plan_requests(items: list[_Item]) -> list[PlanRequest]:
+    """Build one plan request per session still to be planned."""
+    requests: list[PlanRequest] = []
+    for item in items:
+        if item.session is None or item.deadline is None:
+            continue
+        top = _top_current(item.charger)
+        limit = item.session.user_current_limit
+        if limit is not None:
+            top = min(top, float(limit))
+        requests.append(
+            PlanRequest(
+                item.charger.id,
+                item.charger.phases,
+                _low_current(item.charger),
+                top,
+                item.need or 0.0,
+                item.deadline,
+            )
+        )
+    return requests
+
+
+def _present(item: _Item) -> float:
+    """Return the current a charger is at now, 0 when paused."""
+    if item.state.paused:
+        return 0.0
+    if item.charger.kind is ChargerKind.ADJUSTABLE:
+        return item.state.current_setting
+    return float(item.charger.assumed_current or 0.0)
+
+
+def _actions(items: list[_Item]) -> tuple[Action, ...]:
+    """Build the ordered actions: every decrease and pause before every increase."""
+    down: list[Action] = []
+    up: list[Action] = []
+    for item in items:
+        if not item.acts:
+            continue
+        target = item.allocation
+        present = _present(item)
+        charger_id = item.charger.id
+        if target <= 0:
+            if present > 0:
+                down.append(Action(charger_id, ActionKind.PAUSE, 0.0, Stage.DOWN))
+        elif item.state.paused:
+            up.append(Action(charger_id, ActionKind.RESUME, target, Stage.UP))
+        elif abs(target - present) > _EPS:
+            kind = ActionKind.SET_CURRENT
+            if target < present:
+                down.append(Action(charger_id, kind, target, Stage.DOWN))
+            else:
+                up.append(Action(charger_id, kind, target, Stage.UP))
+    down.sort(key=lambda action: action.charger_id)
+    up.sort(key=lambda action: action.charger_id)
+    return (*down, *up)
+
+
+def _expected_finish(item: _Item, ctx: _Context) -> datetime | None:
+    """Estimate when a session's remaining need will be met."""
+    need = item.need
+    if need is None:
+        return None
+    if need <= _EPS:
+        return ctx.now.astimezone(ctx.zone)
+    voltage = ctx.settings.voltage
+    phase_count = len(item.charger.phases)
+    if item.plan is not None:
+        total = 0.0
+        for quarter in item.plan.quarters:
+            total += energy_per_quarter_kwh(quarter.current, phase_count, voltage)
+            if total >= need - _EPS:
+                return (quarter.start + QUARTER).astimezone(ctx.zone)
+        return None
+    if item.allocation > 0:
+        hours = need * 1000 / (voltage * item.allocation * phase_count)
+        return (ctx.now + timedelta(hours=hours)).astimezone(ctx.zone)
+    return None
+
+
+def _capped_by(item: _Item, ctx: _Context, raw: dict[Phase, float]) -> str | None:
+    """Say what holds an allocated charger below its own maximum, if anything."""
+    top = _top_current(item.charger)
+    if item.allocation <= 0 or item.allocation >= top - _EPS:
+        return None
+    if item.allocation >= item.eff_max - _EPS:
+        limit = item.session.user_current_limit if item.session else None
+        if ctx.fallback and (limit is None or limit >= item.eff_max):
+            return "fallback"
+        return "user_limit"
+    budget = ctx.settings.phase_budget
+    if any(raw[phase] < budget - _EPS for phase in item.charger.phases):
+        return "phase"
+    return "budget"
+
+
+def _sentence(item: _Item, code: ReasonCode, ctx: _Context) -> str:
+    """Write the English sentence for a charger's reason."""
+    prefix = f"Priority {item.priority} — " if item.priority else ""
+    ready = item.session.ready_time.strftime("%H:%M") if item.session else ""
+    texts = {
+        ReasonCode.CHARGE_NOW: "charge now",
+        ReasonCode.IN_PLAN: "the current quarter is in the plan",
+        ReasonCode.READY_TIME_PASSED: (
+            f"ready time {ready} passed, charging on spare capacity"
+        ),
+        ReasonCode.PLAN_COMPLETED: "plan completed, charging on spare capacity",
+        ReasonCode.PRICES_STALE: "prices are stale, charging on spare capacity",
+        ReasonCode.PLANNED_LATER: "charging is planned for later quarters",
+        ReasonCode.WAITING_FOR_HIGHER_PRIORITY: (
+            "waiting for higher-priority chargers"
+        ),
+        ReasonCode.WAITING_FOR_CAPACITY: "waiting for capacity",
+        ReasonCode.BELOW_MINIMUM: (
+            f"cannot run: limit {item.eff_max:g} A is below the minimum "
+            f"{_low_current(item.charger):g} A"
+        ),
+        ReasonCode.SMART_CHARGING_OFF: (
+            f"smart charging off, charging at {item.allocation:g} A"
+            if item.allocation > 0
+            else "smart charging off, no capacity left"
+        ),
+        ReasonCode.FIXED: f"fixed charger, reserved at {item.allocation:g} A",
+        ReasonCode.UNAVAILABLE: f"charger unavailable, reserved at {item.allocation:g} A",
+        ReasonCode.TARGET_REACHED: "target reached, the car cannot take more",
+        ReasonCode.NO_CAR: "no car connected",
+        ReasonCode.NO_SESSION: "car connected but no charging session",
+    }
+    body = texts[code]
+    text = prefix + body if prefix else body[0].upper() + body[1:]
+    if item.group is _Group.SMART and item.source is NeedSource.DEFAULT:
+        text += f" (assumed need {ctx.settings.default_energy_need_kwh:g} kWh)"
+    return text
+
+
+def _reason(item: _Item, ctx: _Context, raw: dict[Phase, float]) -> Reason:
+    """Build a charger's reason: code, parameters and sentence."""
+    code = item.final_code or item.code
+    params: Params = {}
+    if item.priority is not None:
+        params["priority"] = item.priority
+    params["allocation"] = item.allocation
+    if item.source is not None:
+        params["need_source"] = item.source.value
+    if code is ReasonCode.READY_TIME_PASSED and item.session is not None:
+        params["ready_time"] = item.session.ready_time.strftime("%H:%M")
+    capped = _capped_by(item, ctx, raw)
+    if capped is not None:
+        params["capped_by"] = capped
+    return Reason(code, _sentence(item, code, ctx), params)
+
+
+def _events(items: list[_Item], ctx: _Context) -> tuple[Event, ...]:
+    """Collect the notification-worthy events of one call."""
+    events: list[Event] = []
+    cap = ctx.settings.price_cap
+    for item in items:
+        plan = item.plan
+        charger_id = item.charger.id
+        if plan is not None and not plan.reachable:
+            delivered = item.session.delivered_kwh if item.session else 0.0
+            reachable = delivered + plan.planned_kwh
+            target = delivered + (item.need or 0.0)
+            deadline = (item.deadline or ctx.now).astimezone(ctx.zone).isoformat()
+            events.append(
+                Event(
+                    EventKind.TARGET_UNREACHABLE,
+                    f"Charger {charger_id} will not reach its target by {deadline}: "
+                    f"{reachable:.1f} of {target:.1f} kWh",
+                    charger_id,
+                    {
+                        "reachable_kwh": reachable,
+                        "target_kwh": target,
+                        "deadline": deadline,
+                    },
+                )
+            )
+        if plan is not None and plan.price_cap_exceeded:
+            events.append(
+                Event(
+                    EventKind.PRICE_CAP_EXCEEDED,
+                    f"Charger {charger_id} charges above the price cap to meet "
+                    "its ready time",
+                    charger_id,
+                    {"price_cap": cap if cap is not None else 0.0},
+                )
+            )
+        if item.covered_event:
+            events.append(
+                Event(
+                    EventKind.CHARGE_NOW_NEED_COVERED,
+                    f"Charger {charger_id}: the need is covered, reset charge now",
+                    charger_id,
+                )
+            )
+    if ctx.fallback:
+        events.append(
+            Event(
+                EventKind.PHASE_DATA_STALE,
+                "Phase measurements are stale or missing, "
+                "chargers are capped at their fallback current",
+            )
+        )
+    if not ctx.prices_ok:
+        events.append(
+            Event(
+                EventKind.PRICES_STALE, "The price series is stale, nothing is planned"
+            )
+        )
+    return tuple(events)
+
+
+def _status(
+    ctx: _Context,
+    items: list[_Item],
+    active: list[_Item],
+    raw: dict[Phase, float],
+) -> Status:
+    """Pick the overall status: the first that applies."""
+    if ctx.fallback:
+        return Status.PHASE_DATA_STALE
+    if not ctx.prices_ok:
+        return Status.PRICES_STALE
+    if active and all(item.allocation <= 0 for item in active):
+        return Status.WAITING_FOR_CAPACITY
+    served = active + [
+        item for item in items if item.group is _Group.SMART_OFF and item.can_run
+    ]
+    short = [item for item in served if item.allocation < item.eff_max - _EPS]
+    if not short:
+        return Status.NORMAL
+    budget = ctx.settings.phase_budget
+    for item in short:
+        if any(raw[phase] < budget - _EPS for phase in item.charger.phases):
+            return Status.LIMITED_BY_PHASE
+    return Status.LIMITED_BY_BUDGET
+
+
+def decide(snapshot: Snapshot) -> Decision:
+    """Decide what every charger should be set to now.
+
+    Args:
+        snapshot: One complete, validated snapshot of the installation.
+
+    Returns:
+        The ordered actions (every decrease and pause before every increase), a
+        decision with reason per charger in snapshot order, the amps still
+        available per phase, the overall status and the events.
+    """
+    settings = snapshot.settings
+    now = snapshot.now
+    states = {state.charger_id: state for state in snapshot.states}
+    sessions = {session.charger_id: session for session in snapshot.sessions}
+    controllable = frozenset(
+        phase
+        for charger in snapshot.chargers
+        if charger.kind is not ChargerKind.FIXED and states[charger.id].available
+        for phase in charger.phases
+    )
+    fresh = measurements_fresh(
+        snapshot.phase_currents, now, settings.max_measurement_age, controllable
+    )
+    ctx = _Context(
+        now=now,
+        zone=ZoneInfo(settings.timezone),
+        settings=settings,
+        prices_ok=prices_fresh(snapshot.prices, now, settings.max_price_age),
+        fallback=not fresh,
+    )
+    items = [
+        _classify(c, states[c.id], sessions.get(c.id), ctx) for c in snapshot.chargers
+    ]
+    for item in items:
+        if item.group in (_Group.SMART, _Group.SMART_OFF):
+            _set_limits(item, ctx)
+
+    raw = phase_capacity(snapshot, fresh)
+    cap = dict(raw)
+    plan_cap = {phase: settings.phase_budget for phase in Phase}
+    for item in items:
+        if item.group is _Group.RESERVED:
+            item.allocation = reserved_current(
+                item.charger, item.state, settings.voltage
+            )
+            _subtract(cap, item.charger.phases, item.allocation)
+            _subtract(plan_cap, item.charger.phases, item.allocation)
+    cap = _clip(cap)
+    available = PhaseAmps(cap[Phase.L1], cap[Phase.L2], cap[Phase.L3])
+
+    off = sorted(
+        (i for i in items if i.group is _Group.SMART_OFF and i.can_run), key=_rank_key
+    )
+    shares = share([_claim(i) for i in off], cap)
+    for item in off:
+        item.allocation = shares[item.charger.id]
+        _subtract(cap, item.charger.phases, item.allocation)
+        _subtract(plan_cap, item.charger.phases, item.allocation)
+    cap = _clip(cap)
+    plan_cap = _clip(plan_cap)
+
+    to_plan = [i for i in items if i.group is _Group.SMART and i.priority is None]
+    if to_plan:
+        plans = plan_sessions(
+            _plan_requests(to_plan),
+            now,
+            quarter_prices(snapshot.prices),
+            plan_cap,
+            settings.voltage,
+            settings.min_block_quarters,
+            settings.price_cap,
+            settings.timezone,
+        )
+        this_quarter = floor_to_quarter(now)
+        for item in to_plan:
+            item.plan = plans[item.charger.id]
+            in_plan = any(
+                q.start.astimezone(UTC) == this_quarter for q in item.plan.quarters
+            )
+            item.priority = 2 if in_plan else 4
+            item.code = ReasonCode.IN_PLAN if in_plan else ReasonCode.PLANNED_LATER
+
+    smart = [i for i in items if i.group is _Group.SMART]
+    tier = next(
+        (t for t in _TIERS if any(i.priority == t and i.can_run for i in smart)), None
+    )
+    active = sorted(
+        (i for i in smart if tier is not None and i.priority == tier and i.can_run),
+        key=_rank_key,
+    )
+    shares = share([_claim(i) for i in active], cap)
+    for item in active:
+        item.allocation = shares[item.charger.id]
+    for item in smart:
+        if not item.can_run:
+            item.final_code = ReasonCode.BELOW_MINIMUM
+        elif item.priority == 4:
+            item.final_code = ReasonCode.PLANNED_LATER
+        elif item not in active:
+            item.final_code = ReasonCode.WAITING_FOR_HIGHER_PRIORITY
+        elif item.allocation <= 0:
+            item.final_code = ReasonCode.WAITING_FOR_CAPACITY
+    for item in items:
+        if item.group is _Group.SMART_OFF and not item.can_run:
+            item.final_code = ReasonCode.BELOW_MINIMUM
+
+    decisions = tuple(
+        ChargerDecision(
+            charger_id=item.charger.id,
+            allocation=item.allocation,
+            priority=item.priority,
+            reason=_reason(item, ctx, raw),
+            plan=item.plan.quarters if item.plan else (),
+            remaining_need_kwh=item.need,
+            deadline=(item.deadline.astimezone(ctx.zone) if item.deadline else None),
+            expected_finish=_expected_finish(item, ctx),
+            reaches_target=_reaches(item, ctx),
+        )
+        for item in items
+    )
+    return Decision(
+        actions=_actions(items),
+        chargers=decisions,
+        available=available,
+        status=_status(ctx, items, active, raw),
+        events=_events(items, ctx),
+    )
+
+
+def _reaches(item: _Item, ctx: _Context) -> bool | None:
+    """Say whether the need is met by the deadline; None without a session."""
+    if item.session is None or item.deadline is None:
+        return None
+    finish = _expected_finish(item, ctx)
+    now = ctx.now.astimezone(UTC)
+    return finish is not None and item.deadline > now and finish <= item.deadline
+
+
+def main() -> None:
+    """Showcase this module's functionality."""
+    now = datetime(2026, 10, 21, 20, 0, tzinfo=UTC)
+    settings = Settings(
+        phase_budget=25.0,
+        phase_threshold=32.0,
+        fallback_current=6,
+        timezone="Europe/Copenhagen",
+    )
+    chargers = (
+        Charger("carport", frozenset(Phase), ChargerKind.ADJUSTABLE, 6, 16),
+        Charger("garage", frozenset({Phase.L1}), ChargerKind.ADJUSTABLE, 6, 16),
+        Charger("wallbox", frozenset({Phase.L2}), ChargerKind.FIXED, None, None, 8.0),
+    )
+    states = (
+        ChargerState("carport", True, 0, True),
+        ChargerState("garage", True, 0, True),
+        ChargerState("wallbox", True, 8, False),
+    )
+    sessions = (
+        Session("carport", time(7, 0), energy_need_kwh=15.0),
+        Session(
+            "garage",
+            time(7, 0),
+            soc_percent=50,
+            target_soc_percent=80,
+            battery_capacity_kwh=40.0,
+            charge_now=True,
+        ),
+    )
+    hourly_prices = [0.10, 0.11, 0.12, 0.25, 0.30, 0.35, 0.40, 0.28]
+    intervals = tuple(
+        PriceInterval(now + timedelta(hours=h), now + timedelta(hours=h + 1), price)
+        for h, price in enumerate(hourly_prices * 3)
+    )
+    prices = PriceSeries(intervals, updated_at=now)
+    currents = PhaseCurrents(now, l1=12.0, l2=10.0, l3=4.0)
+    snapshot = Snapshot(
+        now, settings, chargers, states, sessions, prices, phase_currents=currents
+    )
+
+    decision = decide(snapshot)
+
+    print(f"status: {decision.status}")
+    for charger in decision.chargers:
+        print(f"{charger.charger_id}: {charger.allocation} A - {charger.reason.text}")
+    for action in decision.actions:
+        print(f"action: {action.kind} {action.charger_id} {action.target_current} A")
+
+    # Without phase measurements every charger is capped at the fallback current.
+    stale = replace(snapshot, phase_currents=None)
+
+    decision = decide(stale)
+
+    print(f"without measurements, status: {decision.status}")
+    for charger in decision.chargers:
+        print(f"{charger.charger_id}: {charger.allocation} A - {charger.reason.text}")
+
+
+if __name__ == "__main__":
+    main()
