@@ -264,6 +264,366 @@ def test_a_planned_charger_held_back_only_by_the_phase_guard_stays_normal() -> N
     assert result.status is Status.NORMAL
 
 
+# --- A2/A6 re-run: a session that can never be planned waits for capacity ---------
+
+
+def starved_l1_base(
+    extra_chargers: list[Charger] | None = None,
+    extra_states: list[ChargerState] | None = None,
+    sessions: list[Session] | None = None,
+    **kwargs: object,
+) -> Snapshot:
+    """A fixed charger on L1 leaves 3 A there, below the 6 A minimum of `a`."""
+    chargers = [fixed("f", L1, 22.0), adj("a", L1), *(extra_chargers or [])]
+    states = [idle("f", 22.0, False), idle("a"), *(extra_states or [])]
+    if sessions is None:
+        sessions = [sess("a", need=10.0)]
+    return snap(chargers, states, sessions, hourly([0.2] * 48), **kwargs)  # type: ignore[arg-type]  # test passes through
+
+
+@pytest.mark.parametrize("served_is_charge_now", [False, True])
+def test_a_starved_charger_beside_a_served_one_limits_the_status(
+    served_is_charge_now: bool,
+) -> None:
+    served = now_session("s", need=10.0) if served_is_charge_now else sess("s")
+    chargers = [fixed("f", L1, 27.0), adj("t", ALL), adj("s", L2)]
+    states = [idle("f", 27.0, False), idle("t"), idle("s")]
+    sessions = [sess("t", need=10.0), served]
+
+    result = decide(
+        snap(chargers, states, sessions, hourly([0.2] * 48), budget=32.0, threshold=60)
+    )
+
+    assert by_id(result)["s"].allocation == 16.0
+    assert by_id(result)["s"].priority == (1 if served_is_charge_now else 2)
+    starved = by_id(result)["t"]
+    assert starved.allocation == 0.0
+    assert starved.priority == 4
+    assert starved.plan == ()
+    assert starved.reason.code is ReasonCode.WAITING_FOR_CAPACITY
+    assert result.available == PhaseAmps(5.0, 32.0, 32.0)
+    assert result.status is Status.LIMITED_BY_BUDGET
+
+
+def test_an_empty_plan_left_by_another_sessions_plan_is_waiting_for_capacity() -> None:
+    sessions = [sess("a", need=40.0), sess("b", need=5.0)]
+
+    result = decide(
+        snap(
+            [adj("a"), adj("b")],
+            sessions=sessions,
+            prices=hourly([0.2] * 12),
+            budget=16.0,
+            threshold=60.0,
+        )
+    )
+
+    served, starved = by_id(result)["a"], by_id(result)["b"]
+    assert (served.priority, served.allocation) == (2, 16.0)
+    assert (starved.priority, starved.allocation) == (4, 0.0)
+    assert starved.plan == ()
+    assert starved.reason.code is ReasonCode.WAITING_FOR_CAPACITY
+    assert starved.reason.text == "Priority 4 — waiting for capacity"
+    assert result.status is Status.LIMITED_BY_BUDGET
+    assert kinds(result).count(EventKind.TARGET_UNREACHABLE) == 2
+
+
+@pytest.mark.parametrize(
+    ("level", "starved"),
+    [(26.0, False), (26.0 + 5e-10, False), (26.5, True), (27.0, True)],
+)
+def test_planning_capacity_is_starved_only_below_the_adjustable_minimum(
+    level: float, starved: bool
+) -> None:
+    chargers = [fixed("f", ALL, level), adj("a", ALL)]
+    states = [idle("f", level, False), idle("a")]
+
+    result = decide(
+        snap(
+            chargers,
+            states,
+            [sess("a", need=10.0)],
+            hourly([0.2] * 48),
+            budget=32.0,
+            threshold=60.0,
+        )
+    )
+
+    decision = by_id(result)["a"]
+    if starved:
+        assert decision.plan == ()
+        assert decision.allocation == 0.0
+        assert decision.reason.code is ReasonCode.WAITING_FOR_CAPACITY
+        assert result.status is Status.WAITING_FOR_CAPACITY
+    else:
+        assert decision.plan
+        assert decision.allocation == 6.0
+        assert decision.reason.code is ReasonCode.IN_PLAN
+        assert result.status is Status.LIMITED_BY_BUDGET
+
+
+@pytest.mark.parametrize(("level", "starved"), [(15.0, False), (15.5, True)])
+def test_planning_capacity_is_starved_below_the_assumed_current_of_an_on_off_charger(
+    level: float, starved: bool
+) -> None:
+    chargers = [fixed("f", L1, level), pump("pump", L1, 10.0)]
+    states = [idle("f", level, False), idle("pump")]
+
+    result = decide(
+        snap(chargers, states, [sess("pump", need=5.0)], hourly([0.2] * 12))
+    )
+
+    decision = by_id(result)["pump"]
+    if starved:
+        assert decision.plan == ()
+        assert decision.allocation == 0.0
+        assert decision.reason.code is ReasonCode.WAITING_FOR_CAPACITY
+        assert result.status is Status.WAITING_FOR_CAPACITY
+    else:
+        assert decision.allocation == 10.0
+        assert decision.reason.code is ReasonCode.IN_PLAN
+        assert result.status is Status.NORMAL
+
+
+def test_an_on_off_charger_starves_while_an_adjustable_on_its_phase_plans() -> None:
+    chargers = [fixed("f", L1, 17.0), pump("pump", L1), adj("a", L1)]
+    states = [idle("f", 17.0, False), idle("pump"), idle("a")]
+    sessions = [sess("pump", need=10.0), sess("a", need=10.0)]
+
+    result = decide(snap(chargers, states, sessions, hourly([0.2] * 12)))
+
+    assert by_id(result)["pump"].reason.code is ReasonCode.WAITING_FOR_CAPACITY
+    assert by_id(result)["pump"].allocation == 0.0
+    assert by_id(result)["a"].priority == 2
+    assert by_id(result)["a"].allocation == 8.0
+    assert result.status is Status.LIMITED_BY_BUDGET
+
+
+@pytest.mark.parametrize(
+    ("phases", "starved"), [(ALL, True), (frozenset({Phase.L2, Phase.L3}), False)]
+)
+def test_one_phase_below_the_minimum_starves_a_multi_phase_charger(
+    phases: frozenset[Phase], starved: bool
+) -> None:
+    chargers = [fixed("f", L1, 22.0), adj("a", phases)]
+    states = [idle("f", 22.0, False), idle("a")]
+
+    result = decide(snap(chargers, states, [sess("a", need=10.0)], hourly([0.2] * 48)))
+
+    decision = by_id(result)["a"]
+    assert (decision.reason.code is ReasonCode.WAITING_FOR_CAPACITY) is starved
+    assert bool(decision.plan) is not starved
+    assert (result.status is Status.WAITING_FOR_CAPACITY) is starved
+
+
+@pytest.mark.parametrize("limit", [10, 11, None])
+def test_smart_charging_off_allocations_can_starve_a_smart_session(
+    limit: int | None,
+) -> None:
+    sessions = [
+        sess("off", need=20.0, smart_charging=False, user_current_limit=limit),
+        sess("p", need=3.0),
+    ]
+
+    result = decide(
+        snap(
+            [adj("off"), adj("p")],
+            sessions=sessions,
+            prices=hourly([0.2] * 12),
+            budget=16.0,
+        )
+    )
+
+    smart = by_id(result)["p"]
+    if limit == 10:
+        assert by_id(result)["off"].allocation == 10.0
+        assert (smart.priority, smart.allocation) == (2, 6.0)
+        assert smart.reason.code is ReasonCode.IN_PLAN
+        assert result.status is Status.LIMITED_BY_BUDGET
+    else:
+        assert by_id(result)["off"].allocation == float(limit or 16)
+        assert (smart.priority, smart.allocation) == (4, 0.0)
+        assert smart.plan == ()
+        assert smart.reason.code is ReasonCode.WAITING_FOR_CAPACITY
+        assert result.status is Status.WAITING_FOR_CAPACITY
+
+
+def test_an_active_tier_at_zero_and_a_starved_charger_wait_for_capacity() -> None:
+    chargers = [fixed("f", L1, 27.0), adj("t", ALL), adj("s", L2)]
+    states = [idle("f", 27.0, False), idle("t"), idle("s")]
+    sessions = [sess("t", need=10.0), sess("s", need=10.0)]
+    currents = PhaseCurrents(NOW, 0.0, 55.0, 0.0)  # the phase guard leaves 5 A on L2
+
+    result = decide(
+        snap(
+            chargers,
+            states,
+            sessions,
+            hourly([0.2] * 48),
+            currents,
+            budget=32.0,
+            threshold=60.0,
+        )
+    )
+
+    assert by_id(result)["s"].priority == 2
+    assert by_id(result)["s"].plan
+    assert by_id(result)["s"].allocation == 0.0
+    assert by_id(result)["s"].reason.code is ReasonCode.WAITING_FOR_CAPACITY
+    assert by_id(result)["t"].reason.code is ReasonCode.WAITING_FOR_CAPACITY
+    assert result.status is Status.WAITING_FOR_CAPACITY
+
+
+def test_a_starved_charger_beside_a_charger_planned_for_later_waits_for_capacity() -> (
+    None
+):
+    chargers = [fixed("f", L1, 27.0), adj("t", ALL), adj("s", L2)]
+    states = [idle("f", 27.0, False), idle("t"), idle("s")]
+    sessions = [sess("t", need=10.0), sess("s", need=2.0)]
+    prices = hourly([0.50] * 2 + [0.10] * 4 + [0.50] * 42)
+
+    result = decide(
+        snap(chargers, states, sessions, prices, budget=32.0, threshold=60.0)
+    )
+
+    assert by_id(result)["s"].priority == 4
+    assert by_id(result)["s"].plan
+    assert by_id(result)["s"].reason.code is ReasonCode.PLANNED_LATER
+    assert by_id(result)["t"].reason.code is ReasonCode.WAITING_FOR_CAPACITY
+    assert result.status is Status.WAITING_FOR_CAPACITY
+
+
+@pytest.mark.parametrize(
+    ("limit", "code", "status"),
+    [
+        (4, ReasonCode.BELOW_MINIMUM, Status.NORMAL),
+        (6, ReasonCode.WAITING_FOR_CAPACITY, Status.WAITING_FOR_CAPACITY),
+    ],
+)
+def test_a_user_limit_below_the_minimum_is_not_reported_as_starved(
+    limit: int, code: ReasonCode, status: Status
+) -> None:
+    session = sess("a", need=10.0, user_current_limit=limit)
+
+    result = decide(starved_l1_base(sessions=[session]))
+
+    decision = by_id(result)["a"]
+    assert decision.reason.code is code
+    assert decision.priority == 4
+    assert decision.allocation == 0.0
+    assert result.status is status
+
+
+@pytest.mark.parametrize(
+    ("fallback", "code"),
+    [(None, ReasonCode.WAITING_FOR_CAPACITY), (4, ReasonCode.BELOW_MINIMUM)],
+)
+def test_stale_phase_data_outranks_a_starved_charger_in_the_status(
+    fallback: int | None, code: ReasonCode
+) -> None:
+    chargers = [fixed("f", L1, 22.0), adj("a", L1, fallback=fallback)]
+    states = [idle("f", 22.0, False), idle("a")]
+
+    result = decide(
+        snap(chargers, states, [sess("a", need=10.0)], hourly([0.2] * 48), None)
+    )
+
+    assert by_id(result)["a"].reason.code is code
+    assert by_id(result)["a"].allocation == 0.0
+    assert result.status is Status.PHASE_DATA_STALE
+    assert EventKind.PHASE_DATA_STALE in kinds(result)
+
+
+def _stale(prices: PriceSeries) -> Snapshot:
+    chargers = [fixed("f", L1, 22.0), adj("a", L1)]
+    states = [idle("f", 22.0, False), idle("a")]
+    return snap(chargers, states, [sess("a", need=10.0)], prices)
+
+
+def test_stale_prices_never_mark_a_session_starved() -> None:
+    stale = PriceSeries((), NOW - timedelta(minutes=61))
+
+    result = decide(_stale(stale))
+
+    decision = by_id(result)["a"]
+    assert decision.priority == 3
+    assert decision.plan == ()
+    assert decision.allocation == 0.0
+    assert decision.reason.code is ReasonCode.WAITING_FOR_CAPACITY
+    assert decision.reason.text == "Priority 3 — waiting for capacity"
+    assert result.status is Status.PRICES_STALE
+    assert EventKind.TARGET_UNREACHABLE not in kinds(result)
+
+
+def test_a_running_starved_charger_is_paused() -> None:
+    chargers = [fixed("f", L1, 22.0), adj("a", L1)]
+    states = [idle("f", 22.0, False), idle("a", 10.0, paused=False)]
+
+    result = decide(snap(chargers, states, [sess("a", need=10.0)], hourly([0.2] * 48)))
+
+    assert result.actions == (Action("a", ActionKind.PAUSE, 0.0, Stage.DOWN),)
+    assert by_id(result)["a"].reason.code is ReasonCode.WAITING_FOR_CAPACITY
+    assert result.status is Status.WAITING_FOR_CAPACITY
+
+
+def test_a_starved_session_reports_what_it_will_reach_and_is_not_on_target() -> None:
+    session = sess("a", need=10.0, delivered_kwh=2.5)
+
+    result = decide(starved_l1_base(sessions=[session], price_cap=0.1))
+
+    decision = by_id(result)["a"]
+    (event,) = result.events
+    assert event.kind is EventKind.TARGET_UNREACHABLE
+    assert event.charger_id == "a"
+    assert event.params["reachable_kwh"] == 2.5
+    assert event.params["target_kwh"] == 10.0
+    assert decision.remaining_need_kwh == 7.5
+    assert decision.expected_finish is None
+    assert decision.reaches_target is False
+
+
+@pytest.mark.parametrize(
+    ("session", "text", "source"),
+    [
+        (sess("a", need=10.0), "Priority 4 — waiting for capacity", "energy"),
+        (
+            sess("a", need=None),
+            "Priority 4 — waiting for capacity (assumed need 30 kWh)",
+            "default",
+        ),
+        (
+            Session(
+                "a",
+                time(7, 0),
+                soc_percent=50.0,
+                target_soc_percent=80.0,
+                battery_capacity_kwh=40.0,
+            ),
+            "Priority 4 — waiting for capacity",
+            "soc",
+        ),
+    ],
+)
+def test_the_starved_reason_has_a_stable_text_and_params(
+    session: Session, text: str, source: str
+) -> None:
+    result = decide(starved_l1_base(sessions=[session]))
+
+    reason = by_id(result)["a"].reason
+    assert reason.text == text
+    assert reason.params == {"priority": 4, "allocation": 0.0, "need_source": source}
+
+
+def test_a_starved_snapshot_is_pure_and_repeatable() -> None:
+    snapshot = starved_l1_base()
+    before = copy.deepcopy(snapshot)
+
+    first = decide(snapshot)
+
+    assert snapshot == before
+    assert decide(snapshot) == first
+
+
 def test_equal_ready_times_rank_the_larger_remaining_need_first() -> None:
     chargers = [adj("small"), adj("big")]
     sessions = [

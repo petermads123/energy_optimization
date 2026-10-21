@@ -444,9 +444,11 @@ def _status(
     waiting = active + [item for item in items if item.starved]
     if waiting and all(item.allocation <= 0 for item in waiting):
         return Status.WAITING_FOR_CAPACITY
-    served = active + [
-        item for item in items if item.group is _Group.SMART_OFF and item.can_run
-    ]
+    served = (
+        active
+        + [item for item in items if item.group is _Group.SMART_OFF and item.can_run]
+        + [item for item in items if item.starved]
+    )
     short = [item for item in served if item.allocation < item.eff_max - _EPS]
     if not short:
         return Status.NORMAL
@@ -539,15 +541,11 @@ def decide(snapshot: Snapshot) -> Decision:
             )
             item.priority = 2 if in_plan else 4
             item.code = ReasonCode.IN_PLAN if in_plan else ReasonCode.PLANNED_LATER
-            # Nothing can ever be planned when the budget left after the
-            # reservations is below the charger's minimum on one of its phases:
-            # that is waiting for capacity, not for cheaper quarters.
-            low = _low_current(item.charger)
-            item.starved = (
-                item.can_run
-                and not item.plan.quarters
-                and any(plan_cap[phase] < low - _EPS for phase in item.charger.phases)
-            )
+            # A session that can run but got no quarter at all is waiting for
+            # capacity, whatever consumed it: the reservations, the smart-charging-off
+            # allocations or another session's plan. Calling it "planned for later"
+            # would be false, since nothing is planned.
+            item.starved = item.can_run and not item.plan.quarters
 
     smart = [i for i in items if i.group is _Group.SMART]
     tier = next(
