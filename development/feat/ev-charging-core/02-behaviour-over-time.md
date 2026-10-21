@@ -1,6 +1,6 @@
 # EV charging core: behaviour over time
 
-<!-- claude-plan step=5 status=active -->
+<!-- claude-plan step=6 status=active -->
 
 | Field | Value |
 |---|---|
@@ -17,7 +17,7 @@
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | done |
-| 5 | Test | `/test` | in `/build` | pending |
+| 5 | Test | `/test` | in `/build` | done |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
@@ -209,7 +209,7 @@ current size.
 | `src/energy_optimization/ev/guard.py` | new | Phase-guard level from one reading, and the level/green/emergency latch over time (A5) |
 | `src/energy_optimization/ev/regulation.py` | new | Under-use cut, ramp back, resume probe for one adjustable charger (A3, A4) |
 | `src/energy_optimization/ev/allocation.py` | changed | `phase_capacity` gains `settling` (A6) |
-| `src/energy_optimization/ev/planning.py` | changed (step 3 re-run) | `plan_sessions` gains `first`: sessions that claim capacity before the rest (A2, round-1 A4) |
+| `src/energy_optimization/ev/planning.py` | changed (step 3 re-run, step 5 re-run) | `plan_sessions` gains `first`: the sessions that keep the current quarter, in the order they contest it; `PlanRequest` gains `skip_current` (A2, round-1 A4) |
 | `src/energy_optimization/ev/decide.py` | changed | Memory usability, anti-flapping, hysteresis, regulation and guard wiring, pacing, next check, new memory (A1–A8) |
 | `src/energy_optimization/ev/codec.py` | changed | Memory in snapshot and decision dicts; `memory_to_dict`, `memory_from_dict` (A1) |
 | `src/energy_optimization/ev/__init__.py` | changed | Re-export the new public names |
@@ -272,7 +272,8 @@ threshold, and 30 minutes is two missed 15-minute calls.
 
 | Signature | Purpose | Covers |
 |---|---|---|
-| `plan_sessions(requests: Sequence[PlanRequest], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str, first: Collection[str] = frozenset()) -> dict[str, SessionPlan]` | As round 1, except the sessions whose charger id is in `first` claim capacity before all the others (each group still most urgent first), so the plans together never book more than `capacity` and a session that must keep its place is planned on the full capacity | A2, round-1 A4 |
+| `plan_sessions(requests: Sequence[PlanRequest], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str, first: Sequence[str] = ()) -> dict[str, SessionPlan]` | As round 1, except the sessions named in `first`, in the order they contest it, keep the quarter containing `now` when their own plan (made alone on what the earlier ones left of it) has it there; everything else, their later quarters included, is planned most urgent first on what remains, so the plans together never book more than `capacity`. A bare string is a `TypeError`. *(Changed at the step 5 re-run: it was `Collection[str]` and claimed every quarter.)* | A2, round-1 A4 |
+| `PlanRequest(..., deadline: datetime, skip_current: bool = False)` | `skip_current` closes the quarter containing `now` to the session (it is held off by the minimum pause), so it neither plans nor books it. *(Added at the step 5 re-run.)* | A2 |
 
 **`ev/codec.py`**
 
@@ -646,7 +647,7 @@ its patching of `item.plan` are removed. In their place:
   first, on the same per-quarter remaining capacity. Calling `plan_sessions` twice with
   "the remaining capacity" was not possible, because the remaining capacity differs per
   quarter and the function takes one capacity constant over the horizon.
-- **`decide._keepers`** names the planned sessions that hold their place: a charger that
+- *(Superseded at the step 5 re-run below: `_keepers` is now `_holders`, and the keepers no longer claim every quarter.)* **`decide._keepers`** names the planned sessions that hold their place: a charger that
   can run and is `protected` (running, started less than `min_pause` ago) always; a
   `was_selected` one unless a contender that can run, shares a phase with it and has a
   deadline earlier than its own minus `hysteresis`. Their ids go to `plan_sessions` as
@@ -686,6 +687,81 @@ test; the two edited parametrizations are among the 1637). The four reproduction
 were red above are green. A scratch fuzz of 1 500 random multi-call sequences on 2-3
 chargers over shared phases checks that no decision's plans book more than the budget per
 phase in any quarter: 49 sequences fail on `21c5acd`, 0 on the fix.
+
+### Changed at step 5, re-run after step 6 (reader reports on `5d96a5d`)
+
+Two test-designer reports (`input-space`, `contract`) on `5d96a5d` converged on two
+defects of the step 3 re-run and three smaller ones. All are fixed in the code and pinned
+by tests; none touches section 1, because A2 and round-1 A4 both hold as written (below).
+
+- **(a) Keepers claimed every quarter, starving a more urgent newcomer (A4 against A2).**
+  Round-1 A4: "the most urgent session (least slack) claims shared capacity first".
+  A2 protects a charger's *place*, which is the quarter being decided now: not dropped
+  within `min_pause`, selection kept within the hysteresis. It asks nothing about later
+  quarters, and every call re-decides the place anyway. So a keeper now claims only the
+  current quarter; everything else, its own later quarters included, goes by least slack.
+  `plan_sessions` does it in a pre-pass (`_holds`): each session in `first`, in order, is
+  planned alone on a copy of the capacity less what the earlier ones hold of the current
+  quarter; if that plan has the current quarter, the session *holds* the current it has
+  there. The holds are then taken off the capacity of that quarter, and every session is
+  planned in the round-1 slack order, a holder planned with its own hold given back and
+  the quarter forced into its plan (`_select(..., forced)`, inside the cheapest
+  minimum-length block that contains it when one is free). The plans together still never
+  book more than `capacity` (R-A4), and a more urgent newcomer plans on everything but the
+  holders' current quarter, so it is no longer reported unreachable for quarters the keeper
+  never needed. The cost is a projection that can say a later quarter is the newcomer's
+  while the keeper, still protected or selected at that call, holds that one too; every
+  call re-decides, and the allocation, which is all that is executed, follows the rules.
+- **(b) Hysteresis was an existence test; the ranked tier is pairwise.** `_keepers` voided
+  a selected charger's retention when *any* phase-sharing contender was more than the
+  hysteresis earlier, after which a contender *inside* the hysteresis could take the place
+  on slack. A2 says the place goes unless "a contender's ready time is more than the
+  hysteresis earlier", and the ranked tiers read it as the contender that takes the place.
+  `decide._holders` (replaces `_keepers`) now returns the contest in the ranked tier's
+  order (`_tier_key`: protected first, then deadline with a selected charger's taken the
+  hysteresis earlier): every protected or selected charger, plus any session whose deadline
+  is more than the hysteresis earlier than that of a selected charger it shares a phase
+  with, since only such a session can take that charger's place. A challenger holds the
+  quarter only if its own plan wants it; a session that does not (its cheap hours are
+  later) leaves the place to the selected charger, and a session inside the hysteresis is
+  not in the contest at all, so what the keeper leaves goes by slack.
+- **(c) A held-off charger booked the current quarter.** In the ranked tiers a charger
+  held off by the minimum pause is left out of the claims; in the planned tier the planner
+  still booked the quarter for it, idling the capacity and possibly marking another
+  charger `displaced`. `_held_off` is now computed before planning for every planned
+  session and passed on as `PlanRequest.skip_current`, so the plan starts with the next
+  quarter and books nothing now. It still occupies its tier when it would have had the
+  quarter (`_plans_now`: planned alone on the same capacity, unchanged from
+  `_mark_displaced`), so the reason stays `MINIMUM_PAUSE` and tier 3 does not run over it;
+  `_mark_displaced` skips held-off chargers; `starved` excludes them.
+- **(d) `first` as a bare string** substring-matched (`"b" in "ab"`). `first` is now
+  `Sequence[str]` (the order is the contest order) and a bare `str` raises `TypeError`
+  naming the value. `decide` passes a tuple.
+- **(e) Docstrings and rows.** `plan_sessions`, `_holders` and the section 2 / `STRUCTURE.md`
+  rows now say what the code does (a keeper keeps the quarter being decided, not "the full
+  capacity"; the comparison is of deadlines, the next occurrence of the ready time). A
+  smart-charging-off squeeze is not another session's claim on the current quarter:
+  `plan_cap` already has it out, so a running charger squeezed to fewer quarters is a
+  capacity stop only when it is starved of all of them (`WAITING_FOR_CAPACITY`) — recorded in
+  `_mark_displaced`'s docstring.
+
+**A2 and round-1 A4 can both hold**, and do: A2 is about who has the current quarter at each
+call; A4 about who claims the shared capacity of the plan. The two split on exactly one
+quarter, the current one, and the fix gives that quarter to the A2 order and the rest to
+A4's. No halt.
+
+Public signature changes (section 2 and `STRUCTURE.md` updated): `plan_sessions(..., first:
+Sequence[str] = ())` (was `Collection[str] = frozenset()`), `PlanRequest(..., skip_current:
+bool = False)`. `decide`'s signature is unchanged.
+
+Test changes: **one** existing test encoded defect (a) and was replaced, with its name and
+reason recorded in its comment: `test_plan_a_session_named_first_claims_before_the_more_urgent_one`
+(pinned "a session named first claims every one of its quarters before the more urgent one")
+became `test_plan_a_session_named_first_keeps_only_the_current_quarter`. The planning test
+helper `plan(..., first=)` takes a sequence instead of a frozenset (the new type); two call
+arguments changed from `frozenset(...)` to a tuple. `tier_two_pair` gained optional settings
+changes. No decide test expectation changed: every round-1 test and every earlier round-2
+test passes as it was written.
 
 ---
 
@@ -887,6 +963,88 @@ Edge cases considered and deliberately skipped, with reasons:
 - A `now` within an offset of `datetime.min`/`max` in the snapshot itself: round 1's domain.
 - Soft start and one-step red reduction: out of scope in section 1.
 - A wall-clock `now` that jumps backwards (negative age): becomes a `"future"` memory; covered by the one-microsecond-in-the-future row.
+
+
+### Re-run after step 6 (R-A2, R-A4): reader reports on `5d96a5d`
+
+The earlier record above is kept. Step 3 was re-run (`8955853`, `5d96a5d`) and step 4
+passed again (`047f434`); this step ran again on that tree, with two new `test-designer`
+reports (saved verbatim at `.../scratchpad/designers3/input-space.md` and `contract.md`).
+This is the first re-run after step 6: R-A2 and R-A4 are both met at the end of it (the
+four reproductions stay green; A2 and round-1 A4 are pinned together by the new tests), so
+no halt. Final run: `ruff check .`, `ruff format --check .`, `mypy` clean (28 source files);
+`pytest`: **1686 passed** (1643 before this entry: 22 new `decide` test functions and 15
+new `planning` ones, one of which replaces an old one; parametrized rows counted).
+
+| Intent | Test names | Result |
+|---|---|---|
+| T4/T5 (A2, planned tier) | `test_a_planned_pair_does_not_flap_over_an_hour_with_memory_fed_forward`, `test_the_minimum_on_time_and_pause_end_exactly_on_their_boundaries_in_the_planned_tier` (22:14:59 / 22:15, 22:29:59 / 22:30), `test_a_zero_minimum_pause_disables_both_planned_tier_rules`, `test_a_huge_hysteresis_in_the_planned_tier_keeps_the_selected_charger`, `test_the_planned_tier_hysteresis_is_strict_at_tiny_values` (4 rows), `test_two_protected_chargers_on_a_shrinking_budget_lose_exactly_one_as_a_capacity_stop`, `test_a_nearer_contender_never_takes_the_place_of_a_selected_charger`, `test_a_charger_still_waiting_on_an_in_flight_resume_holds_its_place` | pass |
+| T5, finding (b): the contender that takes the place | `test_a_contender_that_will_not_take_the_quarter_does_not_free_it_for_a_nearer_one`, `test_the_contender_that_takes_the_place_must_be_the_one_more_than_the_hysteresis_earlier`, `test_a_contender_inside_the_hysteresis_gets_no_priority_for_what_the_keeper_leaves`, `test_a_contender_on_another_phase_neither_moves_the_keeper_nor_waits` | pass |
+| T4, finding (c): held-off claims nothing | `test_a_held_off_planned_charger_does_not_idle_the_capacity_it_cannot_use`, `test_a_running_charger_keeps_the_quarter_a_held_off_one_cannot_use`, `test_a_replugged_planned_charger_is_still_held_off_inside_the_pause`, `test_charge_now_skips_the_pause_a_planned_displacement_started`, `test_a_price_driven_stop_beside_a_contender_is_not_a_capacity_stop` | pass |
+| round-1 A4 / A8, finding (a) | `test_a_protected_charger_does_not_starve_a_more_urgent_newcomer_of_later_quarters`, `test_plans_never_overbook_any_phase_when_the_protected_charger_is_three_phase` (2 rows), `test_the_planned_tier_counts_smart_charging_off_draw_before_a_keeper_plans`, `test_plans_never_book_beyond_the_budget_across_memory_fed_sequences` (property, 250 sequences of 3-7 calls, memory fed forward), and the plan-fit oracle `assert_plans_fit` now inside `assert_invariants` (round-1 snapshots) and `assert_sequence_invariants` (T15): no plan books more than the budget less the fixed, unavailable and smart-off allocations on any phase in any quarter (keyed in UTC), and `reaches_target` implies the plan's energy covers the need | pass |
+| `plan_sessions(first=, skip_current=)` | `test_plan_a_session_named_first_keeps_only_the_current_quarter`, `..._keeps_a_current_quarter_in_a_full_block`, `test_plan_the_sessions_named_first_contest_the_quarter_in_the_order_given` (2 rows), `test_plan_the_order_of_first_beats_urgency_for_the_current_quarter`, `test_plan_a_later_session_named_first_holds_what_the_earlier_ones_left`, `test_plan_a_first_that_holds_nothing_changes_no_plan` (3 rows), `test_plan_a_session_whose_own_plan_skips_the_current_quarter_holds_nothing`, `test_plan_first_names_the_same_session_twice_as_once`, `test_plan_first_given_as_a_bare_string_is_refused_not_read_as_characters`, `test_plan_first_accepts_a_list_and_a_tuple_alike`, `test_plan_first_does_not_mutate_its_arguments`, the three `skip_current` tests, and the property `test_plan_sessions_that_hold_the_current_quarter_never_book_beyond_the_capacity` (150 examples: booking per phase and quarter, `skip_current` never plans the current quarter, result independent of request order) | pass |
+| T15 (100 ms) | `test_ten_running_chargers_at_priority_four_still_decide_in_under_100_ms` (about 12 ms: one extra alone plan per running charger the plan put later) | pass |
+
+Offline, beyond the suite: 20 000 round-1 style snapshots through the plan-fit oracle, and
+7 500 sequences (2 500 each of `random_snapshot`, `friendly_snapshot`, crowded installations)
+through `assert_sequence_invariants`: zero violations. Mutation checks against the new tests
+(each reverted): the old step 3 re-run source fails 5 of the new `decide` tests (starvation,
+both contender cases, the held-off idle capacity, the running charger); ignoring
+`skip_current`, not sorting the contest, no block around the held quarter, not reserving the
+hold, no string guard, and treating every earlier session as a challenger are each caught by
+a named test.
+
+**Reader reports, every case and contradiction.** *Applied* = fixed in code and pinned.
+*Written* = test added, behaviour already right. *Rebutted* = the expectation was wrong.
+
+| # | Finding (reader) | Disposition |
+|---|---|---|
+| I1 | Planned pair over an hour with memory fed forward | **Written** (`..._does_not_flap_over_an_hour_...`) |
+| I2 | Far-earlier contender voids retention, nearer one takes the place | **Applied** (b). Part **rebutted**: with flat prices and a need that wants the quarter, the 07:00 contender legitimately takes `a`'s place (it is more than 30 min earlier); the nearer 08:30 car does not. Both variants are tests |
+| I3 | Two keepers on a shrinking budget | **Written**; the winner is the earlier ready time (`b`, 08:30), as in the ranked tiers, not `a` as the report guessed |
+| I4 | Order inside the first group | **Applied**: the order is now the caller's contest order, not slack (needed by (b)); written as two tests |
+| I5 | Contender on another phase | **Written**; no mutation separates it since another phase never conflicts, the behaviour (keeper stays, the other charges) is pinned |
+| I6 | Hysteresis boundary at 0 and 1 minute | **Written** (4 rows) |
+| I7 | A keeper claiming every quarter leaves a newcomer unreachable | **Rebutted**: that is finding (a) itself. The opposite is pinned (`..._does_not_starve_...`) |
+| I8 | Zero minimum pause in the planned tier | **Written** |
+| I9 | `first` that changes no claim | **Written** (unknown id, empty list, a session whose plan skips the quarter, a repeated id) |
+| I10 | Huge hysteresis in the planned tier | **Written** |
+| I11 | Three-phase keeper, per-phase booking | **Written** (2 rows) |
+| I12 | In-flight resume holds its place while the state reads paused | **Written** |
+| I13 | Smart-off draw shrinks the keeper's planning capacity | **Written** |
+| I14 | `first` as a bare string | **Applied** (d) |
+| I-C1 | `_keepers` existence test against A2 | **Applied** (b), not a halt: A2 is satisfied by the pairwise reading, which is also the ranked tier's |
+| I-C2 | Keepers claim everything against round-1 A4 | **Applied** (a), not a halt: A2 and A4 split on one quarter and both hold |
+| I-C3 | Bare string | **Applied** (d) |
+| I-C4 | "ready time" against deadline wording | **Applied** (e) |
+| C1 | Keeper starves a more urgent newcomer | **Applied** (a) |
+| C2 | Overbooking fuzz as a test | **Written** (property and oracle) |
+| C3 | Bystander contender lets a near newcomer displace | **Applied** (b). The report's cars all want the quarter under flat cheap prices, in which case the far-earlier one does take the place; the test uses prices where it does not |
+| C4 | Two keepers no longer fit | **Written** (as I3) |
+| C5 | Price-driven stop beside a contender | **Written** |
+| C6 | Held-off charger idles capacity | **Applied** (c). Caveat found while writing it: with the default minimum block of two quarters, the newcomer cannot use an isolated current quarter when the held-off charger's own plan takes the next one, so the test sets `min_block_quarters=1`; that is the planner's block rule, not the hold |
+| C7 | `first` that changes no order | **Written** (as I9) |
+| C8 | Hypothesis over the planner | **Written**, without the clause "the first sessions' plans equal their plans alone", which no longer holds by design (only the current quarter is held) |
+| C9 | Order inside the first group | **Applied** (as I4) |
+| C10 | Other phase | **Written** (as I5) |
+| C11 | Pause boundaries 1 s either side | **Written** |
+| C12 | Re-plug inside the pause | **Written** |
+| C13 | Charge now after a displacement | **Written** |
+| C14 | 100 ms with displacement checks | **Written** |
+| C15 | Bare string | **Applied** (d) |
+| C-C1 | Round-1 A4 against the "claims every quarter" choice | **Applied** (a); the section 3 "Choice" of the step 3 re-run is reversed |
+| C-C2 | Hysteresis differs between tiers | **Applied** (b) |
+| C-C3 | A held-off charger occupies the plan | **Applied** (c) |
+| C-C4 | Docstring and row overstate `first` | **Applied** (e) |
+| C-C5 | Smart-off squeeze is not a displacement | **Pinned**: documented in `_mark_displaced`; section 3 |
+
+Edge cases considered and deliberately skipped in this re-run: the `plan_sessions([])`
+case (round 1's, and `decide` never plans an empty set); a `first` naming a session with
+need 0 or a passed deadline through `decide` (those sessions are in the ranked tiers, never
+planned, so never holders; covered at planner level by the "holds nothing" tests); text
+ids (only compared for equality); the `_holders` phase filter, whose removal changes no
+outcome (a contender on another phase never conflicts), kept as a statement of who can
+take a place.
 
 ---
 
