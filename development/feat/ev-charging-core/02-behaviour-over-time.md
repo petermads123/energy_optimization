@@ -1,6 +1,6 @@
 # EV charging core: behaviour over time
 
-<!-- claude-plan step=4 status=active -->
+<!-- claude-plan step=5 status=active -->
 
 | Field | Value |
 |---|---|
@@ -16,7 +16,7 @@
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done |
-| 4 | Verify | `/verify` | in `/build` | pending |
+| 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
@@ -769,6 +769,50 @@ regulation: cap 8 A / cap 0 A (0 means stopped) / cap None / cap 12 A   (guide 5
 decide:     call 1 "held by memory reset"; after 0:05:00 the garage gets 16.0 A; next check 2026-10-21 22:05:30+02:00; stale call falls back
 codec:      snapshot and memory round trips equal: True; malformed memory decodes to: None; rejected: chargers[0].max_current: must be a number, got 'sixteen'
 ```
+
+### Re-run after the step 3 re-run (commits `8955853`, `5d96a5d`)
+
+Step 6 sent the round back (R-A2, R-A4); step 3 was re-run, so step 4 ran again on the
+tree at `5d96a5d`. The first record above is kept; this entry adds to it.
+
+| Check | Result |
+|---|---|
+| `ruff check .` | `All checks passed!` |
+| `ruff format --check .` | `57 files already formatted` |
+| `mypy` | `Success: no issues found in 28 source files` |
+| `pytest` | `1643 passed in 16.07s` (1637 + 4 reproductions + 1 price-driven stop + 1 `first` planning test) |
+| Plan completeness | matches; the one changed row is below |
+| `STRUCTURE.md` | in sync (auditor report below) |
+| `python -m energy_optimization.ev.<module>` | all nine modules (`model`, `result`, `quarters`, `planning`, `allocation`, `guard`, `regulation`, `decide`, `codec`) exit 0 |
+
+**Plan completeness, the changed row.** `plan_sessions` was checked with
+`inspect.signature` against the Public API table in section 2 (row added at the step 3
+re-run) and against `STRUCTURE.md`; all three are character-for-character the same
+parameter list: `plan_sessions(requests: Sequence[PlanRequest], now: datetime, prices:
+Mapping[datetime, float], capacity: Mapping[Phase, float], voltage: float,
+min_block_quarters: int, price_cap: float | None, timezone: str, first: Collection[str] =
+frozenset()) -> dict[str, SessionPlan]`. The module-level public names of `decide`
+(`decide`, `main`), `planning`, `guard`, `regulation`, `allocation` and `codec` were listed
+from the code: no name is outside the Public API tables, so no Unplanned surface; no
+Missing; no Deviation (the re-run's signature change is recorded in section 3 and section
+2). `_keepers`, `_mark_displaced` and `_Item.displaced` are private.
+
+**`structure-auditor` (run by the orchestrator on the code as the re-run left it).** No
+edits needed: the `plan_sessions` row matches the real signature including `first:
+Collection[str] = frozenset()`; `decide.py`'s public names are still `decide` and `main`;
+the module purpose covers the keepers / displaced behaviour; no private names are listed;
+the `test_ev_planning.py` and `test_ev_decide.py` entries already describe the new tests.
+Checked by hand against `git diff 21c5acd HEAD -- STRUCTURE.md` (the re-run's own edits to
+the `plan_sessions` row, the `decide.py` intro and the two test entries): consistent with
+the code.
+
+**Changed here to get green.** Nothing failed; no source file was changed in this step.
+
+**Showcases.** All nine run with exit 0. `planning` still prints two cars on a shared phase
+and a default need; `decide` prints the conservative first call (`garage ... held by memory
+reset`), the follow-up five minutes later (`garage: 16.0 A`, next check `22:05:30+02:00`)
+and the stale call. `plan_sessions`'s new `first` parameter is not exercised in the
+`planning` showcase (it keeps its default); its use is shown by the tests.
 
 ---
 
