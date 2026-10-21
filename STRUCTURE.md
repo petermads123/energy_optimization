@@ -38,7 +38,7 @@ here, but everything in this file is in context every session.
 
 ```
 src/                    everything installable; nothing outside it is packaged
-  template_repo/        the package itself (rename this to <package_name>)
+  energy_optimization/  the package itself
 tests/                  pytest suite, one test_<module>.py per module
 development/            one folder per branch, one file per round: the pipeline's state
 .claude/                Claude Code configuration: rules, skills, agents, hooks
@@ -50,12 +50,12 @@ CLAUDE.md               routing map for Claude
 STRUCTURE.md            this file
 ```
 
-## Package: `src/template_repo/`
+## Package: `src/energy_optimization/`
 
-### `src/template_repo/__init__.py`
+### `src/energy_optimization/__init__.py`
 
 Package entry point. Re-export the public API here so callers can
-`from template_repo import X` rather than reaching into modules, using relative imports so
+`from energy_optimization import X` rather than reaching into modules, using relative imports so
 it survives renaming the package folder. Nothing is exported yet — the placeholder script
 has no public API.
 
@@ -63,7 +63,7 @@ Every package directory under `src/`, including every subpackage added later, ne
 these. The stop gate blocks on a directory of modules without it: it is not a package, so
 it will not install.
 
-### `src/template_repo/hello_world.py`
+### `src/energy_optimization/hello_world.py`
 
 Placeholder so the package is not empty. Delete the whole file when real code arrives.
 
@@ -75,9 +75,9 @@ It is deliberately trivial and is **not** the conventions reference — `/implem
 the worked module and `/test` the worked test file, so the examples do not disappear with
 the placeholder.
 
-Runnable standalone: `python -m template_repo.hello_world`, once the package is installed
+Runnable standalone: `python -m energy_optimization.hello_world`, once the package is installed
 (`pip install -e ".[dev]"`). Under a `src/` layout the repo root is not on `sys.path`, so
-without the install it fails with `No module named template_repo` — an un-set-up
+without the install it fails with `No module named energy_optimization` — an un-set-up
 environment, not a broken module.
 
 ## Tests: `tests/`

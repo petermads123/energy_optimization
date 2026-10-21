@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "template_repo"
+name = "energy_optimization"
 version = "0.1.0"
-description = "template_repo"
+description = "Household energy optimization, starting with a pure decision core for smart EV charging"
 authors = [
   { name = "Peter Mads Pedersen", email = "petermads123@hotmail.com" }
 ]

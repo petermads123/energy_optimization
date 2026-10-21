@@ -1,6 +1,6 @@
 import pytest
 
-from template_repo.hello_world import main
+from energy_optimization.hello_world import main
 
 
 def test_main_prints_hello_world(capsys: pytest.CaptureFixture[str]) -> None:
