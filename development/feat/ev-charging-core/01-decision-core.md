@@ -1,6 +1,6 @@
 # EV charging decision core
 
-<!-- claude-plan step=4 status=active -->
+<!-- claude-plan step=5 status=active -->
 
 | Field | Value |
 |---|---|
@@ -16,7 +16,7 @@
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done |
-| 4 | Verify | `/verify` | in `/build` | pending |
+| 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
@@ -497,7 +497,11 @@ Every module also has `main() -> None`, the showcase the conventions require.
        `PHASE_DATA_STALE` when `fallback`; `PRICES_STALE` when not `prices_ok`.
    11. **Status**, first that applies: `PHASE_DATA_STALE` if fallback; `PRICES_STALE` if
        prices stale; `WAITING_FOR_CAPACITY` if the active tier has a charger that can run
-       and every active-tier charger got 0; `LIMITED_BY_PHASE` if an active-tier or
+       and every active-tier charger got 0, or if a starved charger exists (a session that
+       can run, was planned, got an empty plan and whose planning capacity is below its
+       minimum on one of its phases — its reason is `WAITING_FOR_CAPACITY`, its priority
+       stays 4) and every active-tier and every starved charger got 0 *(changed in the
+       step-3 re-run after step 6, A2; see section 3)*; `LIMITED_BY_PHASE` if an active-tier or
        smart-off charger got less than its effective max and one of its phases has
        `threshold − other load < budget`; `LIMITED_BY_BUDGET` if one got less than its
        effective max otherwise; `NORMAL`.
@@ -735,6 +739,28 @@ Showcase form: each `main()` runs and prints something a reader can learn from. 
 under showcase is called on its own line with named inputs in every module; the nested
 constructors that build the larger inputs (`Snapshot` in `decide` and `codec`, `Action` in
 `result`) use inline literals, left as is because they are the input data, not the call.
+
+### Re-run after step 6 (A2 send-back, step-3 re-run commit `9e8b11c`)
+
+The earlier record above stands; this is the verification of the tree as the step-3 re-run
+left it.
+
+| Check | Result |
+|---|---|
+| `ruff check .` | `All checks passed!` |
+| `ruff format --check .` | `52 files already formatted` |
+| `mypy` | `Success: no issues found in 24 source files` |
+| `pytest` | `1113 passed` (1110 before the re-run plus its three new tests in `tests/test_ev_decide.py`) |
+| Plan completeness | The re-run changed `ev/decide.py` privately (`_Item.starved`, `_status`, the reason choice); `decide` and `main` are the only public names in the module and match the table (`decide(snapshot: Snapshot) -> Decision`, `main() -> None`), checked with `inspect`. No other `src/` file changed. Missing: none. Deviation: none. Unplanned: none. |
+| `STRUCTURE.md` | in sync, no edit needed; stop gate's `structure_problems`, `stray_test_files`, `missing_init_files` all empty |
+| `python -m energy_optimization.ev.decide` | exit 0, same readable showcase output (status, allocations, reasons, the action, then the stale-measurement run), plus the expected `RuntimeWarning` |
+
+Structure-auditor finding and what was done: STRUCTURE.md needs no edit (public names and
+rows unchanged; its entry never described when `WAITING_FOR_CAPACITY` applies, so the new
+rule contradicts nothing). One finding outside STRUCTURE.md: guide 8.11 in section 2 still
+gave the old status rule, leaving out starved chargers. **Applied:** section 2 describes the
+code, so 8.11 now states the shipped rule and notes that it changed in the re-run. No code
+change was needed in this step.
 
 ---
 
