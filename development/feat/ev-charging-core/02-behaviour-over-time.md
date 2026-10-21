@@ -1,6 +1,6 @@
 # EV charging core: behaviour over time
 
-<!-- claude-plan step=7 status=active -->
+<!-- claude-plan step=8 status=active -->
 
 | Field | Value |
 |---|---|
@@ -19,7 +19,7 @@
 | 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | done |
 | 6 | Concept check | `/concept-check` | in `/build` | done |
-| 7 | Ship | `/ship` | in `/build` | pending |
+| 7 | Ship | `/ship` | in `/build` | done |
 | 8 | Recommend | `/recommend` | with the user | pending |
 | 9 | Pull request | `/create-pr` | with the user | pending |
 | 10 | Review | `/watch-pr` | on the pull request | pending |
@@ -1296,8 +1296,56 @@ properties), the `test_ev_decide.py` round-1 paragraph (two properties; plans fi
 
 | Field | Value |
 |---|---|
-| Commits | |
-| Pushed to | |
+| Commits | 22 before this one, oldest first (round 1's step-8 commit `982a494` excluded); the `Ship: EV charging core, behaviour over time` commit that carries this table is the last of the round |
+| Pushed to | `origin/feat/ev-charging-core` (`https://github.com/petermads123/energy_optimization`) |
+
+Commits of the round:
+
+  - `6bfe485` Concept: EV charging core, behaviour over time
+  - `106a355` Plan: EV charging core, behaviour over time
+  - `c679116` Plan: EV charging core, behaviour over time, reviewed and accepted
+  - `0afb2de` WIP step 3: memory types, settings, guard and regulation modules
+  - `9dcff0a` WIP step 3: memory-aware decide, codec and exports
+  - `af37629` Add memory-driven behaviour over time to the EV core (step 3)
+  - `1be5bb0` Verify: EV charging core, behaviour over time
+  - `65d348c` WIP step 5: fix findings from the test designers (overflow, regulation, in-flight commands, tier-2 hysteresis)
+  - `e8b40f8` WIP step 5: guard tests
+  - `a459312` WIP step 5: regulation tests
+  - `5bf8b62` WIP step 5: model and allocation round-2 tests, regulated_cap bound
+  - `9e301f5` WIP step 5: codec round-2 tests
+  - `b1cf6ed` WIP step 5: decide round-2 tests, sequence property, overflow guards
+  - `39eb286` Test: EV charging core, behaviour over time
+  - `21c5acd` Concept check: EV charging core, behaviour over time
+  - `8955853` WIP step 3: R-A2 and R-A4 reproductions, red
+  - `5d96a5d` Plan the planned tier once: keepers first, capacity stops held off
+  - `047f434` Verify: EV charging core, behaviour over time (re-run after step 3)
+  - `3a887ac` WIP step 5: keepers hold only the current quarter, ordered like the ranked tier; held-off chargers claim nothing
+  - `7ed092c` WIP step 5: planned-tier tests, plan-fit oracle and property, STRUCTURE.md
+  - `1748061` Test: EV charging core, behaviour over time (re-run after step 6)
+  - `5b39a71` Concept check: EV charging core, behaviour over time (re-run)
+
+**Gates on the whole tree at `5b39a71`:** `ruff check .` all checks passed; `ruff format --check .`
+57 files already formatted; `mypy` no issues in 28 source files; `pytest` 1686 passed (18.6 s).
+`origin/main` is `aa646d8`, the merge base: main has not moved, nothing to merge.
+
+**Plan file agrees:** steps 1 to 6 `done`; section 5 has a passing test against every intent
+T1 to T15; section 6 holds the first audit (which found R-A2 and R-A4 and sent the round back
+to step 3) and its re-run, whose tables mark every round-2 criterion A1 to A8 and every
+round-1 criterion A1 to A10 as met. The "unmet" and "no" cells of the first audit are the
+record of what was sent back, not open rows; neither comes back in the re-run.
+
+**Diff review (`git diff 982a494..HEAD`, 19 files).** Only `src/energy_optimization/ev/`,
+`tests/`, `STRUCTURE.md` and this plan folder changed, as section 1 promised. No stray or
+untracked files, no scratch scripts (the probes and reader reports live in the session
+scratchpad outside the tree), no debug leftovers; every `# type: ignore` carries a narrowing
+code and a reason; the `print(` calls are the module showcases. Nothing in the diff is
+anything a stranger should not read. Nothing removed.
+
+**History vs. steps.** Every step left a commit naming the round file: step 1 `6bfe485`; step
+2 `106a355`, `c679116`; step 3 `0afb2de`, `9dcff0a`, `af37629`; step 4 `1be5bb0`; step 5
+`65d348c` to `39eb286`; step 6 `21c5acd`; then the send-back's step 3 re-run (`8955853`,
+`5d96a5d`), step 4 (`047f434`), step 5 (`3a887ac`, `7ed092c`, `1748061`) and step 6
+(`5b39a71`). No missing record.
 
 ---
 
