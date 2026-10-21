@@ -529,7 +529,7 @@ class Snapshot:
         self._one_per_charger("states", [s.charger_id for s in states], ids, True)
         self._one_per_charger("sessions", [s.charger_id for s in sessions], ids, False)
 
-    def _items(self, name: str, kind: type) -> tuple[object, ...]:
+    def _items[T](self, name: str, kind: type[T]) -> tuple[T, ...]:
         """Convert a sequence field to a tuple of `kind` and store it."""
         value = getattr(self, name)
         if isinstance(value, str) or not isinstance(value, Iterable):

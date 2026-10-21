@@ -1,6 +1,6 @@
 # EV charging decision core
 
-<!-- claude-plan step=3 status=active -->
+<!-- claude-plan step=4 status=active -->
 
 | Field | Value |
 |---|---|
@@ -15,7 +15,7 @@
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
-| 3 | Implement | `/implement` | in `/build` | pending |
+| 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | pending |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
@@ -628,6 +628,24 @@ test intent (the new `PLAN_COMPLETED` code is A2/A6), and nothing was added with
 > Written in step 3. Only deviations from the plan above, each with its reason. "Built as
 > planned" is a complete and good entry. On a fix round, also the reproduction test's red
 > run, pasted here before the fix was written — step 6 cites it.
+
+Built as planned. The Public API table needed no correction; the points below are
+additions or choices inside it, none of which touches an acceptance criterion:
+
+- `ConfigError` also carries a `message` attribute (the text without the field), which the
+  codec uses to re-raise with a dotted path prefix.
+- `ev/result.py` declares `type Params = dict[str, str | float | int | bool]` and uses it
+  for `Reason.params` and `Event.params`; the type is the one in the table.
+- Whole-number fields in `model.py` (`min_current`, `max_current`, `fallback_current`,
+  `user_current_limit`, `min_block_quarters`) accept an integral float and store an int,
+  matching the codec rule; a non-integral float or a bool is rejected.
+- A session whose SOC is at least 100 has its remaining need reported as 0 (reason
+  `TARGET_REACHED`), so `expected_finish` is `now`.
+- `PRICE_CAP_EXCEEDED` events carry the cap in `params["price_cap"]`.
+- STRUCTURE.md gained sections for every `ev/` module (full paths, signature tables) and
+  lost the hello_world entries. The sections for the new `tests/test_ev_*.py` files are
+  left to step 5, because the stop gate blocks on a path named in STRUCTURE.md that does
+  not exist on disk yet.
 
 ---
 

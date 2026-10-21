@@ -39,6 +39,7 @@ here, but everything in this file is in context every session.
 ```
 src/                    everything installable; nothing outside it is packaged
   energy_optimization/  the package itself
+    ev/                 smart EV charging decision core (see its modules below)
 tests/                  pytest suite, one test_<module>.py per module
 development/            one folder per branch, one file per round: the pipeline's state
 .claude/                Claude Code configuration: rules, skills, agents, hooks
@@ -54,39 +55,148 @@ STRUCTURE.md            this file
 
 ### `src/energy_optimization/__init__.py`
 
-Package entry point. Re-export the public API here so callers can
-`from energy_optimization import X` rather than reaching into modules, using relative imports so
-it survives renaming the package folder. Nothing is exported yet — the placeholder script
-has no public API.
+Package entry point. Nothing is re-exported at the root: the EV charging core is the
+subpackage `energy_optimization.ev`, imported as `from energy_optimization.ev import decide`.
 
 Every package directory under `src/`, including every subpackage added later, needs one of
 these. The stop gate blocks on a directory of modules without it: it is not a package, so
 it will not install.
 
-### `src/energy_optimization/hello_world.py`
+### Subpackage `src/energy_optimization/ev/`
 
-Placeholder so the package is not empty. Delete the whole file when real code arrives.
+The smart EV charging decision core: a pure function from one complete snapshot (time,
+prices, chargers, sessions, measured phase currents, settings) to one decision (ordered
+actions, a plan and a reason per charger, available amps, status, events). No I/O, never
+reads the clock, standard library only. Every public type is a frozen dataclass; input
+types validate themselves on construction and raise `ConfigError` naming the field.
+Wherever output depends on a set of phases, phases are iterated in `Phase` order
+(L1, L2, L3), never in `frozenset` order. Every module is runnable with
+`python -m energy_optimization.ev.<module>` and ends in a `main()` showcase.
+
+Dependency order: `model` and `result` are leaves; `quarters` uses `model`; `planning`
+uses `model`, `quarters`, `result`; `allocation` uses `model`; `decide` uses all of those;
+`codec` uses `model` and `result`.
+
+### `src/energy_optimization/ev/__init__.py`
+
+Re-exports the public API with `__all__`: everything in `model`, `result`, `decide`, and
+the four codec functions. The helpers in `quarters`, `planning` and `allocation` are
+importable from their own modules.
+
+### `src/energy_optimization/ev/model.py`
+
+Input types and their validation. `Phase`, `ChargerKind` are `StrEnum`s; the dataclasses
+below are frozen and check themselves in `__post_init__`. Tuple fields accept any sequence
+and become tuples. Numeric fields reject `bool` and non-finite floats; float fields accept
+ints.
 
 | Signature | Description |
 |---|---|
-| `main() -> None` | Print `Hello, World!`. |
+| `class Phase(StrEnum)`: `L1`, `L2`, `L3` | A phase of the grid connection. |
+| `class ChargerKind(StrEnum)`: `ADJUSTABLE`, `ON_OFF`, `FIXED` | What a charger can do. |
+| `class ConfigError(ValueError)`; `__init__(self, field: str, message: str) -> None`; attributes `field`, `message`; `str(err) == f"{field}: {message}"` | Invalid input, naming the field. |
+| `Charger(id: str, phases: frozenset[Phase], kind: ChargerKind, min_current: int \| None = None, max_current: int \| None = None, assumed_current: float \| None = None, fallback_current: int \| None = None)` | A charge point; the fields that apply depend on `kind`. |
+| `ChargerState(charger_id: str, car_connected: bool, current_setting: float, paused: bool, measured_power_w: float \| None = None, available: bool = True)` | A charger's state now. |
+| `Session(charger_id: str, ready_time: time, energy_need_kwh: float \| None = None, soc_percent: float \| None = None, target_soc_percent: float \| None = None, battery_capacity_kwh: float \| None = None, delivered_kwh: float = 0.0, charge_now: bool = False, smart_charging: bool = True, user_current_limit: int \| None = None, plugged_in_at: datetime \| None = None)` | The car on one charger; `ready_time` is naive local time. |
+| `PriceInterval(start: datetime, end: datetime, price: float)` | One priced interval on quarter boundaries. |
+| `PriceSeries(intervals: tuple[PriceInterval, ...], updated_at: datetime)` | The price series; intervals must not overlap. |
+| `PhaseCurrents(measured_at: datetime, l1: float \| None, l2: float \| None, l3: float \| None)`; `get(self, phase: Phase) -> float \| None` | Measured current per phase for the whole connection. |
+| `Settings(phase_budget: float, phase_threshold: float, fallback_current: int, timezone: str, voltage: float = 230.0, min_block_quarters: int = 2, price_cap: float \| None = None, default_energy_need_kwh: float = 30.0, max_price_age: timedelta = timedelta(minutes=60), max_measurement_age: timedelta = timedelta(seconds=60))` | Installation settings; budget, threshold, fallback and timezone are required. |
+| `Snapshot(now: datetime, settings: Settings, chargers: tuple[Charger, ...], states: tuple[ChargerState, ...], sessions: tuple[Session, ...], prices: PriceSeries, phase_currents: PhaseCurrents \| None = None)` | One call's input; cross-checks ids between chargers, states and sessions. |
+| `main() -> None` | Showcase: build a snapshot, then trigger a `ConfigError`. |
 
-It is deliberately trivial and is **not** the conventions reference — `/implement` carries
-the worked module and `/test` the worked test file, so the examples do not disappear with
-the placeholder.
+### `src/energy_optimization/ev/result.py`
 
-Runnable standalone: `python -m energy_optimization.hello_world`, once the package is installed
-(`pip install -e ".[dev]"`). Under a `src/` layout the repo root is not on `sys.path`, so
-without the install it fails with `No module named energy_optimization` — an un-set-up
-environment, not a broken module.
+Output types. No logic beyond `PhaseAmps.get`. `Params` is the alias
+`dict[str, str | float | int | bool]`.
+
+| Signature | Description |
+|---|---|
+| `class Stage(StrEnum)`: `DOWN`, `UP` | Which phase of execution an action belongs to. |
+| `class ActionKind(StrEnum)`: `SET_CURRENT`, `PAUSE`, `RESUME` | What to do to a charger. |
+| `Action(charger_id: str, kind: ActionKind, target_current: float, stage: Stage)` | One change with an absolute target. |
+| `class ReasonCode(StrEnum)`: `CHARGE_NOW`, `IN_PLAN`, `READY_TIME_PASSED`, `PLAN_COMPLETED`, `PRICES_STALE`, `PLANNED_LATER`, `WAITING_FOR_HIGHER_PRIORITY`, `WAITING_FOR_CAPACITY`, `TARGET_REACHED`, `BELOW_MINIMUM`, `SMART_CHARGING_OFF`, `FIXED`, `UNAVAILABLE`, `NO_CAR`, `NO_SESSION` | Stable reason codes; values are the lower-case names. |
+| `Reason(code: ReasonCode, text: str, params: Params = {})` | Why a charger got what it got. |
+| `PlannedQuarter(start: datetime, price: float \| None, current: float)` | One planned quarter; `price` None means unpriced. |
+| `ChargerDecision(charger_id: str, allocation: float, priority: int \| None, reason: Reason, plan: tuple[PlannedQuarter, ...] = (), remaining_need_kwh: float \| None = None, deadline: datetime \| None = None, expected_finish: datetime \| None = None, reaches_target: bool \| None = None)` | Everything decided for one charger. |
+| `class Status(StrEnum)`: `NORMAL`, `LIMITED_BY_BUDGET`, `LIMITED_BY_PHASE`, `WAITING_FOR_CAPACITY`, `PHASE_DATA_STALE`, `PRICES_STALE` | Overall status. |
+| `class EventKind(StrEnum)`: `TARGET_UNREACHABLE`, `PRICE_CAP_EXCEEDED`, `CHARGE_NOW_NEED_COVERED`, `PHASE_DATA_STALE`, `PRICES_STALE` | Notification-worthy events. |
+| `Event(kind: EventKind, text: str, charger_id: str \| None = None, params: Params = {})` | One event. |
+| `PhaseAmps(l1: float, l2: float, l3: float)`; `get(self, phase: Phase) -> float` | Amps per phase. |
+| `Decision(actions: tuple[Action, ...], chargers: tuple[ChargerDecision, ...], available: PhaseAmps, status: Status, events: tuple[Event, ...])` | One call's answer; `chargers` in snapshot charger order. |
+| `main() -> None` | Showcase: build a small decision by hand. |
+
+### `src/energy_optimization/ev/quarters.py`
+
+The quarter-hour grid. All arithmetic in UTC; datetimes sharing a `ZoneInfo` are never
+compared directly because that ignores `fold`.
+
+| Signature | Description |
+|---|---|
+| `QUARTER: timedelta` | The planning step, 15 minutes. |
+| `floor_to_quarter(moment: datetime) -> datetime` | Start of the quarter containing an aware moment, in UTC; `ValueError` if naive. |
+| `next_occurrence(ready_time: time, after: datetime, timezone: str) -> datetime` | First moment strictly after `after` at which local time is `ready_time`, in UTC; a gap time shifts forward, a fold time is the first occurrence. |
+| `quarter_starts(start: datetime, end: datetime) -> list[datetime]` | UTC quarter starts from the quarter containing `start` while before `end`. |
+| `quarter_prices(series: PriceSeries) -> dict[datetime, float]` | Every interval split into quarters, keyed by UTC start. |
+| `prices_fresh(series: PriceSeries, now: datetime, max_age: timedelta) -> bool` | `abs(now - updated_at) <= max_age`. |
+| `main() -> None` | Showcase: deadlines and quarter counts across the 2026 DST nights. |
+
+### `src/energy_optimization/ev/planning.py`
+
+Remaining need and cheapest-block planning with shared capacity, price cap and unpriced
+quarters.
+
+| Signature | Description |
+|---|---|
+| `class NeedSource(StrEnum)`: `ENERGY`, `SOC`, `DEFAULT` | Where a remaining need came from. |
+| `remaining_need_kwh(session: Session, default_need_kwh: float) -> tuple[float, NeedSource]` | Remaining need, clipped at 0, and its source. |
+| `energy_per_quarter_kwh(current: float, phase_count: int, voltage: float) -> float` | Energy delivered in one quarter. |
+| `PlanRequest(charger_id: str, phases: frozenset[Phase], min_current: float, max_current: float, need_kwh: float, deadline: datetime)` | One session to plan; equal min and max means all-or-nothing. |
+| `SessionPlan(charger_id: str, quarters: tuple[PlannedQuarter, ...], planned_kwh: float, reachable: bool, price_cap_exceeded: bool, uses_unpriced: bool)` | One session's plan, quarters in time order. |
+| `plan_sessions(requests: Sequence[PlanRequest], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str) -> dict[str, SessionPlan]` | Plan every request against shared per-phase capacity, most urgent first. |
+| `main() -> None` | Showcase: two cars on a shared phase; a default need. |
+
+### `src/energy_optimization/ev/allocation.py`
+
+Phase capacity, draw and reservations, measurement freshness and max-min-fair sharing.
+
+| Signature | Description |
+|---|---|
+| `Claim(charger_id: str, phases: frozenset[Phase], min_current: float, max_current: float)` | One charger asking for current; equal min and max means all-or-nothing. |
+| `share(claims: Sequence[Claim], capacity: Mapping[Phase, float]) -> dict[str, float]` | Share capacity among claims given in ranking order: 0/min selection, then max-min-fair 1 A steps. |
+| `measurements_fresh(currents: PhaseCurrents \| None, now: datetime, max_age: timedelta, phases: frozenset[Phase]) -> bool` | Measurement present, recent and complete for `phases`. |
+| `present_draw(charger: Charger, state: ChargerState, voltage: float) -> float` | What a charger is taken to draw now on each phase, for the phase guard. |
+| `reserved_current(charger: Charger, state: ChargerState, voltage: float) -> float` | What a fixed or unavailable charger is reserved at on each phase. |
+| `phase_capacity(snapshot: Snapshot, fresh: bool) -> dict[Phase, float]` | Per phase, budget intersected with the phase guard when `fresh`; may be negative. |
+| `main() -> None` | Showcase: sharing on mixed phases and on a tight phase. |
+
+### `src/energy_optimization/ev/decide.py`
+
+The decision core: classification, priority tiers, planning, sharing, actions, reasons,
+status and events.
+
+| Signature | Description |
+|---|---|
+| `decide(snapshot: Snapshot) -> Decision` | Decide what every charger should be set to now. |
+| `main() -> None` | Showcase: three chargers and two sessions, then the same snapshot without phase measurements. |
+
+### `src/energy_optimization/ev/codec.py`
+
+Snapshot and decision to and from plain JSON-compatible dicts. Keys are field names, enums
+go by value, datetimes are ISO 8601 with offset, `time` is `time.isoformat()`, `timedelta`
+is seconds, phase sets are sorted lists. Decoding rejects missing, unknown and wrongly
+typed fields with a `ConfigError` whose `field` is a dotted path such as
+`chargers[1].max_current`.
+
+| Signature | Description |
+|---|---|
+| `snapshot_to_dict(snapshot: Snapshot) -> dict[str, object]` | Snapshot to a plain dict. |
+| `snapshot_from_dict(data: Mapping[str, object]) -> Snapshot` | Dict to snapshot; `ConfigError` with a dotted path on bad input. |
+| `decision_to_dict(decision: Decision) -> dict[str, object]` | Decision to a plain dict. |
+| `decision_from_dict(data: Mapping[str, object]) -> Decision` | Dict to decision, same error rules. |
+| `main() -> None` | Showcase: snapshot to JSON and back; a rejected bad field. |
 
 ## Tests: `tests/`
-
-### `tests/test_hello_world.py`
-
-Covers the placeholder script's `main` via `capsys`: the exact output, that it is one line,
-that nothing goes to stderr, and that a second call prints the same thing. Deleted along
-with the script it covers. The edge-case standard is demonstrated in `/test`, not here.
 
 All tests live here and nowhere else — `testpaths = ["tests"]` in `pyproject.toml` means
 `pytest` collects nothing outside this directory, and the stop gate blocks on a test file

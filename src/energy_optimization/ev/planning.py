@@ -250,7 +250,7 @@ def _latest_key(
 ) -> tuple[float, float, float]:
     """Score a block in the unpriced pass: latest first, then cheapest priced part."""
     latest = max(slots[i].start for i in new).timestamp()
-    priced = [slots[i].price for i in new if slots[i].price is not None]
+    priced = [p for i in new if (p := slots[i].price) is not None]
     cheapest = sum(priced) / len(priced) if priced else math.inf
     return -latest, cheapest, -slots[block[0]].start.timestamp()
 
