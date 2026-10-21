@@ -11,12 +11,16 @@ import pytest
 from energy_optimization.ev.model import (
     Charger,
     ChargerKind,
+    ChargerMemory,
     ChargerState,
     ConfigError,
+    GuardLevel,
+    Memory,
     Phase,
     PhaseCurrents,
     PriceInterval,
     PriceSeries,
+    Reduction,
     Session,
     Settings,
     Snapshot,
@@ -788,7 +792,338 @@ def test_snapshot_accepts_missing_phase_currents() -> None:
     assert snapshot(phase_currents=PhaseCurrents(NOW, 1.0, None, None)).phase_currents
 
 
+# --- Round 2: Settings over time (T1) ----------------------------------------------
+
+MICRO = timedelta(microseconds=1)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [32.0, 31.9, True, math.inf, math.nan, 10**400, "40", [40.0]],
+)
+def test_settings_emergency_threshold_must_exceed_the_threshold_and_be_a_number(
+    value: object,
+) -> None:
+    assert field_of(lambda: settings(emergency_threshold=value)) == (
+        "emergency_threshold"
+    )
+
+
+def test_settings_emergency_threshold_error_names_the_threshold() -> None:
+    with pytest.raises(ConfigError, match=r"phase_threshold \(32.0\), got 32.0"):
+        settings(emergency_threshold=32.0)
+
+
+def test_settings_emergency_threshold_accepts_just_above_and_none() -> None:
+    assert settings(emergency_threshold=32.0 + 1e-9).emergency_threshold == 32.0 + 1e-9
+    assert settings(emergency_threshold=None).emergency_threshold is None
+    assert settings().emergency_threshold is None
+
+
+def test_settings_emergency_threshold_int_becomes_float() -> None:
+    result = settings(emergency_threshold=40).emergency_threshold
+
+    assert result == 40.0
+    assert isinstance(result, float)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["emergency_calm", "green_hold", "min_pause", "hysteresis", "min_action_interval"],
+)
+def test_settings_zero_or_positive_spans_accept_zero_and_reject_negative(
+    name: str,
+) -> None:
+    assert getattr(settings(**{name: timedelta(0)}), name) == timedelta(0)
+    assert field_of(lambda: settings(**{name: -MICRO})) == name
+
+
+@pytest.mark.parametrize(
+    "name", ["ramp_period", "under_use_period", "resume_probe", "max_memory_age"]
+)
+def test_settings_positive_spans_reject_zero_and_accept_a_microsecond(
+    name: str,
+) -> None:
+    assert getattr(settings(**{name: MICRO}), name) == MICRO
+    assert field_of(lambda: settings(**{name: timedelta(0)})) == name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "emergency_calm",
+        "green_hold",
+        "min_pause",
+        "hysteresis",
+        "min_action_interval",
+        "ramp_period",
+        "under_use_period",
+        "resume_probe",
+        "max_memory_age",
+    ],
+)
+@pytest.mark.parametrize("value", [60, 60.0, None, "60 s"])
+def test_settings_spans_must_be_timedeltas(name: str, value: object) -> None:
+    assert field_of(lambda: settings(**{name: value})) == name
+
+
+@pytest.mark.parametrize("name", ["yellow_margin", "deadband", "under_use_margin"])
+def test_settings_margins_reject_negative_and_non_numbers_and_accept_zero(
+    name: str,
+) -> None:
+    assert getattr(settings(**{name: 0}), name) == 0.0
+    for bad in (-0.1, True, math.inf, "2"):
+        assert field_of(lambda bad=bad: settings(**{name: bad})) == name  # type: ignore[misc]  # bound per loop turn
+
+
+@pytest.mark.parametrize("value", [0, -1, 2.5, True, "2", math.inf])
+def test_settings_ramp_step_must_be_a_positive_whole_number(value: object) -> None:
+    assert field_of(lambda: settings(ramp_step=value)) == "ramp_step"
+
+
+def test_settings_ramp_step_accepts_one_and_an_integral_float() -> None:
+    assert settings(ramp_step=1).ramp_step == 1
+    result = settings(ramp_step=2.0).ramp_step
+
+    assert result == 2
+    assert isinstance(result, int)
+
+
+@pytest.mark.parametrize("value", ["halve", "to_use", None, 1])
+def test_settings_reduction_must_be_a_member_not_its_text(value: object) -> None:
+    assert field_of(lambda: settings(reduction=value)) == "reduction"
+
+
+def test_settings_round_two_defaults_match_the_plan() -> None:
+    result = settings()
+
+    assert result.emergency_threshold is None
+    assert result.emergency_calm == timedelta(minutes=5)
+    assert result.yellow_margin == 2.0
+    assert result.green_hold == timedelta(seconds=60)
+    assert result.deadband == 2.0
+    assert result.ramp_step == 2
+    assert result.ramp_period == timedelta(minutes=5)
+    assert result.under_use_period == timedelta(minutes=15)
+    assert result.reduction is Reduction.TO_USE
+    assert result.under_use_margin == 1.0
+    assert result.min_pause == timedelta(minutes=15)
+    assert result.hysteresis == timedelta(minutes=30)
+    assert result.resume_probe == timedelta(minutes=60)
+    assert result.min_action_interval == timedelta(seconds=30)
+    assert result.max_memory_age == timedelta(minutes=30)
+
+
+# --- Round 2: ChargerMemory (T1) -------------------------------------------------
+
+CHARGER_MEMORY_DATETIMES = [
+    "session_start",
+    "switched_at",
+    "under_use_since",
+    "full_use_since",
+    "under_use_stop_at",
+    "last_action_at",
+    "decreased_at",
+]
+
+
+def charger_memory(**kwargs: object) -> ChargerMemory:
+    values: dict[str, Any] = {"charger_id": "carport"}
+    values.update(kwargs)
+    return ChargerMemory(**values)
+
+
+@pytest.mark.parametrize("bad", ["", "  ", None, 7])
+def test_charger_memory_rejects_a_blank_or_non_text_id(bad: object) -> None:
+    assert field_of(lambda: charger_memory(charger_id=bad)) == "charger_id"
+
+
+@pytest.mark.parametrize("name", CHARGER_MEMORY_DATETIMES)
+def test_charger_memory_rejects_a_naive_time_in_every_time_field(name: str) -> None:
+    assert field_of(lambda: charger_memory(**{name: naive("2026-10-21T18:00")})) == name
+
+
+@pytest.mark.parametrize("name", CHARGER_MEMORY_DATETIMES)
+def test_charger_memory_rejects_text_instead_of_a_time(name: str) -> None:
+    assert field_of(lambda: charger_memory(**{name: "2026-10-21T18:00:00+00:00"})) == (
+        name
+    )
+
+
+@pytest.mark.parametrize(
+    "name", ["car_connected", "running", "stopped_for_capacity", "selected"]
+)
+@pytest.mark.parametrize("bad", [1, 0, "yes", None])
+def test_charger_memory_flags_must_be_bools(name: str, bad: object) -> None:
+    assert field_of(lambda: charger_memory(**{name: bad})) == name
+
+
+@pytest.mark.parametrize("bad", [-1, 6.5, True, "6", math.inf, 10**400])
+def test_charger_memory_regulated_cap_must_be_a_whole_non_negative_number(
+    bad: object,
+) -> None:
+    assert field_of(lambda: charger_memory(regulated_cap=bad)) == "regulated_cap"
+
+
+def test_charger_memory_regulated_cap_accepts_zero_and_an_integral_float() -> None:
+    assert charger_memory(regulated_cap=0).regulated_cap == 0
+    result = charger_memory(regulated_cap=6.0).regulated_cap
+
+    assert result == 6
+    assert isinstance(result, int)
+
+
+@pytest.mark.parametrize("bad", [-0.1, math.inf, math.nan, True, "6", 10**400])
+def test_charger_memory_last_target_must_be_a_finite_non_negative_number(
+    bad: object,
+) -> None:
+    assert field_of(lambda: charger_memory(last_target=bad)) == "last_target"
+
+
+def test_charger_memory_last_target_accepts_zero_and_turns_an_int_into_a_float() -> (
+    None
+):
+    assert charger_memory(last_target=0).last_target == 0.0
+    result = charger_memory(last_target=10).last_target
+
+    assert result == 10.0
+    assert isinstance(result, float)
+
+
+@pytest.mark.parametrize("bad", [None, 7, b"x"])
+def test_charger_memory_session_key_must_be_a_string(bad: object) -> None:
+    assert field_of(lambda: charger_memory(session_key=bad)) == "session_key"
+
+
+def test_charger_memory_error_names_the_charger() -> None:
+    with pytest.raises(ConfigError, match="'carport'"):
+        charger_memory(regulated_cap=-1)
+
+
+def test_charger_memory_defaults_are_an_empty_history() -> None:
+    result = charger_memory()
+
+    assert not result.car_connected
+    assert not result.running
+    assert result.session_key == ""
+    assert result.regulated_cap is None
+    assert result.last_target is None
+
+
+def test_charger_memory_accepts_times_in_any_offset() -> None:
+    result = charger_memory(
+        switched_at=NOW.astimezone(timezone(timedelta(hours=-5, minutes=-30)))
+    )
+
+    assert result.switched_at == NOW
+
+
+# --- Round 2: Memory (T1) ----------------------------------------------------------
+
+
+def memory(**kwargs: object) -> Memory:
+    values: dict[str, Any] = {"saved_at": NOW}
+    values.update(kwargs)
+    return Memory(**values)
+
+
+def test_memory_rejects_a_naive_saved_at() -> None:
+    assert field_of(lambda: memory(saved_at=naive("2026-10-21T18:00"))) == "saved_at"
+
+
+@pytest.mark.parametrize("name", ["green_since", "emergency_at"])
+def test_memory_rejects_a_naive_guard_time(name: str) -> None:
+    assert field_of(lambda: memory(**{name: naive("2026-10-21T18:00")})) == name
+
+
+def test_memory_rejects_duplicate_charger_ids() -> None:
+    entries = (charger_memory(), charger_memory())
+
+    assert field_of(lambda: memory(chargers=entries)) == "chargers"
+
+
+@pytest.mark.parametrize("bad", ["abc", 7, None, [{"charger_id": "a"}], [None]])
+def test_memory_rejects_chargers_that_are_not_a_sequence_of_charger_memory(
+    bad: object,
+) -> None:
+    assert field_of(lambda: memory(chargers=bad)) == "chargers"
+
+
+@pytest.mark.parametrize("bad", ["green", "emergency", 1, True])
+def test_memory_level_must_be_a_guard_level_member(bad: object) -> None:
+    assert field_of(lambda: memory(level=bad)) == "level"
+
+
+@pytest.mark.parametrize("level", [None, *GuardLevel])
+def test_memory_accepts_no_level_and_every_level(level: GuardLevel | None) -> None:
+    assert memory(level=level).level is level
+
+
+def test_memory_normalises_lists_and_generators_to_tuples() -> None:
+    def generate() -> Iterator[ChargerMemory]:
+        yield charger_memory()
+
+    assert isinstance(memory(chargers=[charger_memory()]).chargers, tuple)
+    assert memory(chargers=generate()).chargers == (charger_memory(),)
+
+
+def test_memory_charger_looks_an_entry_up_by_exact_id() -> None:
+    result = memory(chargers=[charger_memory(charger_id="a"), charger_memory()])
+
+    assert result.charger("a") == charger_memory(charger_id="a")
+    assert result.charger("A") is None
+    assert result.charger("zz") is None
+    assert memory().charger("a") is None
+
+
+def test_memory_defaults_are_empty() -> None:
+    result = memory()
+
+    assert result.chargers == ()
+    assert result.level is None
+    assert result.green_since is None
+    assert result.emergency_at is None
+
+
+def test_guard_level_and_reduction_have_exact_lower_case_values() -> None:
+    assert {m.name: m.value for m in GuardLevel} == {
+        "GREEN": "green",
+        "YELLOW": "yellow",
+        "RED": "red",
+        "EMERGENCY": "emergency",
+    }
+    assert {m.name: m.value for m in Reduction} == {
+        "TO_USE": "to_use",
+        "HALVE": "halve",
+    }
+
+
+# --- Round 2: Snapshot.memory (T1) ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad", [{}, {"saved_at": "2026-10-21T18:00:00+00:00"}, "memory", 0]
+)
+def test_snapshot_memory_must_be_a_memory_or_none(bad: object) -> None:
+    assert field_of(lambda: snapshot(memory=bad)) == "memory"
+
+
+def test_snapshot_does_not_cross_check_memory_entries_against_its_chargers() -> None:
+    entries = [charger_memory(charger_id="ghost")]
+
+    result = snapshot(memory=memory(chargers=entries))
+
+    assert result.memory is not None
+    assert result.memory.charger("ghost") is not None
+
+
+def test_snapshot_memory_defaults_to_none() -> None:
+    assert snapshot().memory is None
+
+
 def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:
     showcase()
 
-    assert "rejected: " in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "rejected: " in output
+    assert "memory of carport" in output

@@ -597,6 +597,140 @@ def test_phase_capacity_does_not_mutate_the_snapshot() -> None:
     assert snap == before
 
 
+# --- phase_capacity with settling (T11, amended A8) -----------------------------
+
+
+def settling_snapshot(
+    charger: Charger, charger_state: ChargerState, l1: float | None = 20.0
+) -> Snapshot:
+    currents = PhaseCurrents(NOW, l1, 20.0 if l1 is not None else 0.0, 20.0)
+    return snapshot([charger], [charger_state], currents, budget=25.0, threshold=25.0)
+
+
+def drawing(
+    setting: float = 6.0, amps: float | None = 16.0, **kwargs: bool
+) -> ChargerState:
+    power = None if amps is None else amps * 230.0
+    return state("a", setting=setting, power=power, **kwargs)
+
+
+def test_phase_capacity_settling_counts_the_measured_draw_not_the_lower_setting() -> (
+    None
+):
+    snap = settling_snapshot(adjustable(), drawing())
+
+    assert phase_capacity(snap, True)[Phase.L1] == 11.0
+    assert phase_capacity(snap, True, frozenset({"a"}))[Phase.L1] == 21.0
+
+
+def test_phase_capacity_settling_default_is_no_settling() -> None:
+    snap = settling_snapshot(adjustable(), drawing())
+
+    assert phase_capacity(snap, True) == phase_capacity(snap, True, frozenset())
+
+
+def test_phase_capacity_settling_counts_a_paused_car_that_still_draws() -> None:
+    snap = settling_snapshot(adjustable(), drawing(setting=6.0, paused=True))
+
+    assert phase_capacity(snap, True)[Phase.L1] == 5.0
+    assert phase_capacity(snap, True, frozenset({"a"}))[Phase.L1] == 21.0
+
+
+def test_phase_capacity_settling_ignores_a_leftover_reading_without_a_car() -> None:
+    snap = settling_snapshot(adjustable(), drawing(car=False))
+
+    assert phase_capacity(snap, True, frozenset({"a"})) == phase_capacity(snap, True)
+    assert phase_capacity(snap, True, frozenset({"a"}))[Phase.L1] == 5.0
+
+
+def test_phase_capacity_settling_without_a_power_reading_uses_the_present_draw() -> (
+    None
+):
+    snap = settling_snapshot(adjustable(), drawing(amps=None))
+
+    assert phase_capacity(snap, True, frozenset({"a"})) == phase_capacity(snap, True)
+    assert phase_capacity(snap, True)[Phase.L1] == 11.0
+
+
+def test_phase_capacity_settling_a_draw_below_the_setting_changes_nothing() -> None:
+    snap = settling_snapshot(adjustable(), drawing(setting=16.0, amps=4.0))
+
+    assert phase_capacity(snap, True, frozenset({"a"})) == phase_capacity(snap, True)
+    assert phase_capacity(snap, True)[Phase.L1] == 9.0
+
+
+def test_phase_capacity_settling_counts_the_draw_on_every_phase_of_a_charger() -> None:
+    # 3 phases at 230 V: 16 A on each needs 3 x 230 x 16 W.
+    snap = settling_snapshot(
+        adjustable(ALL), state("a", setting=6.0, power=3 * 230.0 * 16.0)
+    )
+
+    plain = phase_capacity(snap, True)
+    settled = phase_capacity(snap, True, frozenset({"a"}))
+
+    assert all(plain[p] == 11.0 for p in Phase)
+    assert all(settled[p] == 21.0 for p in Phase)
+
+
+def test_phase_capacity_settling_only_touches_the_chargers_named() -> None:
+    chargers = [adjustable(cid="a"), adjustable(cid="b")]
+    states = [drawing(), state("b", setting=6.0, power=16.0 * 230.0)]
+    currents = PhaseCurrents(NOW, 30.0, 0.0, 0.0)
+    snap = snapshot(chargers, states, currents, budget=100.0, threshold=40.0)
+
+    only_a = phase_capacity(snap, True, frozenset({"a"}))[Phase.L1]
+    both = phase_capacity(snap, True, frozenset({"a", "b"}))[Phase.L1]
+
+    assert only_a == 40.0 - (30.0 - (16.0 + 6.0))  # a at 16, b at its 6 A setting
+    assert both == 40.0 - (30.0 - 32.0)  # both at 16
+
+
+@pytest.mark.parametrize("settling", [frozenset({"zzz"}), frozenset({""})])
+def test_phase_capacity_settling_ignores_unknown_ids(settling: frozenset[str]) -> None:
+    snap = settling_snapshot(adjustable(), drawing())
+
+    assert phase_capacity(snap, True, settling) == phase_capacity(snap, True)
+
+
+def test_phase_capacity_settling_is_ignored_for_stale_measurements() -> None:
+    snap = settling_snapshot(adjustable(), drawing())
+
+    assert phase_capacity(snap, False, frozenset({"a"})) == caps()
+
+
+def test_phase_capacity_settling_is_ignored_for_a_fixed_charger() -> None:
+    snap = settling_snapshot(fixed(level=6.0, cid="a"), drawing(setting=6.0, amps=10.0))
+
+    assert phase_capacity(snap, True, frozenset({"a"})) == phase_capacity(snap, True)
+
+
+def test_phase_capacity_settling_is_ignored_for_an_unavailable_charger() -> None:
+    snap = settling_snapshot(adjustable(), drawing(available=False))
+
+    assert phase_capacity(snap, True, frozenset({"a"})) == phase_capacity(snap, True)
+
+
+def test_phase_capacity_settling_leaves_a_phase_without_a_reading_at_the_budget() -> (
+    None
+):
+    snap = settling_snapshot(adjustable(ALL), drawing(), l1=None)
+
+    result = phase_capacity(snap, True, frozenset({"a"}))
+
+    assert result[Phase.L1] == 25.0
+
+
+def test_phase_capacity_settling_does_not_change_its_argument() -> None:
+    settling = frozenset({"a"})
+    snap = settling_snapshot(adjustable(), drawing())
+
+    first = phase_capacity(snap, True, settling)
+    second = phase_capacity(snap, True, settling)
+
+    assert first == second
+    assert settling == frozenset({"a"})
+
+
 def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:
     showcase()
 

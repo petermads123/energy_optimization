@@ -645,6 +645,7 @@ class ChargerMemory:
             if value is not None:
                 _aware(name, value, ctx)
         if self.regulated_cap is not None:
+            _number("regulated_cap", self.regulated_cap, ctx)  # finite as a float
             cap = _whole("regulated_cap", self.regulated_cap, ctx)
             if cap < 0:
                 raise _fail("regulated_cap", f"must be ≥ 0, got {cap}", ctx)
