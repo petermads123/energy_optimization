@@ -40,6 +40,7 @@ from energy_optimization.ev import (
     snapshot_from_dict,
     snapshot_to_dict,
 )
+from energy_optimization.ev.quarters import next_occurrence
 
 CPH = ZoneInfo("Europe/Copenhagen")
 NOW = datetime(2026, 10, 21, 18, 0, tzinfo=UTC)
@@ -120,6 +121,14 @@ def edit(data: dict[str, Any], path: list[str | int], value: object) -> dict[str
     else:
         target[path[-1]] = value
     return result
+
+
+def dotted(path: list[str | int]) -> str:
+    """The dotted path the codec reports: `chargers[1].max_current`."""
+    text = ""
+    for step in path:
+        text += f"[{step}]" if isinstance(step, int) else f".{step}"
+    return text.lstrip(".")
 
 
 def error_of(build: Callable[[], object]) -> ConfigError:
@@ -249,14 +258,10 @@ def test_round_trip_keeps_the_instants_of_datetimes_inside_the_fall_back_hour() 
 def test_round_trip_preserves_every_charger_kind() -> None:
     restored = round_trip(base_snapshot())
 
-    assert [c.kind for c in restored.chargers] == list(ChargerKind)[:3] or {
-        c.kind for c in restored.chargers
-    } == set(ChargerKind)
+    assert {c.kind for c in restored.chargers} == set(ChargerKind)
 
 
 def test_round_trip_keeps_a_fold_ready_time_giving_the_same_deadline() -> None:
-    from energy_optimization.ev.quarters import next_occurrence
-
     snapshot = base_snapshot()
     session = replace(snapshot.sessions[1], ready_time=time(2, 30, fold=1))
     snapshot = replace(snapshot, sessions=(snapshot.sessions[0], session))
@@ -365,11 +370,7 @@ def test_snapshot_from_dict_rejects_a_missing_required_field_with_its_path(
 ) -> None:
     error = error_of(lambda: snapshot_from_dict(edit(encoded(), path, DELETE)))
 
-    expected = (
-        ".".join(str(step) for step in path).replace(".0", "[0]").replace(".1", "[1]")
-    )
-    expected = expected.replace(".2", "[2]")
-    assert error.field == expected
+    assert error.field == dotted(path)
     assert error.message == "required"
 
 
@@ -402,10 +403,7 @@ def test_snapshot_from_dict_rejects_a_wrongly_typed_field_with_its_path(
 ) -> None:
     error = error_of(lambda: snapshot_from_dict(edit(encoded(), path, value)))
 
-    parts = []
-    for step in path:
-        parts.append(f"[{step}]" if isinstance(step, int) else f".{step}")
-    assert error.field == "".join(parts).lstrip(".")
+    assert error.field == dotted(path)
 
 
 @pytest.mark.parametrize(
