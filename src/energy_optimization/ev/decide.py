@@ -245,7 +245,7 @@ def _tier_key(item: _Item, ctx: _Context) -> tuple[bool, datetime, bool, float, 
     """
     deadline = item.deadline or datetime.max.replace(tzinfo=UTC)
     if item.was_selected and item.deadline is not None:
-        deadline = deadline - ctx.settings.hysteresis
+        deadline = _earlier(deadline, ctx.settings.hysteresis)
     return (
         not item.protected,
         deadline,
@@ -322,7 +322,7 @@ def _keep_places(
             or item.deadline is None
         ):
             continue
-        limit = item.deadline - settings.hysteresis
+        limit = _earlier(item.deadline, settings.hysteresis)
         if any(
             other.charger.phases & item.charger.phases
             and other.deadline is not None
@@ -364,6 +364,14 @@ def _shifted(moment: datetime, span: timedelta = timedelta(0)) -> datetime | Non
         return moment.astimezone(UTC) + span
     except OverflowError:
         return None
+
+
+def _earlier(moment: datetime, span: timedelta) -> datetime:
+    """Return `moment - span`, the earliest representable time if that underflows."""
+    try:
+        return moment - span
+    except OverflowError:
+        return datetime.min.replace(tzinfo=UTC)
 
 
 def _window_open(item: _Item, ctx: _Context) -> bool:
@@ -447,7 +455,12 @@ def _expected_finish(item: _Item, ctx: _Context) -> datetime | None:
         return None
     if item.allocation > 0:
         hours = need * 1000 / (voltage * item.allocation * phase_count)
-        return (ctx.now.astimezone(UTC) + timedelta(hours=hours)).astimezone(ctx.zone)
+        try:
+            return (ctx.now.astimezone(UTC) + timedelta(hours=hours)).astimezone(
+                ctx.zone
+            )
+        except OverflowError:
+            return None  # a trickle of current: no finish within any calendar
     return None
 
 

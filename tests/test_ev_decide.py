@@ -8,9 +8,10 @@ import subprocess
 import sys
 import time as clock
 from dataclasses import replace
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta, timezone
 from enum import Enum
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -24,9 +25,11 @@ from energy_optimization.ev import (
     Charger,
     ChargerDecision,
     ChargerKind,
+    ChargerMemory,
     ChargerState,
     Decision,
     EventKind,
+    GuardLevel,
     Memory,
     Phase,
     PhaseAmps,
@@ -34,6 +37,7 @@ from energy_optimization.ev import (
     PriceInterval,
     PriceSeries,
     ReasonCode,
+    Reduction,
     Session,
     Settings,
     Snapshot,
@@ -41,6 +45,8 @@ from energy_optimization.ev import (
     Status,
     decide,
     decision_to_dict,
+    memory_from_dict,
+    memory_to_dict,
     snapshot_from_dict,
     snapshot_to_dict,
 )
@@ -2374,6 +2380,2244 @@ def test_generated_snapshots_survive_the_dict_round_trip_and_decide_the_same(
     restored = snapshot_from_dict(data)
 
     assert decision_to_dict(decide(restored)) == decision_to_dict(decide(snapshot))
+
+
+# --- Round 2: behaviour over time (T3-T13) ------------------------------------------------
+#
+# Multi-call scenarios feed each decision's memory into the next snapshot. Charger
+# entries come from real calls (a hand-built entry has an empty session key, which
+# reads as a changed session and clears the regulation), and the previous call's
+# actions are written back into the next call's states by hand.
+
+SECOND = timedelta(seconds=1)
+MIN = timedelta(minutes=1)
+MICRO = timedelta(microseconds=1)
+
+
+def with_settings(snapshot: Snapshot, **changes: object) -> Snapshot:
+    new = replace(snapshot.settings, **changes)  # type: ignore[arg-type]  # test passes through
+    return replace(snapshot, settings=new)
+
+
+def at(
+    snapshot: Snapshot,
+    delta: timedelta,
+    previous: Decision | None = None,
+    *,
+    currents: PhaseCurrents | None | Default = Default.FRESH,
+    **changes: object,
+) -> Snapshot:
+    """The next call: `delta` later, re-dated readings, the previous memory fed in."""
+    now = snapshot.now + delta
+    if isinstance(currents, Default):
+        old = snapshot.phase_currents
+        currents = None if old is None else PhaseCurrents(now, old.l1, old.l2, old.l3)
+    memory = previous.memory if previous is not None else snapshot.memory
+    fields: dict[str, object] = {
+        "now": now,
+        "phase_currents": currents,
+        "memory": memory,
+    }
+    fields.update(changes)
+    return replace(snapshot, **fields)  # type: ignore[arg-type]  # test passes through
+
+
+def readings(
+    now: datetime, l1: float = 0.0, l2: float = 0.0, l3: float = 0.0
+) -> PhaseCurrents:
+    return PhaseCurrents(now, l1, l2, l3)
+
+
+def run(
+    snapshot: Snapshot, delta: timedelta, previous: Decision, **changes: object
+) -> tuple[Snapshot, Decision]:
+    following = at(snapshot, delta, previous, **changes)  # type: ignore[arg-type]  # test passes through
+    return following, decide(following)
+
+
+def action_tuples(decision: Decision) -> list[tuple[str, ActionKind, float, Stage]]:
+    return [(a.charger_id, a.kind, a.target_current, a.stage) for a in decision.actions]
+
+
+def reason_of(decision: Decision) -> str | None:
+    for event in decision.events:
+        if event.kind is EventKind.MEMORY_RESET:
+            return str(event.params["reason"])
+    return None
+
+
+def entry(decision: Decision, charger_id: str = "a") -> ChargerMemory:
+    assert decision.memory is not None
+    found = decision.memory.charger(charger_id)
+    assert found is not None
+    return found
+
+
+def local(moment: datetime) -> datetime:
+    return moment.astimezone(ZONE)
+
+
+def running(
+    cid: str = "a", setting: float = 16.0, amps: float | None = None
+) -> ChargerState:
+    """A charger that is charging at `setting`, drawing `amps` (default: all of it)."""
+    drawn = setting if amps is None else amps
+    return idle(cid, setting, paused=False, power=drawn * 230.0)
+
+
+# --- T3: the conservative start --------------------------------------------------------
+
+
+def test_a_call_without_memory_increases_nothing_but_still_decreases() -> None:
+    chargers = [adj("a", L1), adj("b", L2)]
+    states = [idle("a"), running("b", 16.0)]
+    sessions = [now_session("a"), now_session("b")]
+    first = replace(
+        snap(chargers, states, sessions, budget=10.0, currents=readings(NOW, 0, 16, 0)),
+        memory=None,
+    )
+
+    result = decide(first)
+
+    held = by_id(result)["a"]
+    assert held.allocation == 0.0
+    assert held.reason.code is ReasonCode.CHARGE_NOW
+    assert held.reason.params["held_by"] == "memory_reset"
+    assert "capped_by" not in held.reason.params
+    assert allocations(result)["b"] == 10.0
+    assert action_tuples(result) == [("b", ActionKind.SET_CURRENT, 10.0, Stage.DOWN)]
+    resets = [e for e in result.events if e.kind is EventKind.MEMORY_RESET]
+    assert len(resets) == 1
+    assert resets[0].params == {"reason": "missing"}
+
+
+def test_the_next_call_with_that_memory_starts_the_charger() -> None:
+    chargers = [adj("a", L1), adj("b", L2)]
+    states = [idle("a"), running("b", 16.0)]
+    sessions = [now_session("a"), now_session("b")]
+    first = replace(
+        snap(chargers, states, sessions, budget=10.0, currents=readings(NOW, 0, 16, 0)),
+        memory=None,
+    )
+    d1 = decide(first)
+
+    second, d2 = run(
+        first,
+        5 * MIN,
+        d1,
+        states=(idle("a"), running("b", 10.0)),
+        currents=readings(NOW + 5 * MIN, 0, 10, 0),
+    )
+
+    assert reason_of(d2) is None
+    assert ("a", ActionKind.RESUME, 10.0, Stage.UP) in action_tuples(d2)
+    assert "held_by" not in by_id(d2)["a"].reason.params
+    assert second.memory is d1.memory
+
+
+def test_the_conservative_start_gives_way_to_the_green_hold_not_to_a_second_reset() -> (
+    None
+):
+    first = replace(
+        snap([adj("a")], [idle("a")], [now_session("a")], budget=10.0), memory=None
+    )
+    d1 = decide(first)
+
+    _, d2 = run(first, 30 * SECOND, d1)
+
+    assert reason_of(d2) is None
+    held = by_id(d2)["a"]
+    assert held.allocation == 0.0
+    assert held.reason.params["held_by"] == "phase_guard"
+    assert d2.next_check == local(NOW + 60 * SECOND)
+
+
+@pytest.mark.parametrize(
+    ("setting", "allocation", "pause_or_set"),
+    [
+        (10.6, 10.0, ("a", ActionKind.SET_CURRENT, 10.0, Stage.DOWN)),
+        (6.0, 6.0, None),
+        (5.6, 0.0, ("a", ActionKind.PAUSE, 0.0, Stage.DOWN)),
+        (15.9999999999, 16.0, None),
+    ],
+)
+def test_a_held_charger_is_floored_to_a_whole_legal_current(
+    setting: float,
+    allocation: float,
+    pause_or_set: tuple[str, ActionKind, float, Stage] | None,
+) -> None:
+    first = replace(
+        snap(
+            [adj("a")],
+            [idle("a", setting, paused=False)],
+            [now_session("a")],
+            budget=25.0,
+        ),
+        memory=None,
+    )
+
+    result = decide(first)
+
+    assert allocations(result)["a"] == allocation
+    assert reason_of(result) == "missing"
+    assert action_tuples(result) == ([pause_or_set] if pause_or_set else [])
+
+
+def memory_row(saved_offset: timedelta, **fields: object) -> Memory:
+    saved = NOW + saved_offset
+    return Memory(
+        saved_at=saved,
+        green_since=saved - timedelta(hours=1),
+        **fields,  # type: ignore[arg-type]  # test passes through
+    )
+
+
+USABILITY_CASES = [
+    ("now", memory_row(timedelta(0)), None),
+    ("a minute old", memory_row(-MIN), None),
+    ("exactly the age limit", memory_row(-30 * MIN), None),
+    ("a microsecond too old", memory_row(-30 * MIN - MICRO), "out_of_date"),
+    ("a microsecond in the future", memory_row(MICRO), "future"),
+    (
+        "known entry acted after it was saved",
+        memory_row(
+            -MIN,
+            chargers=(ChargerMemory("a", last_action_at=NOW - MIN + MICRO),),
+        ),
+        "future",
+    ),
+    (
+        "known entry switched after it was saved",
+        memory_row(
+            -MIN,
+            chargers=(ChargerMemory("a", switched_at=NOW - MIN + MICRO),),
+        ),
+        "future",
+    ),
+    (
+        "guard time after it was saved",
+        Memory(saved_at=NOW - MIN, green_since=NOW - MIN + MICRO),
+        "future",
+    ),
+    (
+        "emergency time after it was saved",
+        Memory(saved_at=NOW - MIN, emergency_at=NOW - MIN + MICRO),
+        "future",
+    ),
+    (
+        "unknown entry with a bad time",
+        memory_row(
+            -MIN,
+            chargers=(ChargerMemory("ghost", switched_at=NOW + timedelta(hours=1)),),
+        ),
+        None,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("memory", "reason"),
+    [(m, r) for _, m, r in USABILITY_CASES],
+    ids=[name for name, _, _ in USABILITY_CASES],
+)
+def test_memory_usability_boundaries(memory: Memory, reason: str | None) -> None:
+    first = replace(snap([adj("a")], [idle("a")], [now_session("a")]), memory=memory)
+
+    result = decide(first)
+
+    assert reason_of(result) == reason
+    assert allocations(result)["a"] == (16.0 if reason is None else 0.0)
+    assert result.memory is not None
+    assert result.memory.charger("ghost") is None
+
+
+def test_memory_written_with_another_offset_is_judged_by_its_instant() -> None:
+    plus_two = timezone(timedelta(hours=2))
+    saved = (NOW - 30 * MIN).astimezone(plus_two)
+    memory = Memory(saved_at=saved, green_since=saved - timedelta(hours=1))
+    first = replace(snap([adj("a")], [idle("a")], [now_session("a")]), memory=memory)
+
+    result = decide(first)
+
+    assert reason_of(result) is None
+    assert allocations(result)["a"] == 16.0
+
+
+@pytest.mark.parametrize(
+    "extreme",
+    [
+        datetime(1, 1, 1, 0, 30, tzinfo=timezone(timedelta(hours=1))),
+        datetime(9999, 12, 31, 23, 30, tzinfo=timezone(timedelta(hours=-1))),
+    ],
+    ids=["year one", "year 9999"],
+)
+@pytest.mark.parametrize("where", ["saved_at", "green_since", "emergency_at", "entry"])
+def test_a_time_no_utc_date_can_hold_is_an_invalid_restart_not_a_crash(
+    extreme: datetime, where: str
+) -> None:
+    saved = NOW - MIN
+    fields: dict[str, Any] = {"saved_at": saved, "green_since": saved - 60 * MIN}
+    if where == "entry":
+        fields["chargers"] = (ChargerMemory("a", switched_at=extreme),)
+    else:
+        fields[where] = extreme
+    first = replace(
+        snap([adj("a")], [idle("a")], [now_session("a")]), memory=Memory(**fields)
+    )
+
+    result = decide(first)
+
+    assert reason_of(result) == "invalid"
+    assert allocations(result)["a"] == 0.0
+
+
+def test_an_extreme_time_on_an_unknown_charger_is_ignored() -> None:
+    extreme = datetime(1, 1, 1, 0, 30, tzinfo=timezone(timedelta(hours=1)))
+    memory = memory_row(-MIN, chargers=(ChargerMemory("ghost", decreased_at=extreme),))
+    first = replace(snap([adj("a")], [idle("a")], [now_session("a")]), memory=memory)
+
+    result = decide(first)
+
+    assert reason_of(result) is None
+    assert allocations(result)["a"] == 16.0
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "max_price_age",
+        "max_measurement_age",
+        "emergency_calm",
+        "green_hold",
+        "ramp_period",
+        "under_use_period",
+        "min_pause",
+        "hysteresis",
+        "resume_probe",
+        "min_action_interval",
+        "max_memory_age",
+    ],
+)
+def test_a_huge_duration_setting_never_overflows(name: str) -> None:
+    huge = timedelta(days=10**6)
+    chargers = [adj("a", L1), adj("b", L2), adj("c", L3)]
+    states = [running("a", 16.0, 7.0), running("b", 10.0, 9.5), idle("c")]
+    sessions = [
+        now_session("a"),
+        now_session("b", plugged_in_at=NOW - 3 * MIN),
+        now_session("c"),
+    ]
+    first = snap(chargers, states, sessions)
+    d0 = decide(first)
+    memory = d0.memory
+    assert memory is not None
+    stamped = {
+        "a": replace(
+            entry(d0, "a"),
+            running=True,
+            switched_at=NOW - MIN,
+            last_target=16.0,
+            last_action_at=NOW - SECOND,
+        ),
+        "b": replace(
+            entry(d0, "b"), regulated_cap=10, full_use_since=NOW - MIN, running=True
+        ),
+        "c": replace(entry(d0, "c"), regulated_cap=0, under_use_stop_at=NOW - MIN),
+    }
+    warmed = Memory(
+        saved_at=memory.saved_at,
+        chargers=tuple(stamped[e.charger_id] for e in memory.chargers),
+        green_since=NOW - 10 * MIN,
+    )
+    second = with_settings(at(first, MIN), **{name: huge})
+    second = replace(second, memory=warmed)
+
+    result = decide(second)
+
+    if result.next_check is not None:
+        assert result.next_check > second.now
+        assert result.next_check <= second.now + second.settings.max_memory_age
+
+
+def test_a_huge_emergency_calm_never_overflows() -> None:
+    first = with_settings(
+        snap([adj("a")], [idle("a")], [now_session("a")]),
+        emergency_threshold=40.0,
+        emergency_calm=timedelta(days=10**6),
+    )
+    d1 = decide(replace(first, phase_currents=readings(NOW, 41.0)))
+
+    _, d2 = run(first, MIN, d1)
+
+    assert d2.guard_level is GuardLevel.EMERGENCY
+    assert d2.next_check is not None
+
+
+# --- T4/T5: anti-flapping ---------------------------------------------------------------
+
+
+def paused_for_capacity() -> tuple[Snapshot, Decision]:
+    """Call 1: `a` charges at 10 A but only 4 A fit, so it is paused for capacity."""
+    first = snap([adj("a")], [running("a", 10.0)], [sess("a", need=0.0)], budget=4.0)
+    return first, decide(first)
+
+
+def roomy(snapshot: Snapshot) -> dict[str, object]:
+    return {"settings": replace(snapshot.settings, phase_budget=25.0)}
+
+
+def test_a_charger_stopped_for_capacity_remembers_why_and_when() -> None:
+    first, d1 = paused_for_capacity()
+
+    assert action_tuples(d1) == [("a", ActionKind.PAUSE, 0.0, Stage.DOWN)]
+    assert by_id(d1)["a"].reason.code is ReasonCode.WAITING_FOR_CAPACITY
+    stored = entry(d1)
+    assert stored.stopped_for_capacity
+    assert not stored.running
+    assert stored.switched_at == NOW
+    assert stored.last_target == 0.0
+    assert stored.last_action_at == NOW
+    assert stored.decreased_at == NOW
+
+
+def test_the_minimum_pause_holds_a_capacity_stop_until_it_has_passed() -> None:
+    first, d1 = paused_for_capacity()
+
+    _, d2 = run(first, 14 * MIN + 59 * SECOND, d1, states=(idle("a"),), **roomy(first))
+
+    held = by_id(d2)["a"]
+    assert held.allocation == 0.0
+    assert held.reason.code is ReasonCode.MINIMUM_PAUSE
+    assert held.reason.params["until"] == "2026-10-21T22:15:00+02:00"
+    assert d2.actions == ()
+    assert d2.next_check == local(NOW + 15 * MIN)
+    assert entry(d2).switched_at == NOW  # holding off is not a new switch
+
+
+def test_the_minimum_pause_does_not_drift_while_it_is_held() -> None:
+    first, d1 = paused_for_capacity()
+
+    _, d2 = run(first, 5 * MIN, d1, states=(idle("a"),), **roomy(first))
+
+    assert by_id(d2)["a"].reason.code is ReasonCode.MINIMUM_PAUSE
+    assert entry(d2).switched_at == NOW
+    assert entry(d2).stopped_for_capacity
+
+
+def test_a_capacity_stop_can_restart_once_the_pause_has_passed() -> None:
+    first, d1 = paused_for_capacity()
+
+    _, d2 = run(first, 15 * MIN, d1, states=(idle("a"),), **roomy(first))
+
+    assert action_tuples(d2) == [("a", ActionKind.RESUME, 16.0, Stage.UP)]
+    assert by_id(d2)["a"].reason.code is ReasonCode.PLAN_COMPLETED
+
+
+def test_charge_now_skips_the_minimum_pause() -> None:
+    first, d1 = paused_for_capacity()
+
+    _, d2 = run(
+        first,
+        5 * MIN,
+        d1,
+        states=(idle("a"),),
+        sessions=(now_session("a", need=0.0),),
+        **roomy(first),
+    )
+
+    assert by_id(d2)["a"].reason.code is ReasonCode.CHARGE_NOW
+    assert action_tuples(d2) == [("a", ActionKind.RESUME, 16.0, Stage.UP)]
+
+
+def test_charge_now_skips_the_pause_but_not_the_pacing() -> None:
+    first, d1 = paused_for_capacity()
+    changes = {
+        "states": (idle("a"),),
+        "sessions": (now_session("a", need=0.0),),
+        **roomy(first),
+    }
+
+    _, early = run(first, 10 * SECOND, d1, **changes)
+    _, later = run(first, 30 * SECOND, d1, **changes)
+
+    held = by_id(early)["a"]
+    assert held.allocation == 0.0
+    assert held.reason.code is ReasonCode.CHARGE_NOW
+    assert held.reason.params["held_by"] == "pacing"
+    assert early.actions == ()
+    assert action_tuples(later) == [("a", ActionKind.RESUME, 16.0, Stage.UP)]
+
+
+def test_a_zero_minimum_pause_restarts_as_soon_as_pacing_allows() -> None:
+    first, d1 = paused_for_capacity()
+    first = replace(first, settings=replace(first.settings, min_pause=timedelta(0)))
+    d1 = decide(first)
+
+    _, d2 = run(first, 31 * SECOND, d1, states=(idle("a"),), **roomy(first))
+
+    assert [a.kind for a in d2.actions] == [ActionKind.RESUME]
+
+
+def test_an_observed_unplug_and_replug_does_not_skip_the_minimum_pause() -> None:
+    first, d1 = paused_for_capacity()
+    unplugged, d2 = run(
+        first, 2 * MIN, d1, states=(idle("a", car=False),), **roomy(first)
+    )
+
+    _, d3 = run(unplugged, 2 * MIN, d2, states=(idle("a"),))
+
+    gone = entry(d2)
+    assert not gone.car_connected
+    assert gone.stopped_for_capacity
+    assert gone.switched_at == NOW
+    assert gone.regulated_cap is None
+    held = by_id(d3)["a"]
+    assert held.allocation == 0.0
+    assert held.reason.code is ReasonCode.MINIMUM_PAUSE
+    assert held.reason.params["until"] == "2026-10-21T22:15:00+02:00"
+
+
+def test_a_held_off_charger_still_occupies_its_tier() -> None:
+    chargers = [adj("a"), adj("b")]
+    prices = hourly([0.2] * 48)
+    first = snap(
+        chargers,
+        [running("a", 10.0), idle("b")],
+        [sess("a", need=10.0), sess("b", need=0.0)],
+        prices,
+        budget=4.0,
+    )
+    d1 = decide(first)
+
+    _, d2 = run(first, 5 * MIN, d1, states=(idle("a"), idle("b")), **roomy(first))
+
+    assert by_id(d2)["a"].priority == 2
+    assert by_id(d2)["a"].reason.code is ReasonCode.MINIMUM_PAUSE
+    assert by_id(d2)["b"].reason.code is ReasonCode.WAITING_FOR_HIGHER_PRIORITY
+    assert allocations(d2) == {"a": 0.0, "b": 0.0}
+
+
+def selected_pair(ready_b: time) -> tuple[Snapshot, Decision, Snapshot, Decision]:
+    """`a` (ready 08:45) charges at 10 A of 10; `b` joins five minutes later."""
+    chargers = [adj("a"), adj("b")]
+    first = snap(
+        chargers,
+        [running("a", 10.0), idle("b", car=False)],
+        [sess("a", ready=time(8, 45), need=0.0)],
+        budget=10.0,
+    )
+    d1 = decide(first)
+    second, d2 = run(
+        first,
+        5 * MIN,
+        d1,
+        states=(running("a", 10.0), idle("b")),
+        sessions=(
+            sess("a", ready=time(8, 45), need=0.0),
+            sess("b", ready=ready_b, need=0.0),
+        ),
+    )
+    return first, d1, second, d2
+
+
+@pytest.mark.parametrize("ready_b", [time(8, 30), time(8, 15)])
+def test_a_selected_charger_keeps_its_place_against_a_contender_within_the_hysteresis(
+    ready_b: time,
+) -> None:
+    _, _, _, d2 = selected_pair(ready_b)
+
+    assert allocations(d2) == {"a": 10.0, "b": 0.0}
+    assert by_id(d2)["b"].reason.code is ReasonCode.WAITING_FOR_CAPACITY
+    assert d2.actions == ()
+
+
+def test_a_contender_more_than_the_hysteresis_earlier_takes_the_place() -> None:
+    _, _, _, d2 = selected_pair(time(8, 14))
+
+    assert action_tuples(d2) == [
+        ("a", ActionKind.PAUSE, 0.0, Stage.DOWN),
+        ("b", ActionKind.RESUME, 10.0, Stage.UP),
+    ]
+
+
+def test_a_just_started_charger_is_not_dropped_for_an_equal_tier_one() -> None:
+    chargers = [adj("a"), adj("b")]
+    first = snap(
+        chargers,
+        [idle("a"), idle("b", car=False)],
+        [sess("a", ready=time(8, 45), need=0.0)],
+        budget=10.0,
+    )
+    d1 = decide(first)
+    both = (
+        sess("a", ready=time(8, 45), need=0.0),
+        sess("b", ready=time(6, 0), need=0.0),
+    )
+    states = (running("a", 10.0), idle("b"))
+
+    second, d2 = run(first, 5 * MIN, d1, states=states, sessions=both)
+    third, d3 = run(second, 10 * MIN, d2, states=states, sessions=both)
+
+    assert action_tuples(d1) == [("a", ActionKind.RESUME, 10.0, Stage.UP)]
+    assert allocations(d2) == {"a": 10.0, "b": 0.0}
+    assert d2.next_check == local(NOW + 15 * MIN)
+    assert action_tuples(d3) == [
+        ("a", ActionKind.PAUSE, 0.0, Stage.DOWN),
+        ("b", ActionKind.RESUME, 10.0, Stage.UP),
+    ]
+
+
+def test_an_in_flight_resume_still_counts_as_running_for_the_minimum_on_time() -> None:
+    chargers = [adj("a"), adj("b")]
+    first = snap(
+        chargers,
+        [idle("a"), idle("b", car=False)],
+        [sess("a", ready=time(8, 45), need=0.0)],
+        budget=10.0,
+    )
+    d1 = decide(first)
+
+    second, d2 = run(first, 10 * SECOND, d1)
+    _, d3 = run(
+        second,
+        50 * SECOND,
+        d2,
+        states=(running("a", 10.0), idle("b")),
+        sessions=(
+            sess("a", ready=time(8, 45), need=0.0),
+            sess("b", ready=time(8, 30), need=0.0),
+        ),
+    )
+
+    assert action_tuples(d1) == [("a", ActionKind.RESUME, 10.0, Stage.UP)]
+    assert d2.actions == ()
+    assert allocations(d2)["a"] == 10.0
+    assert entry(d2).running
+    assert entry(d2).switched_at == NOW
+    assert allocations(d3) == {"a": 10.0, "b": 0.0}
+    assert d3.actions == ()
+
+
+def tier_two_pair(ready_b: time) -> Decision:
+    prices = hourly([0.10] * 48)
+    chargers = [adj("a"), adj("b")]
+    first = snap(
+        chargers,
+        [idle("a"), idle("b", car=False)],
+        [sess("a", ready=time(8, 45), need=10.0)],
+        prices,
+        budget=10.0,
+    )
+    d1 = decide(first)
+    assert by_id(d1)["a"].priority == 2
+    assert action_tuples(d1) == [("a", ActionKind.RESUME, 10.0, Stage.UP)]
+    _, d2 = run(
+        first,
+        20 * MIN,
+        d1,
+        states=(running("a", 10.0), idle("b")),
+        sessions=(
+            sess("a", ready=time(8, 45), need=10.0),
+            sess("b", ready=ready_b, need=10.0),
+        ),
+    )
+    return d2
+
+
+@pytest.mark.parametrize("ready_b", [time(8, 30), time(8, 15)])
+def test_the_hysteresis_holds_in_the_planned_tier_too(ready_b: time) -> None:
+    d2 = tier_two_pair(ready_b)
+
+    assert allocations(d2) == {"a": 10.0, "b": 0.0}
+    assert by_id(d2)["a"].priority == 2
+    assert by_id(d2)["a"].reason.code is ReasonCode.IN_PLAN
+    assert by_id(d2)["b"].reason.code is ReasonCode.WAITING_FOR_CAPACITY
+    assert d2.actions == ()
+
+
+def test_a_contender_more_than_the_hysteresis_earlier_displaces_in_the_planned_tier() -> (
+    None
+):
+    d2 = tier_two_pair(time(8, 14))
+
+    assert allocations(d2) == {"a": 0.0, "b": 10.0}
+    assert action_tuples(d2) == [
+        ("a", ActionKind.PAUSE, 0.0, Stage.DOWN),
+        ("b", ActionKind.RESUME, 10.0, Stage.UP),
+    ]
+
+
+def test_a_selected_charger_the_plan_moved_to_later_quarters_stays_moved_without_a_rival() -> (
+    None
+):
+    expensive_now = hourly([0.9, 0.9] + [0.1] * 46)
+    first = snap(
+        [adj("a")],
+        [running("a", 10.0)],
+        [sess("a", ready=time(8, 45), need=2.0)],
+        expensive_now,
+        budget=10.0,
+    )
+    d1 = decide(first)
+    assert d1.memory is not None
+    selected = replace(entry(d1), selected=True, running=True)
+    carried = replace(d1.memory, chargers=(selected,))
+
+    result = decide(replace(at(first, 5 * MIN), memory=carried))
+
+    assert by_id(result)["a"].reason.code is ReasonCode.PLANNED_LATER
+    assert allocations(result)["a"] == 0.0
+
+
+# --- T7/T8: regulation through decide -------------------------------------------------------
+
+
+def shared_l1(a_amps: float, **session: object) -> Snapshot:
+    """Two charge-now chargers at 11 A each of a 22 A budget; `a` draws `a_amps`."""
+    return snap(
+        [adj("a"), adj("b")],
+        [running("a", 11.0, a_amps), running("b", 11.0)],
+        [now_session("a", **session), now_session("b")],
+        budget=22.0,
+        currents=readings(NOW, 18.0),
+    )
+
+
+def cut_after_a_period(a_amps: float) -> tuple[Snapshot, Decision, Decision]:
+    first = shared_l1(a_amps)
+    d1 = decide(first)
+    second, d2 = run(first, 15 * MIN - SECOND, d1)
+    assert d2.actions == ()
+    _, d3 = run(second, SECOND, d2)
+    return first, d2, d3
+
+
+def test_nothing_is_cut_before_a_whole_under_use_period() -> None:
+    _, d2, _ = cut_after_a_period(7.0)
+
+    assert allocations(d2) == {"a": 11.0, "b": 11.0}
+    assert "regulated_cap" not in by_id(d2)["a"].reason.params
+    assert entry(d2).under_use_since == NOW
+
+
+def test_an_under_use_cut_frees_current_to_another_charger_in_the_same_call() -> None:
+    _, _, d3 = cut_after_a_period(7.0)
+
+    decision = by_id(d3)["a"]
+    assert decision.allocation == 8.0
+    assert decision.reason.params["regulated_cap"] == 8
+    assert decision.reason.params["capped_by"] == "regulation"
+    assert by_id(d3)["b"].allocation == 14.0
+    assert action_tuples(d3) == [
+        ("a", ActionKind.SET_CURRENT, 8.0, Stage.DOWN),
+        ("b", ActionKind.SET_CURRENT, 14.0, Stage.UP),
+    ]
+    assert entry(d3).regulated_cap == 8
+
+
+def test_a_cut_below_the_minimum_stops_the_charger_and_remembers_when() -> None:
+    _, _, d3 = cut_after_a_period(2.0)
+
+    stopped = by_id(d3)["a"]
+    assert stopped.allocation == 0.0
+    assert stopped.reason.code is ReasonCode.UNDER_USE
+    assert stopped.reason.params["regulated_cap"] == 0
+    assert by_id(d3)["b"].allocation == 16.0
+    assert action_tuples(d3) == [
+        ("a", ActionKind.PAUSE, 0.0, Stage.DOWN),
+        ("b", ActionKind.SET_CURRENT, 16.0, Stage.UP),
+    ]
+    assert entry(d3).regulated_cap == 0
+    assert entry(d3).under_use_stop_at == NOW + 15 * MIN
+
+
+def lone_charger(setting: float = 16.0, amps: float = 7.0) -> Snapshot:
+    return snap(
+        [adj("a")],
+        [running("a", setting, amps)],
+        [now_session("a")],
+        currents=readings(NOW),
+    )
+
+
+@pytest.mark.parametrize("reduction", list(Reduction))
+def test_a_cut_charger_alone_is_cut_to_eight_amps_by_either_method(
+    reduction: Reduction,
+) -> None:
+    first = with_settings(lone_charger(), reduction=reduction)
+    d1 = decide(first)
+
+    _, d2 = run(first, 15 * MIN, d1)
+
+    assert action_tuples(d2) == [("a", ActionKind.SET_CURRENT, 8.0, Stage.DOWN)]
+    assert by_id(d2)["a"].reason.params["capped_by"] == "regulation"
+
+
+@pytest.mark.parametrize("reduction", list(Reduction))
+def test_a_steady_draw_after_a_cut_is_not_cut_or_ramped_again(
+    reduction: Reduction,
+) -> None:
+    first = with_settings(lone_charger(), reduction=reduction)
+    d1 = decide(first)
+    snapshot, previous = run(first, 15 * MIN, d1)
+
+    for _ in range(4):
+        snapshot, previous = run(
+            snapshot, 15 * MIN, previous, states=(running("a", 8.0, 7.0),)
+        )
+
+        assert allocations(previous)["a"] == 8.0
+        assert previous.actions == ()
+        assert entry(previous).regulated_cap == 8
+        assert entry(previous).under_use_since is None
+
+
+def test_whole_ramp_periods_of_full_use_raise_the_cap_back_up_to_the_share() -> None:
+    first = lone_charger()
+    d1 = decide(first)
+    snapshot, previous = run(first, 15 * MIN, d1)
+    allocs = [allocations(previous)["a"]]
+    caps = [entry(previous).regulated_cap]
+
+    for _ in range(6):
+        setting = allocs[-1]
+        snapshot, previous = run(
+            snapshot, 5 * MIN, previous, states=(running("a", setting, setting - 0.4),)
+        )
+        allocs.append(allocations(previous)["a"])
+        caps.append(entry(previous).regulated_cap)
+
+    assert allocs == [8.0, 8.0, 10.0, 12.0, 14.0, 16.0, 16.0]
+    assert caps == [8, 8, 10, 12, 14, None, None]
+
+
+def never_regulated_cases() -> list[tuple[str, Snapshot]]:
+    under = running("a", 11.0, 7.0)
+    other = running("b", 11.0)
+    pump_a = pump("a", L1, 10.0)
+    return [
+        (
+            "on_off charger",
+            snap(
+                [pump_a, adj("b")],
+                [idle("a", 0.0, paused=False, power=460.0), other],
+                [now_session("a"), now_session("b")],
+                budget=22.0,
+                currents=readings(NOW, 18.0),
+            ),
+        ),
+        (
+            "no power reading",
+            snap(
+                [adj("a"), adj("b")],
+                [idle("a", 11.0, paused=False, power=None), other],
+                [now_session("a"), now_session("b")],
+                budget=22.0,
+                currents=readings(NOW, 18.0),
+            ),
+        ),
+        (
+            "smart charging off",
+            snap(
+                [adj("a"), adj("b")],
+                [under, other],
+                [now_session("a", smart_charging=False), now_session("b")],
+                budget=22.0,
+                currents=readings(NOW, 18.0),
+            ),
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "case", never_regulated_cases(), ids=[name for name, _ in never_regulated_cases()]
+)
+def test_chargers_that_cannot_be_regulated_are_never_cut(
+    case: tuple[str, Snapshot],
+) -> None:
+    first = case[1]
+    d1 = decide(first)
+    second, d2 = run(first, 15 * MIN - SECOND, d1)
+    _, d3 = run(second, SECOND, d2)
+
+    assert "regulated_cap" not in by_id(d3)["a"].reason.params
+    assert entry(d3).regulated_cap is None
+    assert entry(d3).under_use_since is None
+    assert by_id(d3)["a"].allocation > 0
+
+
+def test_a_cut_charger_is_offered_current_again_after_the_probe_time() -> None:
+    first = snap(
+        [adj("a")],
+        [running("a", 10.0, 2.0)],
+        [now_session("a")],
+        currents=readings(NOW),
+    )
+    d1 = decide(first)
+    second, d2 = run(first, 15 * MIN, d1)
+    stop = second.now
+    assert by_id(d2)["a"].reason.code is ReasonCode.UNDER_USE
+    paused = {"states": (idle("a"),)}
+    previous, snapshot = d2, second
+    for minutes in (25, 25, 9):
+        snapshot, previous = run(snapshot, minutes * MIN, previous, **paused)
+        assert by_id(previous)["a"].reason.code is ReasonCode.UNDER_USE
+        assert by_id(previous)["a"].allocation == 0.0
+        assert previous.actions == ()
+    assert snapshot.now == stop + 59 * MIN
+
+    _, probe = run(snapshot, MIN, previous, **paused)
+
+    assert action_tuples(probe) == [("a", ActionKind.RESUME, 16.0, Stage.UP)]
+    assert by_id(probe)["a"].reason.code is ReasonCode.CHARGE_NOW
+    assert "regulated_cap" not in by_id(probe)["a"].reason.params
+
+
+def stopped_for_under_use() -> tuple[Snapshot, Decision]:
+    first = snap(
+        [adj("a")],
+        [running("a", 10.0, 2.0)],
+        [now_session("a")],
+        currents=readings(NOW),
+    )
+    d1 = decide(first)
+    second, d2 = run(first, 15 * MIN, d1, states=(running("a", 10.0, 2.0),))
+    assert by_id(d2)["a"].reason.code is ReasonCode.UNDER_USE
+    return second, d2
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"sessions": "plugged"},
+        {"sessions": "ready"},
+        {"sessions": "need"},
+        {"sessions": "limit"},
+    ],
+    ids=["plugged in again", "ready time", "energy need", "current limit"],
+)
+def test_a_session_change_clears_an_under_use_stop_early(
+    changes: dict[str, str],
+) -> None:
+    second, d2 = stopped_for_under_use()
+    variants = {
+        "plugged": now_session("a", plugged_in_at=NOW + 19 * MIN),
+        "ready": now_session("a", ready=time(8, 0)),
+        "need": now_session("a", need=12.0),
+        "limit": now_session("a", user_current_limit=12),
+    }
+
+    _, result = run(
+        second,
+        5 * MIN,
+        d2,
+        states=(idle("a"),),
+        sessions=(variants[changes["sessions"]],),
+    )
+
+    assert [a.kind for a in result.actions] == [ActionKind.RESUME]
+    assert "regulated_cap" not in by_id(result)["a"].reason.params
+
+
+def test_a_replug_clears_an_under_use_stop_early() -> None:
+    second, d2 = stopped_for_under_use()
+    unplugged, d3 = run(second, 2 * MIN, d2, states=(idle("a", car=False),))
+
+    _, d4 = run(unplugged, 3 * MIN, d3, states=(idle("a"),))
+
+    assert [a.kind for a in d4.actions] == [ActionKind.RESUME]
+    assert entry(d4).regulated_cap is None
+
+
+def test_the_same_plug_in_time_written_with_another_offset_is_not_a_replug() -> None:
+    plugged = datetime(2026, 10, 21, 18, 0, tzinfo=UTC)
+    state = running("a", 16.0, 7.0)
+    first = snap(
+        [adj("a")],
+        [state],
+        [now_session("a", plugged_in_at=plugged)],
+        currents=readings(NOW),
+    )
+    d1 = decide(first)
+    same_instant = plugged.astimezone(timezone(timedelta(hours=2)))
+
+    _, d2 = run(
+        first, 15 * MIN, d1, sessions=(now_session("a", plugged_in_at=same_instant),)
+    )
+
+    assert action_tuples(d2) == [("a", ActionKind.SET_CURRENT, 8.0, Stage.DOWN)]
+    assert by_id(d2)["a"].reason.params["capped_by"] == "regulation"
+
+
+def test_a_smart_charging_off_period_forgets_the_under_use_timers() -> None:
+    under = running("a", 16.0, 7.0)
+    full = running("a", 16.0)
+    first = snap([adj("a")], [under], [now_session("a")], currents=readings(NOW))
+    d1 = decide(first)
+    off = now_session("a", smart_charging=False)
+    second, d2 = run(first, 5 * MIN, d1, states=(full,), sessions=(off,))
+    third, d3 = run(second, 5 * MIN, d2)
+    fourth, d4 = run(third, 10 * MIN, d3, states=(under,), sessions=(now_session("a"),))
+
+    assert entry(d2).under_use_since is None
+    assert allocations(d4)["a"] == 16.0
+    assert "regulated_cap" not in by_id(d4)["a"].reason.params
+    assert d4.actions == ()
+    assert entry(d4).under_use_since == fourth.now
+
+
+# --- T9/T10: the phase guard through decide ---------------------------------------------------
+
+
+def guard_snapshot(**kwargs: object) -> Snapshot:
+    return snap(
+        [adj("a")],
+        [running("a", 6.0)],
+        [now_session("a")],
+        **kwargs,  # type: ignore[arg-type]  # test passes through
+    )
+
+
+def test_red_cuts_to_fit_and_raises_the_guard_event() -> None:
+    first = snap(
+        [adj("a")],
+        [running("a", 16.0)],
+        [now_session("a")],
+        currents=readings(NOW, 33.0),
+    )
+
+    result = decide(first)
+
+    assert result.guard_level is GuardLevel.RED
+    assert action_tuples(result) == [("a", ActionKind.SET_CURRENT, 15.0, Stage.DOWN)]
+    events = [e for e in result.events if e.kind is EventKind.PHASE_GUARD_INTERVENED]
+    assert [e.params for e in events] == [{"level": "red"}]
+
+
+def test_yellow_allows_no_increase_and_raises_no_event() -> None:
+    result = decide(guard_snapshot(currents=readings(NOW, 30.0)))
+
+    held = by_id(result)["a"]
+    assert result.guard_level is GuardLevel.YELLOW
+    assert held.allocation == 6.0
+    assert held.reason.params["held_by"] == "phase_guard"
+    assert "capped_by" not in held.reason.params
+    assert result.actions == ()
+    assert EventKind.PHASE_GUARD_INTERVENED not in kinds(result)
+
+
+def test_just_below_yellow_is_green_and_allows_the_increase() -> None:
+    result = decide(guard_snapshot(currents=readings(NOW, 29.99)))
+
+    assert result.guard_level is GuardLevel.GREEN
+    assert action_tuples(result) == [("a", ActionKind.SET_CURRENT, 8.0, Stage.UP)]
+
+
+def test_increases_wait_for_the_green_hold_after_a_yellow_call() -> None:
+    first = guard_snapshot(currents=readings(NOW, 30.0))
+    d1 = decide(first)
+
+    second, d2 = run(first, MIN, d1, currents=readings(NOW + MIN, 10.0))
+    third, d3 = run(second, MIN, d2, currents=readings(NOW + 2 * MIN, 10.0))
+
+    assert d1.actions == ()
+    assert by_id(d2)["a"].reason.params["held_by"] == "phase_guard"
+    assert d2.actions == ()
+    assert d2.next_check == local(NOW + 2 * MIN)
+    assert action_tuples(d3) == [("a", ActionKind.SET_CURRENT, 16.0, Stage.UP)]
+    assert third.now == NOW + 2 * MIN
+
+
+def test_stale_measurements_leave_increases_to_the_fallback_cap() -> None:
+    first = snap([adj("a")], [idle("a")], [now_session("a")], currents=None)
+
+    result = decide(first)
+
+    assert result.guard_level is None
+    assert result.status is Status.PHASE_DATA_STALE
+    assert action_tuples(result) == [("a", ActionKind.RESUME, 6.0, Stage.UP)]
+    assert by_id(result)["a"].reason.params["capped_by"] == "fallback"
+    assert "held_by" not in by_id(result)["a"].reason.params
+
+
+def test_a_stale_call_in_the_middle_restarts_the_green_hold() -> None:
+    first = snap([adj("a")], [running("a", 16.0)], [now_session("a")], currents=None)
+    d1 = decide(first)
+
+    second, d2 = run(
+        first,
+        5 * MIN,
+        d1,
+        states=(running("a", 6.0),),
+        currents=readings(NOW + 5 * MIN, 6.0),
+    )
+    _, d3 = run(second, 5 * MIN, d2, states=(running("a", 6.0),))
+
+    assert d1.guard_level is None
+    assert action_tuples(d1) == [("a", ActionKind.SET_CURRENT, 6.0, Stage.DOWN)]
+    assert by_id(d2)["a"].reason.params["held_by"] == "phase_guard"
+    assert d2.actions == ()
+    assert d2.next_check == local(NOW + 6 * MIN)
+    assert action_tuples(d3) == [("a", ActionKind.SET_CURRENT, 16.0, Stage.UP)]
+
+
+def emergency_installation() -> Snapshot:
+    chargers = [
+        adj("a", L1),
+        adj("s", L2),
+        pump("p", L3, 10.0),
+        fixed("f", L3, 5.0),
+    ]
+    states = [
+        running("a", 16.0),
+        running("s", 10.0),
+        idle("p", 0.0, paused=False, power=2300.0),
+        idle("f", 5.0, paused=False),
+    ]
+    sessions = [
+        now_session("a"),
+        sess("s", smart_charging=False),
+        sess("p", need=0.0),
+    ]
+    first = snap(chargers, states, sessions, currents=readings(NOW, 41.0, 10.0, 15.0))
+    return with_settings(first, emergency_threshold=40.0)
+
+
+def all_stopped() -> tuple[ChargerState, ...]:
+    return (idle("a"), idle("s"), idle("p"), idle("f", 5.0, paused=False))
+
+
+def test_an_emergency_pauses_every_controllable_charger_and_reports_it() -> None:
+    result = decide(emergency_installation())
+
+    assert result.guard_level is GuardLevel.EMERGENCY
+    assert result.status is Status.EMERGENCY
+    for cid in "asp":
+        assert by_id(result)[cid].allocation == 0.0
+        assert by_id(result)[cid].reason.code is ReasonCode.EMERGENCY
+    assert by_id(result)["f"].allocation == 5.0
+    assert action_tuples(result) == [
+        ("a", ActionKind.PAUSE, 0.0, Stage.DOWN),
+        ("p", ActionKind.PAUSE, 0.0, Stage.DOWN),
+        ("s", ActionKind.PAUSE, 0.0, Stage.DOWN),
+    ]
+    events = [e for e in result.events if e.kind is EventKind.PHASE_GUARD_INTERVENED]
+    assert [e.params for e in events] == [{"level": "emergency"}]
+
+
+def test_an_emergency_restarts_only_after_the_calm_period() -> None:
+    first = emergency_installation()
+    d1 = decide(first)
+    green = (10.0, 10.0, 10.0)
+    snapshot, previous = first, d1
+    waits = [MIN, 2 * MIN, 2 * MIN + 59 * SECOND]  # at +1, +3 and +5:59
+    for index, wait in enumerate(waits):
+        snapshot, previous = run(
+            snapshot,
+            wait,
+            previous,
+            states=all_stopped(),
+            currents=readings(snapshot.now + wait, *green),
+        )
+
+        assert previous.guard_level is GuardLevel.EMERGENCY
+        assert previous.status is Status.EMERGENCY
+        assert previous.actions == ()
+        if index == 0:
+            assert previous.next_check == local(NOW + 6 * MIN)
+
+    _, released = run(
+        snapshot,
+        SECOND,
+        previous,
+        states=all_stopped(),
+        currents=readings(snapshot.now + SECOND, *green),
+    )
+
+    assert released.guard_level is GuardLevel.GREEN
+    resumed = {a.charger_id for a in released.actions if a.kind is ActionKind.RESUME}
+    assert resumed == {"a", "s"}  # the pump is tier 3 and waits behind charge now
+    assert by_id(released)["p"].reason.code is ReasonCode.WAITING_FOR_HIGHER_PRIORITY
+
+
+def test_a_yellow_call_during_the_calm_restarts_it() -> None:
+    first = emergency_installation()
+    d1 = decide(first)
+    snapshot, previous = first, d1
+    plan = [(MIN, 10.0), (2 * MIN, 31.0), (MIN, 10.0), (2 * MIN, 10.0)]
+    for wait, l1 in plan:
+        snapshot, previous = run(
+            snapshot,
+            wait,
+            previous,
+            states=all_stopped(),
+            currents=readings(snapshot.now + wait, l1, 10.0, 10.0),
+        )
+
+        assert previous.guard_level is GuardLevel.EMERGENCY
+
+    _, released = run(
+        snapshot,
+        3 * MIN,
+        previous,
+        states=all_stopped(),
+        currents=readings(snapshot.now + 3 * MIN, 10.0, 10.0, 10.0),
+    )
+
+    assert released.guard_level is GuardLevel.GREEN
+
+
+def test_stale_measurements_do_not_release_an_emergency() -> None:
+    first = emergency_installation()
+    d1 = decide(first)
+
+    _, d2 = run(first, MIN, d1, states=all_stopped(), currents=None)
+
+    assert d2.guard_level is GuardLevel.EMERGENCY
+    assert d2.status is Status.EMERGENCY
+    assert d2.actions == ()
+    assert all(allocations(d2)[cid] == 0.0 for cid in "asp")
+
+
+def test_without_an_emergency_threshold_red_is_the_strongest_reaction() -> None:
+    first = replace(
+        emergency_installation(), settings=emergency_installation().settings
+    )
+    first = with_settings(first, emergency_threshold=None)
+
+    result = decide(first)
+
+    assert result.guard_level is GuardLevel.RED
+    assert result.status is not Status.EMERGENCY
+    assert by_id(result)["f"].allocation == 5.0
+
+
+def test_an_emergency_countermands_a_resume_still_in_flight() -> None:
+    first = with_settings(
+        snap([adj("a")], [idle("a")], [now_session("a")]), emergency_threshold=40.0
+    )
+    d1 = decide(first)
+
+    _, d2 = run(first, 10 * SECOND, d1, currents=readings(NOW + 10 * SECOND, 41.0))
+
+    assert action_tuples(d1) == [("a", ActionKind.RESUME, 16.0, Stage.UP)]
+    assert d2.guard_level is GuardLevel.EMERGENCY
+    assert allocations(d2)["a"] == 0.0
+    assert action_tuples(d2) == [("a", ActionKind.PAUSE, 0.0, Stage.DOWN)]
+
+
+# --- T11: pacing ------------------------------------------------------------------------------
+
+
+def cut_to_ten() -> tuple[Snapshot, Decision]:
+    first = snap([adj("a")], [running("a", 16.0)], [now_session("a")], budget=10.0)
+    d1 = decide(first)
+    assert action_tuples(d1) == [("a", ActionKind.SET_CURRENT, 10.0, Stage.DOWN)]
+    return first, d1
+
+
+def test_an_increase_inside_the_action_interval_is_held_and_a_decrease_is_not() -> None:
+    first, d1 = cut_to_ten()
+    roomy_settings = replace(first.settings, phase_budget=25.0)
+
+    _, held = run(
+        first, 10 * SECOND, d1, states=(running("a", 10.0),), settings=roomy_settings
+    )
+    _, later = run(
+        first, 30 * SECOND, d1, states=(running("a", 10.0),), settings=roomy_settings
+    )
+    _, down = run(
+        first,
+        10 * SECOND,
+        d1,
+        states=(running("a", 10.0),),
+        settings=replace(first.settings, phase_budget=6.0),
+    )
+
+    pacing = by_id(held)["a"]
+    assert pacing.allocation == 10.0
+    assert pacing.reason.params["held_by"] == "pacing"
+    assert "capped_by" not in pacing.reason.params
+    assert held.actions == ()
+    assert held.next_check == local(NOW + 30 * SECOND)
+    assert action_tuples(later) == [("a", ActionKind.SET_CURRENT, 16.0, Stage.UP)]
+    assert action_tuples(down) == [("a", ActionKind.SET_CURRENT, 6.0, Stage.DOWN)]
+
+
+def test_a_command_still_in_flight_is_not_sent_again() -> None:
+    first, d1 = cut_to_ten()
+
+    _, d2 = run(first, 10 * SECOND, d1)  # the car still reports 16 A
+
+    assert allocations(d2)["a"] == 10.0
+    assert d2.actions == ()
+
+
+def test_a_decrease_in_flight_is_not_raised_by_a_roomier_share() -> None:
+    first, d1 = cut_to_ten()
+
+    _, d2 = run(
+        first, 10 * SECOND, d1, settings=replace(first.settings, phase_budget=12.0)
+    )
+
+    assert allocations(d2)["a"] == 10.0
+    assert by_id(d2)["a"].reason.params["held_by"] == "pacing"
+    assert d2.actions == ()
+
+
+def test_an_increase_in_flight_is_cut_back_when_the_share_shrinks() -> None:
+    first = snap(
+        [adj("a"), adj("b", high=13)],
+        [running("a", 10.0), idle("b", car=False)],
+        [now_session("a")],
+        currents=readings(NOW, 10.0),
+    )
+    d1 = decide(first)
+    assert action_tuples(d1) == [("a", ActionKind.SET_CURRENT, 16.0, Stage.UP)]
+
+    _, d2 = run(
+        first,
+        10 * SECOND,
+        d1,
+        states=(running("a", 10.0), idle("b")),
+        sessions=(now_session("a"), sess("b", smart_charging=False)),
+    )
+
+    assert allocations(d2) == {"a": 12.0, "b": 13.0}
+    assert action_tuples(d2) == [
+        ("a", ActionKind.SET_CURRENT, 12.0, Stage.DOWN),
+        ("b", ActionKind.RESUME, 13.0, Stage.UP),
+    ]
+
+
+def settling_start() -> tuple[Snapshot, Decision]:
+    first = snap(
+        [adj("a")],
+        [running("a", 16.0)],
+        [now_session("a")],
+        currents=readings(NOW, 34.0),
+    )
+    d1 = decide(first)
+    assert action_tuples(d1) == [("a", ActionKind.SET_CURRENT, 14.0, Stage.DOWN)]
+    assert d1.guard_level is GuardLevel.RED
+    return first, d1
+
+
+@pytest.mark.parametrize("delta", [10 * SECOND, 29 * SECOND])
+def test_a_second_decrease_is_not_compounded_while_the_first_settles(
+    delta: timedelta,
+) -> None:
+    first, d1 = settling_start()
+    still_drawing = idle("a", 14.0, paused=False, power=16 * 230.0)
+
+    _, d2 = run(first, delta, d1, states=(still_drawing,))
+
+    assert allocations(d2)["a"] == 14.0
+    assert d2.actions == ()
+
+
+def test_a_decrease_that_never_landed_is_not_repeated_either() -> None:
+    first, d1 = settling_start()
+
+    _, d2 = run(first, 10 * SECOND, d1)
+
+    assert allocations(d2)["a"] == 14.0
+    assert d2.actions == ()
+
+
+def test_once_the_window_closes_the_remaining_overload_is_cut_again() -> None:
+    first, d1 = settling_start()
+    still_drawing = idle("a", 14.0, paused=False, power=16 * 230.0)
+
+    _, d2 = run(first, 30 * SECOND, d1, states=(still_drawing,))
+
+    assert action_tuples(d2) == [("a", ActionKind.SET_CURRENT, 12.0, Stage.DOWN)]
+
+
+# --- T12: when to call next ---------------------------------------------------------------------
+
+
+def idle_installation(**kwargs: object) -> Snapshot:
+    """No car anywhere and stale prices: nothing is pending."""
+    return snap(
+        [adj("a")],
+        [idle("a", car=False)],
+        [],
+        PriceSeries((), NOW - timedelta(hours=3)),
+        **kwargs,  # type: ignore[arg-type]  # test passes through
+    )
+
+
+def test_next_check_is_none_when_nothing_is_pending() -> None:
+    assert decide(idle_installation()).next_check is None
+
+
+def test_next_check_is_the_end_of_the_green_hold() -> None:
+    first = replace(idle_installation(), memory=None)
+
+    result = decide(first)
+
+    assert result.next_check == local(NOW + 60 * SECOND)
+
+
+def test_next_check_is_the_price_series_expiring() -> None:
+    first = with_settings(
+        snap([adj("a")], [idle("a", car=False)], [], PriceSeries((), NOW)),
+        max_memory_age=timedelta(hours=3),
+    )
+
+    result = decide(first)
+
+    assert result.next_check == local(NOW + 60 * MIN)
+
+
+def test_next_check_is_clamped_to_the_memory_expiring() -> None:
+    first = snap([adj("a")], [idle("a", car=False)], [], PriceSeries((), NOW))
+
+    result = decide(first)
+
+    assert result.next_check == local(NOW + 30 * MIN)
+
+
+def test_next_check_is_the_next_quarter_when_a_session_has_a_plan() -> None:
+    prices = hourly([0.2] * 48)
+    first = snap([adj("a")], [running("a", 16.0)], [sess("a", need=10.0)], prices)
+
+    result = decide(first)
+
+    assert by_id(result)["a"].plan
+    assert result.next_check == local(NOW + 15 * MIN)
+
+
+def test_next_check_is_a_deadline_still_ahead() -> None:
+    first = snap(
+        [adj("a")],
+        [running("a", 16.0)],
+        [sess("a", ready=time(22, 10), need=0.0)],
+        PriceSeries((), NOW - timedelta(hours=3)),
+    )
+
+    result = decide(first)
+
+    assert result.next_check == local(NOW + 10 * MIN)
+
+
+def test_next_check_is_the_under_use_period_ending() -> None:
+    first = replace(lone_charger(), memory=warm(NOW))
+    first = replace(first, prices=PriceSeries((), NOW - timedelta(hours=3)))
+
+    result = decide(first)
+
+    assert result.next_check == local(NOW + 15 * MIN)
+
+
+def test_next_check_is_the_end_of_the_action_window_when_it_comes_first() -> None:
+    first = snap([adj("a")], [idle("a")], [now_session("a")])
+    d1 = decide(first)
+
+    assert action_tuples(d1) == [("a", ActionKind.RESUME, 16.0, Stage.UP)]
+    assert d1.next_check == local(NOW + 30 * SECOND)
+
+
+def test_next_check_is_the_probe_time_of_a_stopped_charger() -> None:
+    second, d2 = stopped_for_under_use()
+    long_memory = replace(
+        second.settings,
+        max_memory_age=timedelta(hours=3),
+        max_price_age=timedelta(hours=3),
+    )
+
+    _, d3 = run(second, MIN, d2, states=(idle("a"),), settings=long_memory)
+
+    assert d3.next_check == local(second.now + 60 * MIN)  # an hour after the stop
+
+
+def test_next_check_is_the_end_of_a_ramp_period() -> None:
+    first = lone_charger()
+    d1 = decide(first)
+    snapshot, cut = run(first, 15 * MIN, d1)
+
+    _, d3 = run(snapshot, MIN, cut, states=(running("a", 8.0, 7.6),))
+
+    assert d3.next_check == local(snapshot.now + MIN + 5 * MIN)
+
+
+def test_next_check_is_the_earliest_of_several_sources() -> None:
+    first, d1 = paused_for_capacity()
+
+    _, d2 = run(first, 5 * MIN, d1, states=(idle("a"),), **roomy(first))
+
+    # pause ends at +15 min, memory goes out of date at +35 min, prices at +60 min
+    assert d2.next_check == local(NOW + 15 * MIN)
+
+
+def test_next_check_is_never_later_than_the_memory_expiring() -> None:
+    first = snap(
+        [adj("a")],
+        [running("a", 16.0)],
+        [sess("a", need=0.0)],
+        PriceSeries((), NOW),
+    )
+    d1 = decide(first)
+
+    assert d1.next_check is not None
+    assert d1.next_check <= NOW + timedelta(minutes=30)
+    _, d2 = run(first, d1.next_check - NOW, d1)
+    assert reason_of(d2) is None
+
+
+def test_next_check_is_in_the_installation_timezone_across_the_fall_back_night() -> (
+    None
+):
+    now = datetime(2026, 10, 25, 0, 50, tzinfo=UTC)  # 02:50 CEST
+    first = snap(
+        [adj("a")],
+        [running("a", 16.0)],
+        [sess("a", need=10.0)],
+        hourly([0.2] * 24, start=now - timedelta(minutes=5)),
+        now=now,
+    )
+
+    result = decide(first)
+
+    assert result.next_check is not None
+    # compared as instants: a fold time never equals a time in another zone
+    assert result.next_check.astimezone(UTC) == datetime(2026, 10, 25, 1, 0, tzinfo=UTC)
+    assert result.next_check.utcoffset() == timedelta(hours=1)  # 02:00 CET
+
+
+def test_next_check_adds_durations_in_utc_across_the_fold() -> None:
+    now = datetime(2026, 10, 25, 2, 59, 30, tzinfo=ZONE)  # fold=0, 00:59:30 UTC
+    first = replace(
+        snap(
+            [adj("a")],
+            [idle("a", car=False)],
+            [],
+            PriceSeries((), now - timedelta(hours=3)),
+            now=now,
+        ),
+        memory=None,
+    )
+
+    result = decide(first)
+
+    assert result.next_check is not None
+    assert result.next_check.astimezone(UTC) == datetime(
+        2026, 10, 25, 1, 0, 30, tzinfo=UTC
+    )
+
+
+# --- T13: the session start comes from memory ------------------------------------------------------
+
+
+def session_start_run(minutes: list[int]) -> Decision:
+    start = datetime(2026, 10, 21, 4, 0, tzinfo=UTC)  # 06:00 local
+    first = with_settings(
+        snap(
+            [adj("a")],
+            [idle("a")],
+            [sess("a", ready=time(7, 0), need=10.0)],
+            now=start,
+            currents=readings(start),
+        ),
+        max_price_age=timedelta(hours=6),
+    )
+    snapshot, previous = first, decide(first)
+    for minute in minutes:
+        snapshot, previous = run(snapshot, timedelta(minutes=minute), previous)
+    return previous
+
+
+def test_the_deadline_is_seen_from_the_session_start_held_in_memory() -> None:
+    result = session_start_run([25, 25, 25])  # calls at 06:00, 06:25, 06:50, 07:15
+
+    decision = by_id(result)["a"]
+    assert decision.reason.code is ReasonCode.READY_TIME_PASSED
+    assert decision.priority == 3
+    assert decision.deadline == datetime(2026, 10, 21, 7, 0, tzinfo=ZONE)
+
+
+def test_without_memory_the_deadline_is_seen_from_now() -> None:
+    start = datetime(2026, 10, 21, 5, 15, tzinfo=UTC)  # 07:15 local
+    first = replace(
+        snap(
+            [adj("a")],
+            [idle("a")],
+            [sess("a", ready=time(7, 0), need=10.0)],
+            now=start,
+        ),
+        memory=None,
+    )
+
+    decision = by_id(decide(first))["a"]
+
+    assert decision.deadline == datetime(2026, 10, 22, 7, 0, tzinfo=ZONE)
+
+
+def test_a_replug_restarts_the_deadline() -> None:
+    start = datetime(2026, 10, 21, 4, 50, tzinfo=UTC)  # 06:50 local
+    first = snap(
+        [adj("a")],
+        [idle("a")],
+        [sess("a", ready=time(7, 0), need=10.0)],
+        now=start,
+        currents=readings(start),
+    )
+    snapshot, previous = first, decide(first)
+    snapshot, previous = run(
+        snapshot, 25 * MIN, previous, states=(idle("a", car=False),)
+    )
+    _, last = run(snapshot, 10 * MIN, previous, states=(idle("a"),))
+
+    # plugged in again at 07:25, after the ready time: the next one is tomorrow's
+    assert by_id(last)["a"].deadline == datetime(2026, 10, 22, 7, 0, tzinfo=ZONE)
+
+
+def test_a_given_plugged_in_time_is_the_session_start() -> None:
+    start = datetime(2026, 10, 21, 5, 15, tzinfo=UTC)  # 07:15 local
+    plugged = datetime(2026, 10, 21, 4, 0, tzinfo=UTC)
+    first = snap(
+        [adj("a")],
+        [idle("a")],
+        [sess("a", ready=time(7, 0), need=10.0, plugged_in_at=plugged)],
+        now=start,
+    )
+
+    decision = by_id(decide(first))["a"]
+
+    assert decision.deadline == datetime(2026, 10, 21, 7, 0, tzinfo=ZONE)
+
+
+# --- the new memory itself -------------------------------------------------------------------------
+
+
+def test_the_new_memory_lists_the_snapshot_chargers_in_order_and_drops_unknown_ones() -> (
+    None
+):
+    chargers = [adj("z"), adj("a"), fixed("f")]
+    ghost = ChargerMemory("ghost", running=True, switched_at=NOW - 2 * MIN)
+    memory = Memory(
+        saved_at=NOW - MIN, chargers=(ghost,), green_since=NOW - timedelta(hours=1)
+    )
+    first = replace(
+        snap(chargers, [idle("z"), idle("a"), idle("f", 10.0, paused=False)], []),
+        memory=memory,
+    )
+
+    result = decide(first)
+
+    assert result.memory is not None
+    assert result.memory.saved_at == NOW
+    assert [e.charger_id for e in result.memory.chargers] == ["z", "a", "f"]
+
+
+def test_the_new_memory_records_sessions_actions_and_the_guard() -> None:
+    first = snap([adj("a")], [idle("a")], [now_session("a")])
+
+    result = decide(first)
+
+    stored = entry(result)
+    assert result.memory is not None
+    assert result.memory.level is GuardLevel.GREEN
+    assert result.memory.green_since == NOW - timedelta(hours=1)
+    assert stored.car_connected
+    assert stored.running
+    assert stored.selected
+    assert stored.session_start == NOW
+    assert stored.switched_at == NOW
+    assert not stored.stopped_for_capacity
+    assert stored.last_target == 16.0
+    assert stored.last_action_at == NOW
+    assert stored.decreased_at is None
+
+
+def test_the_memory_round_trips_through_json_and_feeds_the_next_call() -> None:
+    first = snap([adj("a")], [idle("a")], [now_session("a")])
+    d1 = decide(first)
+    assert d1.memory is not None
+    data = json.loads(json.dumps(memory_to_dict(d1.memory)))
+
+    restored = memory_from_dict(data)
+    _, d2 = run(first, MIN, d1, memory=restored)
+
+    assert restored == d1.memory
+    assert reason_of(d2) is None
+
+
+def test_deciding_twice_from_the_same_memory_gives_the_same_decision() -> None:
+    first = snap([adj("a")], [running("a", 16.0, 7.0)], [now_session("a")])
+    d1 = decide(first)
+    second = at(first, 15 * MIN, d1)
+
+    assert decide(second) == decide(second)
+    assert second.memory is d1.memory
+
+
+# --- T15: invariants over multi-call sequences -------------------------------------------------------
+
+
+def sequence_settings(rng: random.Random, base: Settings) -> Settings:
+    """Round-2 settings drawn from a small set of values, so timers actually fire."""
+    emergency = rng.choice(
+        [None, None, base.phase_threshold + rng.choice([2.0, 5.0, 12.0])]
+    )
+    return replace(
+        base,
+        emergency_threshold=emergency,
+        emergency_calm=timedelta(seconds=rng.choice([60, 300, 600])),
+        yellow_margin=rng.choice([0.0, 2.0, 4.0]),
+        green_hold=timedelta(seconds=rng.choice([20, 60, 120])),
+        deadband=rng.choice([0.0, 1.0, 2.0, 4.0]),
+        ramp_step=rng.randint(1, 3),
+        ramp_period=timedelta(seconds=rng.choice([60, 300])),
+        under_use_period=timedelta(seconds=rng.choice([60, 300, 900])),
+        reduction=rng.choice(list(Reduction)),
+        under_use_margin=rng.choice([0.5, 1.0, 2.0]),
+        min_pause=timedelta(seconds=rng.choice([0, 120, 900])),
+        hysteresis=timedelta(seconds=rng.choice([0, 1800])),
+        resume_probe=timedelta(seconds=rng.choice([300, 3600])),
+        min_action_interval=timedelta(seconds=rng.choice([0, 30, 120])),
+    )
+
+
+def next_states(
+    rng: random.Random,
+    snapshot: Snapshot,
+    result: Decision,
+    draws: dict[str, float],
+) -> tuple[ChargerState, ...]:
+    """Let the hardware follow the actions, mostly, and drift a little.
+
+    `draws` is how much of its setting each car keeps drawing, fixed per sequence so
+    that under-use lasts long enough to be regulated.
+    """
+    actions = {a.charger_id: a for a in result.actions}
+    chargers = {c.id: c for c in snapshot.chargers}
+    states: list[ChargerState] = []
+    for old in snapshot.states:
+        charger = chargers[old.charger_id]
+        setting, paused = old.current_setting, old.paused
+        action = actions.get(old.charger_id)
+        if action is not None and rng.random() < 0.75:
+            if action.kind is ActionKind.PAUSE:
+                paused = True
+            else:
+                paused = False
+                setting = action.target_current
+        car = old.car_connected if rng.random() > 0.03 else not old.car_connected
+        flip = 0.5 if not old.available else 0.01
+        available = old.available if rng.random() > flip else not old.available
+        nominal = (
+            setting
+            if charger.kind is ChargerKind.ADJUSTABLE
+            else (charger.assumed_current or 0.0)
+        )
+        power: float | None = None
+        if rng.random() < 0.85:
+            if paused or not car:
+                power = rng.choice([0.0, 0.0, rng.uniform(0, 3000)])
+            else:
+                factor = draws.setdefault(
+                    old.charger_id, rng.choice([0.2, 0.5, 0.95, 1.0, 1.0])
+                )
+                power = nominal * 230.0 * len(charger.phases) * factor
+        states.append(
+            ChargerState(old.charger_id, car, setting, paused, power, available)
+        )
+    return tuple(states)
+
+
+def next_snapshot(
+    rng: random.Random,
+    snapshot: Snapshot,
+    result: Decision,
+    draws: dict[str, float],
+) -> Snapshot:
+    delta = timedelta(
+        seconds=rng.choice(
+            [1, 5, 10, 29, 30, 31, 60, 120, 300, 300, 600, 900, 900, 900, 1500, 2400]
+        )
+    )
+    now = snapshot.now + delta
+    sessions = list(snapshot.sessions)
+    if sessions and rng.random() < 0.12:
+        index = rng.randrange(len(sessions))
+        sessions[index] = random_session(rng, sessions[index].charger_id, now)
+    old_prices = snapshot.prices
+    prices = PriceSeries(old_prices.intervals, old_prices.updated_at + delta)
+    currents: PhaseCurrents | None = None
+    if rng.random() < 0.92:
+        currents = PhaseCurrents(
+            now + timedelta(seconds=rng.choice([0, 0, 0, rng.randint(-50, 50), 400])),
+            *(
+                rng.choice(
+                    [rng.uniform(0, 28)] * 5
+                    + [rng.uniform(28, 34)] * 2
+                    + [rng.uniform(34, 48), None]
+                )
+                for _ in Phase
+            ),
+        )
+    memory = result.memory if rng.random() < 0.92 else None
+    return replace(
+        snapshot,
+        now=now,
+        states=next_states(rng, snapshot, result, draws),
+        sessions=tuple(sessions),
+        prices=prices,
+        phase_currents=currents,
+        memory=memory,
+    )
+
+
+def utc(moment: datetime) -> datetime:
+    return moment.astimezone(UTC)
+
+
+def previous_memory(snapshot: Snapshot) -> Memory | None:
+    """The memory `decide` should accept, worked out without its helpers."""
+    memory = snapshot.memory
+    if memory is None:
+        return None
+    age = utc(snapshot.now) - utc(memory.saved_at)
+    if age < timedelta(0) or age > snapshot.settings.max_memory_age:
+        return None
+    return memory
+
+
+def assert_sequence_invariants(snapshot: Snapshot, result: Decision) -> None:
+    """Check one call of a sequence against the promises, independently of `decide`."""
+    cfg = snapshot.settings
+    now = utc(snapshot.now)
+    states = {s.charger_id: s for s in snapshot.states}
+    sessions = {s.charger_id: s for s in snapshot.sessions}
+    decisions = {c.charger_id: c for c in result.chargers}
+    prev = previous_memory(snapshot)
+    interval = cfg.min_action_interval
+    assert [c.charger_id for c in result.chargers] == [c.id for c in snapshot.chargers]
+
+    def reserved(c: Charger) -> bool:
+        return c.kind is ChargerKind.FIXED or not states[c.id].available
+
+    def acts(c: Charger) -> bool:
+        return not reserved(c) and states[c.id].car_connected
+
+    def entry_of(c: Charger) -> ChargerMemory | None:
+        return prev.charger(c.id) if prev is not None else None
+
+    def within(moment: datetime | None, span: timedelta) -> bool:
+        return moment is not None and timedelta(0) <= now - utc(moment) < span
+
+    def present_of(c: Charger) -> float:
+        state = states[c.id]
+        if state.paused:
+            return 0.0
+        return (
+            state.current_setting
+            if c.kind is ChargerKind.ADJUSTABLE
+            else (c.assumed_current or 0.0)
+        )
+
+    def per_phase(c: Charger) -> float | None:
+        power = states[c.id].measured_power_w
+        return None if power is None else power / (cfg.voltage * len(c.phases))
+
+    controllable_phases = {
+        p for c in snapshot.chargers if not reserved(c) for p in c.phases
+    }
+    pc = snapshot.phase_currents
+    fresh = (
+        pc is not None
+        and abs((now - utc(pc.measured_at)).total_seconds())
+        <= cfg.max_measurement_age.total_seconds()
+        and all(pc.get(p) is not None for p in controllable_phases)
+    )
+
+    # memory: usable or a restart
+    resets = [e for e in result.events if e.kind is EventKind.MEMORY_RESET]
+    if prev is None:
+        assert len(resets) == 1
+        reason = snapshot.memory is None and "missing" or None
+        if reason is None:
+            assert resets[0].params["reason"] in ("out_of_date", "future")
+        else:
+            assert resets[0].params["reason"] == reason
+    else:
+        assert not resets
+
+    # the guard
+    level = result.guard_level
+    if fresh and pc is not None:
+        assert level is not None
+        readings_now = [
+            v
+            for p in Phase
+            if p in controllable_phases and (v := pc.get(p)) is not None
+        ]
+        over_emergency = cfg.emergency_threshold is not None and any(
+            v > cfg.emergency_threshold for v in readings_now
+        )
+        if over_emergency:
+            assert level is GuardLevel.EMERGENCY
+    else:
+        latched = prev is not None and prev.level is GuardLevel.EMERGENCY
+        assert level is None or (level is GuardLevel.EMERGENCY and latched)
+    if cfg.emergency_threshold is None:
+        assert level is not GuardLevel.EMERGENCY
+    assert (level is GuardLevel.EMERGENCY) == (result.status is Status.EMERGENCY)
+    blocked = bool(resets) or (
+        fresh and level in (GuardLevel.YELLOW, GuardLevel.RED, GuardLevel.EMERGENCY)
+    )
+    green_held = (
+        fresh
+        and prev is not None
+        and (prev.green_since is None or now - utc(prev.green_since) < cfg.green_hold)
+    )
+
+    stages: list[Stage] = []
+    seen: set[str] = set()
+    for sent in result.actions:
+        assert sent.charger_id not in seen
+        seen.add(sent.charger_id)
+        stages.append(sent.stage)
+    assert stages == sorted(stages, key=lambda s: s is Stage.UP)
+    for stage in Stage:
+        ids = [a.charger_id for a in result.actions if a.stage is stage]
+        assert ids == sorted(ids)
+    by_charger = {a.charger_id: a for a in result.actions}
+
+    for c in snapshot.chargers:
+        state, decision = states[c.id], decisions[c.id]
+        alloc = decision.allocation
+        if reserved(c):
+            measured = per_phase(c) or 0.0
+            level_c = (
+                c.assumed_current or 0.0
+                if c.kind is not ChargerKind.ADJUSTABLE
+                else state.current_setting
+            )
+            assert alloc == pytest.approx(max(level_c, measured))
+            assert c.id not in by_charger
+            continue
+        if not state.car_connected or sessions.get(c.id) is None:
+            assert alloc == 0.0
+        if decision.priority == 4:
+            assert alloc == 0.0
+        if level is GuardLevel.EMERGENCY:
+            assert alloc == 0.0
+        if not acts(c):
+            assert c.id not in by_charger
+            continue
+        stored = entry_of(c)
+        window = (
+            stored is not None
+            and stored.last_target is not None
+            and within(stored.last_action_at, interval)
+        )
+        last_sent = stored.last_target if stored is not None else None
+        present = present_of(c)
+        command = last_sent if window and last_sent is not None else present
+        action = by_charger.get(c.id)
+        in_flight = window and last_sent is not None and abs(last_sent - alloc) <= 1e-9
+        # the command the hardware ends up at is the allocation (nothing is left in flight)
+        if action is not None:
+            effective = action.target_current
+        elif in_flight and last_sent is not None:
+            effective = last_sent
+        else:
+            effective = command
+        assert effective == pytest.approx(alloc, abs=1e-9)
+        # an action exists exactly when the allocation differs from where it is going
+        expected: tuple[ActionKind, float, Stage] | None
+        if in_flight:
+            expected = None
+        elif alloc <= 0:
+            expected = (ActionKind.PAUSE, 0.0, Stage.DOWN) if command > 0 else None
+        elif window:
+            expected = (
+                None
+                if abs(alloc - command) <= 1e-9
+                else (
+                    ActionKind.SET_CURRENT,
+                    alloc,
+                    Stage.DOWN if alloc < command else Stage.UP,
+                )
+            )
+        elif state.paused:
+            expected = (ActionKind.RESUME, alloc, Stage.UP)
+        elif abs(alloc - present) > 1e-9:
+            expected = (
+                ActionKind.SET_CURRENT,
+                alloc,
+                Stage.DOWN if alloc < present else Stage.UP,
+            )
+        else:
+            expected = None
+        got = (
+            None
+            if action is None
+            else (action.kind, action.target_current, action.stage)
+        )
+        assert got == expected
+        # increases
+        increases = (
+            action is not None and action.stage is Stage.UP
+        ) or alloc > command + 1e-6
+        if blocked:
+            assert not increases
+        if green_held:
+            assert not (action is not None and action.stage is Stage.UP)
+        if stored is not None and within(stored.last_action_at, interval):
+            assert not (action is not None and action.stage is Stage.UP)
+        if window:
+            assert alloc <= (last_sent or 0.0) + 1e-9
+        # the minimum pause
+        if (
+            stored is not None
+            and stored.stopped_for_capacity
+            and not stored.running
+            and within(stored.switched_at, cfg.min_pause)
+            and decision.priority in (2, 3, 4)
+        ):
+            assert alloc == 0.0
+
+    # limits of each charger
+    for c in snapshot.chargers:
+        if reserved(c):
+            continue
+        alloc = decisions[c.id].allocation
+        session = sessions.get(c.id)
+        limit = (
+            float(session.user_current_limit)
+            if session and session.user_current_limit is not None
+            else None
+        )
+        cap = float(
+            c.fallback_current
+            if c.fallback_current is not None
+            else cfg.fallback_current
+        )
+        if c.kind is ChargerKind.ADJUSTABLE:
+            assert c.min_current is not None
+            assert c.max_current is not None
+            assert alloc == 0.0 or c.min_current <= alloc <= c.max_current
+            assert alloc == int(alloc)
+            if limit is not None:
+                assert alloc <= limit
+            if not fresh:
+                assert alloc <= cap
+            stored = (
+                next(e for e in result.memory.chargers if e.charger_id == c.id)
+                if result.memory
+                else None
+            )
+            if stored is not None and stored.regulated_cap is not None:
+                assert alloc <= stored.regulated_cap
+        else:
+            assumed = c.assumed_current or 0.0
+            assert alloc == 0.0 or alloc == pytest.approx(assumed)
+            if alloc > 0:
+                assert limit is None or assumed <= limit
+                assert fresh or assumed <= cap
+
+    # budget and phase guard
+    for phase in Phase:
+        on_phase = [c for c in snapshot.chargers if phase in c.phases]
+        held = sum(decisions[c.id].allocation for c in on_phase if reserved(c))
+        given = sum(decisions[c.id].allocation for c in on_phase if not reserved(c))
+        assert given <= max(0.0, cfg.phase_budget - held) + TOLERANCE
+        reading = pc.get(phase) if pc is not None else None
+        if fresh and reading is not None:
+            draw = 0.0
+            for c in on_phase:
+                state = states[c.id]
+                drawn = per_phase(c)
+                stored = entry_of(c)
+                settling = stored is not None and within(stored.decreased_at, interval)
+                if reserved(c):
+                    draw += drawn if drawn is not None else decisions[c.id].allocation
+                elif settling and state.car_connected and drawn is not None:
+                    draw += drawn
+                elif state.paused or not state.car_connected:
+                    draw += 0.0
+                else:
+                    nominal = present_of(c)
+                    draw += nominal if drawn is None else min(nominal, drawn)
+            bound = max(
+                0.0,
+                min(cfg.phase_budget, cfg.phase_threshold - (reading - draw)) - held,
+            )
+            assert given <= bound + TOLERANCE
+        assert 0.0 <= result.available.get(phase) <= cfg.phase_budget + TOLERANCE
+
+    served = {
+        decisions[c.id].priority
+        for c in snapshot.chargers
+        if not reserved(c)
+        and decisions[c.id].allocation > 0
+        and decisions[c.id].priority is not None
+    }
+    assert len(served) <= 1
+    assert served <= {1, 2, 3}
+
+    # the memory and the next check
+    assert result.memory is not None
+    assert result.memory.saved_at == snapshot.now
+    assert [e.charger_id for e in result.memory.chargers] == [
+        c.id for c in snapshot.chargers
+    ]
+    assert (
+        memory_from_dict(json.loads(json.dumps(memory_to_dict(result.memory))))
+        == result.memory
+    )
+    if result.next_check is not None:
+        assert utc(result.next_check) > now
+        assert utc(result.next_check) <= now + cfg.max_memory_age
+        assert (
+            result.next_check.utcoffset()
+            == utc(result.next_check).astimezone(ZONE).utcoffset()
+        )
+
+
+@settings(deadline=None, max_examples=150, derandomize=True)
+@given(st.randoms(use_true_random=False))
+def test_the_promises_hold_across_sequences_of_calls_feeding_memory_forward(
+    rng: random.Random,
+) -> None:
+    snapshot = random_snapshot(rng)
+    snapshot = replace(
+        snapshot,
+        settings=sequence_settings(rng, snapshot.settings),
+        memory=None if rng.random() < 0.5 else warm(snapshot.now),
+    )
+    draws: dict[str, float] = {}
+    for _ in range(rng.randint(2, 6)):
+        result = decide(snapshot)
+
+        assert_sequence_invariants(snapshot, result)
+        assert decide(snapshot) == result
+        snapshot = next_snapshot(rng, snapshot, result, draws)
+
+
+def friendly_snapshot(rng: random.Random) -> Snapshot:
+    """A plain installation where every timer can fire: few cars, room to move."""
+    now = rng.choice(BASES) + timedelta(minutes=rng.randint(0, 59))
+    base = Settings(
+        rng.choice([16.0, 25.0, 32.0]),
+        40.0,
+        rng.choice([6, 8]),
+        TZ,
+        default_energy_need_kwh=rng.uniform(5, 40),
+    )
+    chargers: list[Charger] = []
+    for index in range(rng.randint(1, 3)):
+        phases = frozenset(rng.sample(list(Phase), rng.choice([1, 1, 2])))
+        low = rng.choice([6, 6, 8])
+        chargers.append(Charger(f"c{index}", phases, ChargerKind.ADJUSTABLE, low, 16))
+    states = [
+        ChargerState(
+            c.id,
+            True,
+            rng.choice([0.0, 6.0, 10.0, 16.0]),
+            rng.random() < 0.4,
+            None,
+        )
+        for c in chargers
+    ]
+    sessions = [
+        Session(
+            c.id,
+            time(rng.randint(5, 9), 0),
+            energy_need_kwh=rng.uniform(2, 50),
+            charge_now=rng.random() < 0.5,
+            smart_charging=rng.random() < 0.9,
+        )
+        for c in chargers
+    ]
+    values = [rng.uniform(0.1, 3.0)] * 8 + [rng.uniform(0.1, 3.0)]
+    hour = now.replace(minute=0, second=0, microsecond=0)
+    prices = hourly(
+        [0.2 + 0.1 * (i % 5) * rng.choice(values) for i in range(60)], hour, now
+    )
+    currents = PhaseCurrents(now, *(rng.uniform(0, 30) for _ in Phase))
+    settings_now = sequence_settings(rng, base)
+    return Snapshot(
+        now,
+        settings_now,
+        tuple(chargers),
+        tuple(states),
+        tuple(sessions),
+        prices,
+        currents,
+        warm(now),
+    )
+
+
+@settings(deadline=None, max_examples=120, derandomize=True)
+@given(st.randoms(use_true_random=False))
+def test_the_promises_hold_across_plain_sequences_where_every_timer_can_fire(
+    rng: random.Random,
+) -> None:
+    snapshot = friendly_snapshot(rng)
+    draws: dict[str, float] = {}
+    for _ in range(rng.randint(3, 8)):
+        result = decide(snapshot)
+
+        assert_sequence_invariants(snapshot, result)
+        assert decide(snapshot) == result
+        snapshot = next_snapshot(rng, snapshot, result, draws)
+
+
+# --- T15: speed with a full memory --------------------------------------------------------------------------
+
+
+def test_ten_chargers_and_a_48_hour_series_decide_in_under_100_ms_with_a_full_memory() -> (
+    None
+):
+    first = large_snapshot()
+    d0 = decide(first)
+    assert d0.memory is not None
+    stamp = NOW - 2 * MIN
+    full = tuple(
+        replace(
+            e,
+            running=True,
+            selected=True,
+            stopped_for_capacity=False,
+            regulated_cap=10,
+            under_use_since=stamp,
+            full_use_since=stamp,
+            switched_at=stamp,
+            last_target=10.0,
+            last_action_at=stamp,
+            decreased_at=stamp,
+        )
+        for e in d0.memory.chargers
+    )
+    memory = Memory(
+        saved_at=NOW,
+        chargers=full,
+        level=GuardLevel.GREEN,
+        green_since=NOW - timedelta(hours=1),
+    )
+    later = NOW + MIN
+    snapshot = replace(
+        first,
+        now=later,
+        phase_currents=PhaseCurrents(later, 0.0, 0.0, 0.0),
+        memory=memory,
+    )
+    durations = []
+    for _ in range(5):
+        started = clock.perf_counter()
+        result = decide(snapshot)
+        durations.append(clock.perf_counter() - started)
+
+    assert len(result.chargers) == 10
+    assert reason_of(result) is None
+    assert result.memory is not None
+    assert any(e.regulated_cap is not None for e in result.memory.chargers)
+    assert min(durations) < 0.1
 
 
 def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:
