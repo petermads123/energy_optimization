@@ -608,6 +608,30 @@ Where the fix differs from the implementation guide, the guide's text is superse
 - **Settling** counts a charger's measured draw only when it has a car (`allocation`).
 - **Guard** ignores a `green_since` carried by a yellow or red memory.
 
+### Changed in step 3, re-run after step 6 (R-A2 and R-A4)
+
+Step 6 sent the round back for the planned-tier hysteresis (`_keep_places`, added at step
+5): R-A2, the minimum on-time and the minimum pause do not hold in the planned tier, and
+R-A4, a restored charger's stand-alone plan overbooks a phase (a regression of round-1 A4).
+Both reproductions are written as tests in `tests/test_ev_decide.py` (section "Send-back
+after step 6") and were run against the code as step 6 left it (commit `21c5acd`) before
+anything was fixed. Red run:
+
+```
+$ pytest tests/test_ev_decide.py -k "started_planned or in_the_middle_of_a_newcomers or displaced_for_capacity or never_book" -q --tb=short
+collected 298 items / 294 deselected / 4 selected
+tests/test_ev_decide.py FFFF                                             [100%]
+_ test_a_started_planned_charger_is_not_dropped_for_a_more_urgent_one_within_the_pause _
+E   AssertionError: assert {'a': 0.0, 'b': 6.0} == {'a': 6.0, 'b': 0.0}          (22:05: a demoted after 5 min)
+_ test_a_planned_charger_that_stops_in_the_middle_of_a_newcomers_stay_is_not_restarted _
+E   AssertionError: assert (Action(charg...e.UP: 'up'>),) == ()                   (22:15: a restarts 10 min after it stopped)
+_ test_a_planned_charger_displaced_for_capacity_cannot_restart_before_the_minimum_pause _
+E   AssertionError: assert [] == [('a', <Actio...ge.UP: 'up'>)]                   (22:15: a was already dropped at 22:05)
+_______ test_planned_charger_plans_never_book_more_than_the_phase_holds ________
+E   AssertionError: assert 12.0 <= 6.0                                            (18 quarters booked at 12 A on a 6 A phase)
+4 failed, 294 deselected in 0.61s
+```
+
 ---
 
 ## 4. Verification log

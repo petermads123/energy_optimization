@@ -3097,6 +3097,136 @@ def test_a_selected_charger_the_plan_moved_to_later_quarters_stays_moved_without
     assert allocations(result)["a"] == 0.0
 
 
+# --- Send-back after step 6: the planned tier keeps its places (R-A2, R-A4) -----------------
+#
+# `a` (ready 08:45) and `b` (ready 07:00 or 08:30) share one 6 A phase and each needs 6 kWh,
+# which is 18 quarters at 6 A. The four cheap hours come first, so both want the same
+# quarters. Calls are five minutes apart and the previous decision's allocations are
+# executed before the next call.
+
+PLANNED_PRICES = hourly([0.10] * 4 + [0.30] * 44)
+
+
+def planned_pair_start() -> tuple[Snapshot, Decision]:
+    """Call 1 at 22:00: only `a` is plugged in, and it is started."""
+    first = snap(
+        [adj("a"), adj("b")],
+        [idle("a"), idle("b", car=False)],
+        [sess("a", ready=time(8, 45), need=6.0)],
+        PLANNED_PRICES,
+        budget=6.0,
+    )
+    return first, decide(first)
+
+
+def planned_pair_next(
+    snapshot: Snapshot, previous: Decision, ready_b: time | None, delta: timedelta
+) -> tuple[Snapshot, Decision]:
+    """The next call: `b` is plugged in with ready time `ready_b`, or not at all."""
+    amps = allocations(previous)
+    now = snapshot.now + delta
+    sessions = [sess("a", ready=time(8, 45), need=6.0)]
+    states = [running("a", amps["a"]) if amps["a"] > 0 else idle("a")]
+    if ready_b is None:
+        states.append(idle("b", car=False))
+    else:
+        sessions.append(sess("b", ready=ready_b, need=6.0))
+        states.append(running("b", amps["b"]) if amps["b"] > 0 else idle("b"))
+    return run(
+        snapshot,
+        delta,
+        previous,
+        states=tuple(states),
+        sessions=tuple(sessions),
+        currents=readings(now, amps["a"] + amps["b"]),
+    )
+
+
+def test_a_started_planned_charger_is_not_dropped_for_a_more_urgent_one_within_the_pause() -> (
+    None
+):
+    first, d1 = planned_pair_start()
+    second, d2 = planned_pair_next(first, d1, time(7, 0), 5 * MIN)
+    _, d3 = planned_pair_next(second, d2, time(7, 0), 5 * MIN)
+
+    assert allocations(d1) == {"a": 6.0, "b": 0.0}
+    for decision in (d2, d3):
+        assert allocations(decision) == {"a": 6.0, "b": 0.0}
+        assert by_id(decision)["a"].priority == 2
+        assert by_id(decision)["a"].reason.code is ReasonCode.IN_PLAN
+        assert decision.actions == ()
+
+
+def test_a_planned_charger_that_stops_in_the_middle_of_a_newcomers_stay_is_not_restarted() -> (
+    None
+):
+    first, d1 = planned_pair_start()
+    second, d2 = planned_pair_next(first, d1, time(7, 0), 5 * MIN)
+    third, d3 = planned_pair_next(second, d2, time(7, 0), 5 * MIN)
+
+    _, d4 = planned_pair_next(third, d3, None, 5 * MIN)
+
+    assert allocations(d4) == {"a": 6.0, "b": 0.0}
+    assert d4.actions == ()
+
+
+def test_a_planned_charger_displaced_for_capacity_cannot_restart_before_the_minimum_pause() -> (
+    None
+):
+    first, d1 = planned_pair_start()
+    second, d2 = planned_pair_next(first, d1, time(7, 0), 5 * MIN)
+    third, d3 = planned_pair_next(second, d2, time(7, 0), 5 * MIN)
+    fourth, d4 = planned_pair_next(third, d3, time(7, 0), 5 * MIN)
+    fifth, d5 = planned_pair_next(fourth, d4, None, 5 * MIN)
+    sixth, d6 = planned_pair_next(fifth, d5, None, 5 * MIN)
+    _, d7 = planned_pair_next(sixth, d6, None, 5 * MIN)
+
+    # 22:15: the minimum on-time is over, so the far more urgent newcomer takes over.
+    assert allocations(d4) == {"a": 0.0, "b": 6.0}
+    assert action_tuples(d4) == [
+        ("a", ActionKind.PAUSE, 0.0, Stage.DOWN),
+        ("b", ActionKind.RESUME, 6.0, Stage.UP),
+    ]
+    assert entry(d4).stopped_for_capacity
+    assert entry(d4).switched_at == NOW + 15 * MIN
+    # 22:20 and 22:25: the newcomer has left, but `a` was stopped for capacity.
+    for decision in (d5, d6):
+        assert allocations(decision) == {"a": 0.0, "b": 0.0}
+        assert by_id(decision)["a"].reason.code is ReasonCode.MINIMUM_PAUSE
+        assert by_id(decision)["a"].reason.params["until"] == (
+            local(NOW + 30 * MIN).isoformat()
+        )
+        assert decision.actions == ()
+    # 22:30: the pause has passed.
+    assert allocations(d7) == {"a": 6.0, "b": 0.0}
+    assert action_tuples(d7) == [("a", ActionKind.RESUME, 6.0, Stage.UP)]
+
+
+def test_planned_charger_plans_never_book_more_than_the_phase_holds() -> None:
+    first, d1 = planned_pair_start()
+    second, d2 = planned_pair_next(first, d1, None, 5 * MIN)
+    third, d3 = planned_pair_next(second, d2, None, 5 * MIN)
+    _, d4 = planned_pair_next(third, d3, time(8, 30), 5 * MIN)
+
+    # 22:15: `b` is only 15 minutes earlier, so the selected `a` keeps its place.
+    assert allocations(d4) == {"a": 6.0, "b": 0.0}
+    booked: dict[datetime, float] = {}
+    for charger in d4.chargers:
+        for quarter in charger.plan:
+            booked[quarter.start] = booked.get(quarter.start, 0.0) + quarter.current
+    assert booked
+    assert max(booked.values()) <= 6.0
+    a, b = by_id(d4)["a"], by_id(d4)["b"]
+    assert {q.start for q in a.plan}.isdisjoint({q.start for q in b.plan})
+    assert a.priority == 2
+    assert b.priority == 4
+    # Both finish where their own plan ends, and both make their ready time.
+    assert a.reaches_target is True
+    assert b.reaches_target is True
+    assert a.expected_finish == a.plan[17].start + QUARTER
+    assert b.expected_finish == b.plan[17].start + QUARTER
+
+
 # --- T7/T8: regulation through decide -------------------------------------------------------
 
 
