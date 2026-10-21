@@ -1,6 +1,6 @@
 # EV charging decision core
 
-<!-- claude-plan step=5 status=active -->
+<!-- claude-plan step=6 status=active -->
 
 | Field | Value |
 |---|---|
@@ -17,7 +17,7 @@
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | done |
-| 5 | Test | `/test` | in `/build` | pending |
+| 5 | Test | `/test` | in `/build` | done |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
@@ -478,8 +478,12 @@ Every module also has `main() -> None`, the showcase the conventions require.
       can run; nobody in priority 4 ever gets current. Active claims ranked by deadline
       (earliest first; for priority 3 the most overdue first), then larger remaining need,
       then id; `share` against the remaining `cap`. Chargers in lower tiers get 0 with
-      `WAITING_FOR_HIGHER_PRIORITY` (priority 4 keeps `PLANNED_LATER`); an active-tier
-      charger that got 0 gets `WAITING_FOR_CAPACITY`.
+      `WAITING_FOR_HIGHER_PRIORITY` (priority 4 keeps `PLANNED_LATER` unless it is
+      *starved*, below); an active-tier charger that got 0 gets `WAITING_FOR_CAPACITY`. A
+      charger that can run, was planned and got an empty plan is *starved*: its reason is
+      `WAITING_FOR_CAPACITY` and its priority stays 4, whatever used the planning capacity
+      up (reservations, smart-charging-off allocations or another session's plan) *(changed
+      in step 5 of the re-run: it was "below its minimum on one of its phases")*.
    8. **Actions**, compared with the present state (present = 0 if paused, else
       `current_setting`, for on/off `assumed_current` when not paused), never for reserved
       or carless chargers: target 0 and present > 0 → `PAUSE` (down); target > 0 and
@@ -498,13 +502,14 @@ Every module also has `main() -> None`, the showcase the conventions require.
    11. **Status**, first that applies: `PHASE_DATA_STALE` if fallback; `PRICES_STALE` if
        prices stale; `WAITING_FOR_CAPACITY` if the active tier has a charger that can run
        and every active-tier charger got 0, or if a starved charger exists (a session that
-       can run, was planned, got an empty plan and whose planning capacity is below its
-       minimum on one of its phases — its reason is `WAITING_FOR_CAPACITY`, its priority
-       stays 4) and every active-tier and every starved charger got 0 *(changed in the
-       step-3 re-run after step 6, A2; see section 3)*; `LIMITED_BY_PHASE` if an active-tier or
-       smart-off charger got less than its effective max and one of its phases has
+       can run, was planned and got an empty plan — its reason is `WAITING_FOR_CAPACITY`,
+       its priority stays 4) and every active-tier and every starved charger got 0 *(changed
+       in the step-3 re-run after step 6, A2, and in step 5 of the re-run; see section 3)*;
+       `LIMITED_BY_PHASE` if an active-tier, smart-off or starved charger got less than its
+       effective max and one of its phases has
        `threshold − other load < budget`; `LIMITED_BY_BUDGET` if one got less than its
-       effective max otherwise; `NORMAL`.
+       effective max otherwise; `NORMAL`. A starved charger beside a served one therefore
+       reads as limited, never `NORMAL`.
    12. **Reasons:** a code, params (always `priority` when there is one; `allocation`;
        `need_source` when a session exists; `capped_by` one of `"max"`, `"user_limit"`,
        `"fallback"`, `"budget"`, `"phase"` when an allocated charger is below its own max)
@@ -708,6 +713,23 @@ no public signature, no `ReasonCode` member and no tier changed (the session kee
   `test_a_planned_charger_held_back_only_by_the_phase_guard_stays_normal`.
 - Not touched: `STRUCTURE.md` (no public change).
 
+### Changed in step 5, re-run (after the step-3 re-run for A2)
+
+Two test-designer reports on the starved rule found two ways the re-run left a reason or a
+status untruthful. Both are fixed in `ev/decide.py` only; no public signature, no
+`ReasonCode` member, no priority and no tier changed.
+
+- *Starved* is now "can run, was planned, got an empty plan" (was: and the planning capacity
+  is below its minimum on one of its phases). An empty plan can only come from capacity — the
+  horizon is never empty for a session with a future deadline and unpriced quarters are
+  usable — so the narrower test only missed capacity consumed by another session's plan, whose
+  charger still read "charging is planned for later quarters" (A6: the reason must be true).
+- `_status` counts a starved charger as *short* beside served ones, so a starved charger next
+  to an active charger that is fully served reads `limited_by_budget` / `limited_by_phase`,
+  not `normal` (section 6's complaint that the status said "normal" while nothing could ever
+  be planned). Every case where all active and starved chargers get 0 is unchanged.
+- Guide 8.7 and 8.11 now describe this.
+
 ---
 
 ## 4. Verification log
@@ -849,6 +871,56 @@ planning/allocation/decide) were merged; duplicates dropped, every contradiction
 - Duplicate ids inside `share` / `plan_sessions`: `decide` cannot produce them.
 - A mutation of tier exclusivity was not caught by the property because the mutant did not
   change behaviour; the tier rule is pinned by the explicit tier tests instead.
+
+### Re-run after step 6 (A2 send-back; step-3 re-run commit `9e8b11c`)
+
+The record above stands. This is step 5 on the re-run: the changed rule is `decide`'s
+starved rule and the status it feeds. Two `test-designer` reports (input-space, contract;
+13 cases each, six contradictions between them) were merged: duplicates dropped (the
+boundary, smart-off, running-charger and stale-data cases appeared in both), every
+contradiction decided below. 28 test cases (16 functions) were added to `tests/test_ev_decide.py` (1113 →
+1141 passing); the existing tests needed no change.
+
+| Intent | Test names (all `tests/test_ev_decide.py`) | Result |
+|---|---|---|
+| T3 / A2: "waiting for capacity" when less than min is left, in its boundaries | `test_planning_capacity_is_starved_only_below_the_adjustable_minimum` (6.0 A, 6.0 A + 5e-10, 5.5 A, 3 A), `test_planning_capacity_is_starved_below_the_assumed_current_of_an_on_off_charger`, `test_one_phase_below_the_minimum_starves_a_multi_phase_charger`, `test_an_on_off_charger_starves_while_an_adjustable_on_its_phase_plans` | pass |
+| T3 / A2: all active and starved chargers at 0 | `test_an_active_tier_at_zero_and_a_starved_charger_wait_for_capacity`, `test_a_starved_charger_beside_a_charger_planned_for_later_waits_for_capacity`, `test_smart_charging_off_allocations_can_starve_a_smart_session` (limit 10 / 11 / none) | pass |
+| T3 / A2 mixed case | `test_a_starved_charger_beside_a_served_one_limits_the_status` (served is smart, served is charge-now) | pass (red on the previous code) |
+| A6 reason truthfulness | `test_an_empty_plan_left_by_another_sessions_plan_is_waiting_for_capacity` | pass (red on the previous code) |
+| T5 / T13 precedence | `test_a_user_limit_below_the_minimum_is_not_reported_as_starved` (4 A and 6 A), `test_stale_phase_data_outranks_a_starved_charger_in_the_status` (global and own fallback), `test_stale_prices_never_mark_a_session_starved` | pass |
+| T15 / T16 / T18 | `test_a_running_starved_charger_is_paused` (pause, down stage), `test_a_starved_session_reports_what_it_will_reach_and_is_not_on_target` (event params with delivered energy, no price-cap event), `test_the_starved_reason_has_a_stable_text_and_params` (energy / default / SOC need source, text and params), `test_a_starved_snapshot_is_pure_and_repeatable` | pass |
+
+The new tests run against the previous `decide.py` (commit `b2e115e`): the three marked red
+fail — the two mixed-case parameters and the other-session empty plan — and the other 25
+pass, so they pin behaviour the re-run already had. Against the fixed code all 1141 pass.
+
+**Decisions on the four open points**
+
+| Point | Decision | Why it stays within section 1 |
+|---|---|---|
+| (a) An empty plan left by another session's plan read "charging is planned for later quarters" | **Fixed.** Starved = can run, planned, empty plan (see section 3, "Changed in step 5, re-run"). Reason `WAITING_FOR_CAPACITY` ("Priority 4 — waiting for capacity"), priority 4 and tiers untouched | A6 promises an explainable reason; a sentence that says charging is planned when nothing is planned is false. Reading the reason off the plan (empty, so capacity) needs no new priority and no new rule |
+| (b) Status `waiting_for_capacity` while a smart-charging-off charger draws current | **Pinned as built** (`test_smart_charging_off_allocations_can_starve_a_smart_session`). Not changed | A2 is about smart chargers ("every connected smart charger ... everyone gets 0"); section 1's order of service serves smart-off chargers first and gives the smart ones what is left, so with less than a minimum left every smart charger gets 0 and the status is "waiting for capacity". The existing smart-off test already encoded the same reading |
+| (c) Status `normal` for a starved charger beside a served one | **Fixed.** A starved charger counts as short in `_status`: the mixed case reads `limited_by_budget` or `limited_by_phase` | Section 1 names the statuses and A2 decides only the all-zero case; for the mixed case "normal" repeats the complaint of section 6 (status "normal" while nothing can ever be planned) and "limited by budget" is what the budget causes. No priority or allocation changes |
+| (d) Guide 8.7 said priority 4 keeps `PLANNED_LATER` | **Fixed in the plan**: 8.7 and 8.11 now describe the code | Section 2 describes the code, as at step 4 |
+
+Other contradictions the reports raised, none of which needs a decision from section 1:
+a user limit below the minimum with too little capacity left gives `BELOW_MINIMUM` and
+status `normal` — it predates the re-run, the cause is the limit, not capacity, and A2's
+"less than min available" does not cover it (pinned by the 4 A parameter); the order
+`PRICES_STALE` before `WAITING_FOR_CAPACITY` cannot meet a starved charger, since stale
+prices send every session to priority 3 before planning (pinned by the stale-prices test).
+
+**Considered and deliberately skipped (re-run)**
+
+- A starved charger when `plan_cap` is an exact multiple-of-EPS boundary beyond 5e-10:
+  float noise is a property of the planner's `floor(room + EPS)`; the 5e-10 row pins the
+  edge the starved test shares with it.
+- A charger whose plan is empty for a reason other than capacity: none exists (a future
+  deadline gives at least one quarter, unpriced quarters are usable, and a user limit below
+  the minimum means it cannot run, not starved).
+- `capped_by` on a starved charger: it has allocation 0, so none is reported by design.
+
+Final run: `ruff check .`, `ruff format --check .`, `mypy` clean; `pytest` 1141 passed.
 
 ## 6. Concept check
 
