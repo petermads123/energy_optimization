@@ -1,6 +1,6 @@
 # EV charging decision core
 
-<!-- claude-plan step=8 status=active -->
+<!-- claude-plan step=8 status=done -->
 
 | Field | Value |
 |---|---|
@@ -20,7 +20,7 @@
 | 5 | Test | `/test` | in `/build` | done |
 | 6 | Concept check | `/concept-check` | in `/build` | done |
 | 7 | Ship | `/ship` | in `/build` | done |
-| 8 | Recommend | `/recommend` | with the user | pending |
+| 8 | Recommend | `/recommend` | with the user | done |
 | 9 | Pull request | `/create-pr` | with the user | pending |
 | 10 | Review | `/watch-pr` | on the pull request | pending |
 
@@ -1088,7 +1088,7 @@ none missing.
 
 | # | Recommendation | Why it is critical | Effort | Decision |
 |---|---|---|---|---|
-| R1 | | | | |
+| R1 | **Round 2 — behaviour over time:** memory between calls (and a conservative start when it is missing or invalid), minimum on/off pause, selection hysteresis, deadband, ramp-up, under-use reduction, the resume probe, the phase guard's yellow/red/emergency levels over time, and the minimum time between actions on one charger (doc scenarios 6, 8–11, 16, 21). | Section 1 names it as the second half of this feature on this branch. Without it the core re-decides from scratch every call: a charger at the edge of capacity is switched on and off every quarter, a car that under-draws keeps its allocation forever, and a phase above the threshold only shrinks headroom instead of triggering the red/emergency reaction doc §13 requires — unfit for the HA installation section 1 targets. | large | **next round** — agreed by the user at step 1 ("Two rounds, one PR") |
 
 Decisions: `deferred`, `rejected`, or `next round` — a new numbered file in this folder,
 taken back through steps 1 to 7 on the same branch.

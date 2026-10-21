@@ -25,3 +25,11 @@ step: a later round once the core's input/output shapes have settled after round
 car sleeps, so a session's SOC can be hours old. The core takes SOC as given; judging its
 age is the caller's job for now. Next step: decide whether a session should carry the SOC's
 timestamp and the core should distrust an old one.
+
+## `feat/ev-charging-core` round 1 notes
+
+2026-10-21, from round 1's step 5 and step 6 records (`development/feat/ev-charging-core/01-decision-core.md`, section 5).
+
+- A `plugged_in_at` later than `now` (clock skew) moves the deadline a full day when the ready time falls in between; section 1 does not decide it. Next step: reject or clamp a future `plugged_in_at` once a real caller shows whether it happens.
+- Planning credits a part-used quarter (the one holding `now`, or the last one before an off-grid ready time) as a whole quarter; the error is at most one quarter and self-corrects on the next call. Next step: revisit if ready times off the 15-minute grid matter in practice.
+- `LIMITED_BY_PHASE` is chosen when any phase of a short charger has its guard below the budget, even when another phase binds; the status is informational. Next step: attribute per binding phase if the status is ever acted on.
