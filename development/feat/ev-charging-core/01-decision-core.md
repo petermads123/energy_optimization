@@ -1,6 +1,6 @@
 # EV charging decision core
 
-<!-- claude-plan step=7 status=active -->
+<!-- claude-plan step=8 status=active -->
 
 | Field | Value |
 |---|---|
@@ -19,7 +19,7 @@
 | 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | done |
 | 6 | Concept check | `/concept-check` | in `/build` | done |
-| 7 | Ship | `/ship` | in `/build` | pending |
+| 7 | Ship | `/ship` | in `/build` | done |
 | 8 | Recommend | `/recommend` | with the user | pending |
 | 9 | Pull request | `/create-pr` | with the user | pending |
 | 10 | Review | `/watch-pr` | on the pull request | pending |
@@ -1064,8 +1064,16 @@ and reads as before. A2 is met, so this is not a second failure of the same crit
 
 | Field | Value |
 |---|---|
-| Commits | |
-| Pushed to | |
+| Commits | 22 commits on top of `main` (`aa646d8`, unmoved: `origin/main` fetched at ship). By step: 1 `37aad2a` Concept; 2 `a43bf51` Plan, `7a0467a` Plan (reviewed and accepted); 3 `11250c6`, `39f27dd`, `c6a78ff` WIP step 3, `d69c87a` Add EV charging decision core; 4 `4c15ecb` WIP step 4, `1fec06b` Verify; 5 `5615a09`, `8441bd6`, `52a9aa5`, `70a1a8e`, `9154d43`, `7688400`, `ef6aef6` WIP step 5, `6d18ef2` Test; 6 `348b2b0` Concept check; A2 send-back re-run: `9e8b11c` Report waiting for capacity when planning capacity is below the minimum, `b2e115e` Verify (re-run), `4cb6db3` WIP step 5, `711bdda` Test (re-run), `14c8abf` Concept check (re-run); 7 the `Ship: EV charging decision core` commit that closes this round |
+| Pushed to | `origin/feat/ev-charging-core` |
+
+Gates on the whole tree at ship: `ruff check .` all checks passed; `ruff format --check .`
+52 files already formatted; `mypy` no issues in 24 source files; `pytest` 1141 passed.
+Section 6's tables have no unmet row; sections 4 and 5 carry a test against every intent
+T1-T20. Diff review (`git diff main...HEAD --stat`, 22 files): only `src/`, `tests/`,
+`development/`, `STRUCTURE.md`, `DEVELOPMENT.md` and `pyproject.toml`; no scratch files, sample
+data, debug leftovers or TODO markers. Every step from 1 to 6 left a commit naming the round;
+none missing.
 
 ---
 
