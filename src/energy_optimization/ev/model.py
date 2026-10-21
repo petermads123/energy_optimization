@@ -571,7 +571,12 @@ class Settings:
         span = self.min_action_interval
         if not isinstance(span, timedelta) or span < timedelta(0):
             raise _fail("min_action_interval", f"must be a timedelta ≥ 0, got {span!r}")
-        for name in ("ramp_period", "under_use_period", "resume_probe", "max_memory_age"):
+        for name in (
+            "ramp_period",
+            "under_use_period",
+            "resume_probe",
+            "max_memory_age",
+        ):
             span = getattr(self, name)
             if not isinstance(span, timedelta) or span <= timedelta(0):
                 raise _fail(name, f"must be a positive timedelta, got {span!r}")
@@ -624,7 +629,9 @@ class ChargerMemory:
         for name in ("car_connected", "running", "stopped_for_capacity", "selected"):
             _bool(name, getattr(self, name), ctx)
         if not isinstance(self.session_key, str):
-            raise _fail("session_key", f"must be a string, got {self.session_key!r}", ctx)
+            raise _fail(
+                "session_key", f"must be a string, got {self.session_key!r}", ctx
+            )
         for name in (
             "session_start",
             "switched_at",
@@ -701,6 +708,10 @@ class Memory:
             if entry.charger_id == charger_id:
                 return entry
         return None
+
+
+_INVALID_MEMORY = Memory(saved_at=datetime(1, 1, 1, tzinfo=UTC))
+"""Marker the codec puts in a snapshot whose memory could not be decoded."""
 
 
 @dataclass(frozen=True)

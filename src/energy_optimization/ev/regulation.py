@@ -92,7 +92,10 @@ def regulate(
     setting = state.current_setting
     if measured < setting - settings.deadband:
         under_since = under_since or now
-        if _elapsed_seconds(now, under_since) < settings.under_use_period.total_seconds():
+        if (
+            _elapsed_seconds(now, under_since)
+            < settings.under_use_period.total_seconds()
+        ):
             return Regulation(cap, under_since, None, stop_at, False)
         if settings.reduction is Reduction.HALVE:
             reduced = math.floor(setting / 2)
@@ -106,7 +109,8 @@ def regulate(
         if (
             cap is not None
             and cap > 0
-            and _elapsed_seconds(now, full_since) >= settings.ramp_period.total_seconds()
+            and _elapsed_seconds(now, full_since)
+            >= settings.ramp_period.total_seconds()
         ):
             cap = min(cap, math.floor(setting)) + settings.ramp_step
             full_since = now

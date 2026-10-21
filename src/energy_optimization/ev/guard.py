@@ -94,11 +94,13 @@ def advance_guard(
     previous_emergency = memory.emergency_at if memory is not None else None
     if instant is None:
         if latched:
-            return GuardState(GuardLevel.EMERGENCY, None, previous_emergency, False, True)
+            return GuardState(
+                GuardLevel.EMERGENCY, None, previous_emergency, False, True
+            )
         return GuardState(None, None, previous_emergency, True, False)
     if instant is GuardLevel.EMERGENCY:
         return GuardState(GuardLevel.EMERGENCY, None, now, False, True)
-    level = instant
+    level: GuardLevel = instant
     emergency_at = None
     if latched:
         emergency_at = previous_emergency
@@ -147,7 +149,7 @@ def main() -> None:
     )
     phases = frozenset(Phase)  # L1, L2, L3
     readings = [33.0, 20.0, 20.0, 20.0]  # amps on L1; the first call is over the limit
-    memory = None
+    memory: Memory | None = None
 
     for step, amps in enumerate(readings):
         now = start + timedelta(seconds=30 * step)
@@ -168,9 +170,9 @@ def main() -> None:
         )
 
     # No usable reading: round 1's fallback cap governs, the guard does not block.
-    instant = None
+    no_reading: GuardLevel | None = None
 
-    state = advance_guard(memory, instant, start + timedelta(minutes=5), settings)
+    state = advance_guard(memory, no_reading, start + timedelta(minutes=5), settings)
 
     print(f"stale: level {state.level}, increases allowed: {state.increases_allowed}")
 
