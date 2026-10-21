@@ -3059,7 +3059,10 @@ def test_the_hysteresis_holds_in_the_planned_tier_too(ready_b: time) -> None:
     assert allocations(d2) == {"a": 10.0, "b": 0.0}
     assert by_id(d2)["a"].priority == 2
     assert by_id(d2)["a"].reason.code is ReasonCode.IN_PLAN
-    assert by_id(d2)["b"].reason.code is ReasonCode.WAITING_FOR_CAPACITY
+    # The plan itself holds the place now, so the loser is simply planned for later
+    # quarters: it used to be a second priority-2 session in a quarter already booked.
+    assert by_id(d2)["b"].priority == 4
+    assert by_id(d2)["b"].reason.code is ReasonCode.PLANNED_LATER
     assert d2.actions == ()
 
 
@@ -3225,6 +3228,30 @@ def test_planned_charger_plans_never_book_more_than_the_phase_holds() -> None:
     assert b.reaches_target is True
     assert a.expected_finish == a.plan[17].start + QUARTER
     assert b.expected_finish == b.plan[17].start + QUARTER
+
+
+def test_a_selected_charger_stopped_because_later_is_cheaper_is_not_a_capacity_stop() -> (
+    None
+):
+    expensive_now = hourly([0.9, 0.9] + [0.1] * 46)
+    first = snap(
+        [adj("a"), adj("b")],
+        [running("a", 10.0), idle("b", car=False)],
+        [sess("a", ready=time(8, 45), need=2.0)],
+        expensive_now,
+        budget=10.0,
+    )
+    d1 = decide(first)
+    assert d1.memory is not None
+    selected = replace(entry(d1), selected=True, running=True)
+    carried = replace(d1.memory, chargers=(selected,))
+
+    result = decide(replace(at(first, 20 * MIN), memory=carried))
+
+    assert action_tuples(result) == [("a", ActionKind.PAUSE, 0.0, Stage.DOWN)]
+    assert by_id(result)["a"].reason.code is ReasonCode.PLANNED_LATER
+    assert not entry(result).stopped_for_capacity
+    assert entry(result).switched_at == NOW + 20 * MIN
 
 
 # --- T7/T8: regulation through decide -------------------------------------------------------

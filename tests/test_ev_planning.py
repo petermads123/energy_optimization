@@ -60,6 +60,7 @@ def plan(
     block: int = 2,
     cap: float | None = None,
     now: datetime = NOW,
+    first: frozenset[str] = frozenset(),
 ) -> dict[str, SessionPlan]:
     return plan_sessions(
         requests,
@@ -70,6 +71,7 @@ def plan(
         block,
         cap,
         TZ,
+        first,
     )
 
 
@@ -610,6 +612,22 @@ def test_plan_the_least_slack_session_claims_the_cheap_quarters_first() -> None:
     assert result["b"].reachable is True
     assert slots(result["a"]) == [8, 9, 10, 11]
     assert result["a"].reachable is True
+
+
+def test_plan_a_session_named_first_claims_before_the_more_urgent_one() -> None:
+    prices = {NOW + QUARTER * i: (0.1 if i < 8 else 0.5) for i in range(32)}
+    relaxed = request("a", need=3.0, deadline=NOW + timedelta(hours=8))
+    urgent = request("b", need=7.0, deadline=NOW + timedelta(hours=2))
+
+    result = plan([relaxed, urgent], prices, first=frozenset({"a"}))
+
+    assert slots(result["a"]) == [0, 1, 2, 3]
+    assert set(slots(result["a"])).isdisjoint(slots(result["b"]))
+    assert slots(result["b"]) == [4, 5, 6, 7]
+    assert result["b"].reachable is False
+    assert plan([relaxed, urgent], prices, first=frozenset()) == plan(
+        [relaxed, urgent], prices
+    )
 
 
 def test_plan_urgency_does_not_depend_on_the_order_of_the_requests() -> None:

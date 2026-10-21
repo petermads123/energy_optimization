@@ -6,7 +6,7 @@ blocks of a minimum length where the price cap, the horizon and the capacity all
 """
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from enum import StrEnum
@@ -305,6 +305,7 @@ def plan_sessions(
     min_block_quarters: int,
     price_cap: float | None,
     timezone: str,
+    first: Collection[str] = frozenset(),
 ) -> dict[str, SessionPlan]:
     """Plan every request against shared per-phase capacity, most urgent first.
 
@@ -318,6 +319,11 @@ def plan_sessions(
         min_block_quarters: Minimum length of a contiguous run of quarters.
         price_cap: Price above which quarters are avoided, None for off.
         timezone: IANA name; only sets the zone of `PlannedQuarter.start`.
+        first: Charger ids whose sessions claim capacity before all the others, each
+            group still most urgent first. A session that holds its place (it is
+            running and must not be displaced) is planned first, and the rest are
+            planned on what is left of every quarter, so the plans together never
+            book more than `capacity`.
 
     Returns:
         Each session's plan, keyed by charger id. A request whose `max_current` is 0
@@ -338,7 +344,7 @@ def plan_sessions(
             if start not in remaining:
                 remaining[start] = {phase: capacity.get(phase, 0.0) for phase in Phase}
 
-    def urgency(request: PlanRequest) -> tuple[float, datetime, str]:
+    def urgency(request: PlanRequest) -> tuple[bool, float, datetime, str]:
         per_quarter = energy_per_quarter_kwh(
             request.max_current, len(request.phases), voltage
         )
@@ -350,7 +356,12 @@ def plan_sessions(
             else math.inf
         )
         slack = len(horizons[request.charger_id]) - max(needed, 0)
-        return slack, request.deadline.astimezone(UTC), request.charger_id
+        return (
+            request.charger_id not in first,
+            slack,
+            request.deadline.astimezone(UTC),
+            request.charger_id,
+        )
 
     plans: dict[str, SessionPlan] = {}
     for request in sorted(requests, key=urgency):

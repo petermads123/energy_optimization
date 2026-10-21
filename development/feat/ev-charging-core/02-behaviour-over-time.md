@@ -1,6 +1,6 @@
 # EV charging core: behaviour over time
 
-<!-- claude-plan step=3 status=active -->
+<!-- claude-plan step=4 status=active -->
 
 | Field | Value |
 |---|---|
@@ -15,7 +15,7 @@
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
-| 3 | Implement | `/implement` | in `/build` | in progress |
+| 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | pending |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
@@ -209,6 +209,7 @@ current size.
 | `src/energy_optimization/ev/guard.py` | new | Phase-guard level from one reading, and the level/green/emergency latch over time (A5) |
 | `src/energy_optimization/ev/regulation.py` | new | Under-use cut, ramp back, resume probe for one adjustable charger (A3, A4) |
 | `src/energy_optimization/ev/allocation.py` | changed | `phase_capacity` gains `settling` (A6) |
+| `src/energy_optimization/ev/planning.py` | changed (step 3 re-run) | `plan_sessions` gains `first`: sessions that claim capacity before the rest (A2, round-1 A4) |
 | `src/energy_optimization/ev/decide.py` | changed | Memory usability, anti-flapping, hysteresis, regulation and guard wiring, pacing, next check, new memory (A1–A8) |
 | `src/energy_optimization/ev/codec.py` | changed | Memory in snapshot and decision dicts; `memory_to_dict`, `memory_from_dict` (A1) |
 | `src/energy_optimization/ev/__init__.py` | changed | Re-export the new public names |
@@ -266,6 +267,12 @@ threshold, and 30 minutes is two missed 15-minute calls.
 | Signature | Purpose | Covers |
 |---|---|---|
 | `phase_capacity(snapshot: Snapshot, fresh: bool, settling: frozenset[str] = frozenset()) -> dict[Phase, float]` | As round 1, except a charger whose id is in `settling` counts at its **measured** per-phase draw (when known) instead of the smaller of setting and measured: a car still ramping down after a decrease is not mistaken for other load | A6 |
+
+**`ev/planning.py`** (added at the step 3 re-run after step 6)
+
+| Signature | Purpose | Covers |
+|---|---|---|
+| `plan_sessions(requests: Sequence[PlanRequest], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str, first: Collection[str] = frozenset()) -> dict[str, SessionPlan]` | As round 1, except the sessions whose charger id is in `first` claim capacity before all the others (each group still most urgent first), so the plans together never book more than `capacity` and a session that must keep its place is planned on the full capacity | A2, round-1 A4 |
 
 **`ev/codec.py`**
 
@@ -592,10 +599,8 @@ Where the fix differs from the implementation guide, the guide's text is superse
   the minimum pause.
 - **Smart-off / unregulated (guide 6.4 with 6.11).** Entries of chargers that were not
   regulated this call clear `under_use_since` and `full_use_since`.
-- **Tier-2 hysteresis (new `_keep_places`, after planning).** A selected, displaced
-  (priority 4) charger is put back in the plan for this quarter when a planned contender
-  sharing a phase is not earlier than its deadline minus the hysteresis and planning it alone
-  would have given it this quarter.
+- **Tier-2 hysteresis (new `_keep_places`, after planning).** *Superseded in the re-run
+  below:* `_keep_places` is gone; the retention decision now goes into the planner.
 - **Next check (guide 6.12).** Never later than the new memory's expiry when anything is
   pending (None stays None); all additions in UTC (`_shifted`); the `until` parameter too.
 - **Never an error.** A memory time no UTC date can hold (known entries and the top
@@ -631,6 +636,56 @@ _______ test_planned_charger_plans_never_book_more_than_the_phase_holds ________
 E   AssertionError: assert 12.0 <= 6.0                                            (18 quarters booked at 12 A on a 6 A phase)
 4 failed, 294 deselected in 0.61s
 ```
+
+Fix (one source of truth; no public signature of `decide` changed). `_keep_places` and
+its patching of `item.plan` are removed. In their place:
+
+- **`planning.plan_sessions(..., first: Collection[str] = frozenset())`** (the one public
+  signature change; recorded in section 2's Public API and in `STRUCTURE.md`). Sessions
+  named in `first` claim capacity before all the others, each group still most urgent
+  first, on the same per-quarter remaining capacity. Calling `plan_sessions` twice with
+  "the remaining capacity" was not possible, because the remaining capacity differs per
+  quarter and the function takes one capacity constant over the horizon.
+- **`decide._keepers`** names the planned sessions that hold their place: a charger that
+  can run and is `protected` (running, started less than `min_pause` ago) always; a
+  `was_selected` one unless a contender that can run, shares a phase with it and has a
+  deadline earlier than its own minus `hysteresis`. Their ids go to `plan_sessions` as
+  `first`, so the plan is one plan: the keepers are planned on the full planning capacity
+  and everyone else on what is left, the plans together never book more than the phase
+  holds (R-A4), and a started charger keeps the current quarter against a newcomer within
+  the minimum on-time (R-A2). A keeper whose own cheapest quarters do not include this one
+  is still planned for later (price-driven), as before.
+- **`decide._mark_displaced`** sets `_Item.displaced` on a running charger (commanded
+  above 0) that the plan put at priority 4 although, planned alone on the same planning
+  capacity, it would have had this quarter: the quarter was lost to another session, not to
+  price. `_new_memory` then records the stop as `stopped_for_capacity` (alongside the
+  `WAITING_FOR_CAPACITY` and `MINIMUM_PAUSE` final codes), so the minimum pause holds the
+  charger off when it would restart (the planner then puts it at priority 2 and the
+  existing hold-off gives `MINIMUM_PAUSE`). A price-driven stop is not a capacity stop
+  (pinned by `test_a_selected_charger_stopped_because_later_is_cheaper_is_not_a_capacity_stop`).
+  The reason code of a displaced charger stays `PLANNED_LATER`, which is true: it is
+  planned for later quarters.
+- **Choice:** keepers claim *all* their quarters first, not only the current one, so a
+  keeper's plan is the one it was already executing and does not churn. The price is that
+  a less urgent keeper can take cheap quarters a more urgent newcomer would have needed;
+  the newcomer's plan then says unreachable if it cannot be met, honestly, instead of
+  overbooking.
+
+Round-1 and round-2 test expectations: none of round 1 changed. One round-2 test line
+changed because it encoded the defect: `test_the_hysteresis_holds_in_the_planned_tier_too`
+(both parametrizations) asserted that the loser `b` is `WAITING_FOR_CAPACITY`. That was
+`b` being a second priority-2 session in a quarter `_keep_places` had already given to `a`
+(the double booking itself); with one plan, `b` is priority 4, `PLANNED_LATER`, and the test
+now says so. Its allocations (`a` 10 A, `b` 0 A), `a`'s priority and code and the absence of
+actions are unchanged. Tests added: four reproductions (R-A2 x3, R-A4 x1), one price-driven
+stop, one `plan_sessions(first=...)` test.
+
+Green run: `ruff check .` clean, `ruff format --check .` clean, `mypy` clean (28 source
+files), `pytest` 1643 passed (1637 + 4 reproductions + 1 price-driven stop + 1 planning
+test; the two edited parametrizations are among the 1637). The four reproductions that
+were red above are green. A scratch fuzz of 1 500 random multi-call sequences on 2-3
+chargers over shared phases checks that no decision's plans book more than the budget per
+phase in any quarter: 49 sequences fail on `21c5acd`, 0 on the fix.
 
 ---
 

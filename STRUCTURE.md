@@ -164,7 +164,7 @@ quarters.
 | `energy_per_quarter_kwh(current: float, phase_count: int, voltage: float) -> float` | Energy delivered in one quarter. |
 | `PlanRequest(charger_id: str, phases: frozenset[Phase], min_current: float, max_current: float, need_kwh: float, deadline: datetime)` | One session to plan; equal min and max means all-or-nothing. |
 | `SessionPlan(charger_id: str, quarters: tuple[PlannedQuarter, ...], planned_kwh: float, reachable: bool, price_cap_exceeded: bool, uses_unpriced: bool)` | One session's plan, quarters in time order. |
-| `plan_sessions(requests: Sequence[PlanRequest], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str) -> dict[str, SessionPlan]` | Plan every request against shared per-phase capacity, most urgent first. |
+| `plan_sessions(requests: Sequence[PlanRequest], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str, first: Collection[str] = frozenset()) -> dict[str, SessionPlan]` | Plan every request against shared per-phase capacity, most urgent first; the sessions named in `first` claim capacity before all the others, so a session that must keep its place is planned on the full capacity and the rest on what is left. |
 | `main() -> None` | Showcase: two cars on a shared phase; a default need. |
 
 ### `src/energy_optimization/ev/guard.py`
@@ -218,7 +218,9 @@ Phase capacity, draw and reservations, measurement freshness and max-min-fair sh
 ### `src/energy_optimization/ev/decide.py`
 
 The decision core: memory usability, classification, regulation, priority tiers with
-anti-flapping (minimum pause, hysteresis, kept in the planned tier too), planning,
+anti-flapping (minimum pause, hysteresis; in the planned tier the planner claims capacity for the
+sessions that keep their place first, and a running charger it still drops for capacity is
+a capacity stop held off by the minimum pause), planning,
 sharing, the lowering steps (emergency, no increases, pacing), actions with in-flight
 suppression, reasons, status, events, the new memory and the next check. A command sent
 within the action interval counts as where the charger is (it may not have landed), so
@@ -289,7 +291,8 @@ refused, `quarter_prices` splitting, and the `main` showcase.
 Covers `src/energy_optimization/ev/planning.py` (T8-T10, T12): `remaining_need_kwh` and `energy_per_quarter_kwh`
 tables, the cheapest-block planner against a brute-force optimum on hand-checked series,
 the finishing rule, the price-cap precedence and boundary, unpriced quarters used last and
-latest first, shared capacity with the least-slack session first, whole-amp flooring, a
+latest first, shared capacity with the least-slack session first (or the sessions named in
+`first`), whole-amp flooring, a
 zero `max_current` as unreachable, DST horizons, and a `hypothesis` property over generated
 requests; and the `main` showcase.
 
@@ -320,7 +323,9 @@ Round 2 adds multi-call scenarios that feed each decision's memory into the next
 snapshot (T3-T13): the conservative start and every memory-usability boundary, times no
 UTC date can hold, huge duration settings; minimum pause (including across an unplug and
 charge now), selection hysteresis and minimum on-time in both the tier ranking and the
-planned tier, an in-flight resume; regulation through `decide` (a cut freeing current,
+planned tier (a started charger kept against a more urgent newcomer, a capacity stop held
+off by the minimum pause, plans that never book more than the phase holds, a price-driven
+stop that is not a capacity stop), an in-flight resume; regulation through `decide` (a cut freeing current,
 a stop, the probe, a session change or re-plug clearing it, ramp back, never-regulated
 chargers, smart charging off); the guard levels (yellow, red, green hold, stale data,
 emergency and its calm period, emergency countermanding an in-flight resume); pacing,

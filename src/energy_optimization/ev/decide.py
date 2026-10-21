@@ -113,6 +113,7 @@ class _Item:
     held_off: bool = False
     protected: bool = False
     was_selected: bool = False
+    displaced: bool = False
     held_by: str | None = None
 
 
@@ -293,48 +294,58 @@ def _plan_requests(items: list[_Item]) -> list[PlanRequest]:
     return requests
 
 
-def _keep_places(
+def _keepers(items: list[_Item], ctx: _Context) -> frozenset[str]:
+    """Pick the planned sessions that hold their place against the others.
+
+    The planner gives the current quarter to the session with the least slack, so a
+    newcomer whose ready time is only a little earlier would displace a charger that
+    is already running. That is the flapping the minimum on-time and the selection
+    hysteresis prevent, and they hold in this tier too: a charger that started less
+    than the minimum pause ago keeps its place, and a selected one keeps it unless a
+    contender sharing a phase has a ready time more than the hysteresis earlier. The
+    planner claims capacity for these first and plans everyone else on what is left,
+    so there is one plan and it never books more than the phase holds.
+    """
+    candidates = [item for item in items if item.can_run and item.deadline is not None]
+    keepers: set[str] = set()
+    for item in candidates:
+        if item.protected:
+            keepers.add(item.charger.id)
+        elif item.was_selected and item.deadline is not None:
+            limit = _earlier(item.deadline, ctx.settings.hysteresis)
+            if not any(
+                other is not item
+                and other.deadline is not None
+                and other.deadline < limit
+                and other.charger.phases & item.charger.phases
+                for other in candidates
+            ):
+                keepers.add(item.charger.id)
+    return frozenset(keepers)
+
+
+def _mark_displaced(
     items: list[_Item],
-    now: datetime,
     ctx: _Context,
     prices: dict[datetime, float],
     plan_cap: dict[Phase, float],
 ) -> None:
-    """Let a selected planned charger keep its quarter against a planned contender.
+    """Mark the running chargers the plan dropped from this quarter for lack of capacity.
 
-    The planner gives the current quarter to the session with the least slack, so a
-    newcomer whose ready time is only a little earlier would displace a charger that
-    is already running. That is the flapping the selection hysteresis prevents, and
-    it holds in this tier too: a displaced selected charger is put back in the plan
-    for this quarter when a contender sharing a phase is not earlier than its
-    deadline minus the hysteresis, and the quarter was lost to capacity rather than
-    to price (planned alone, it would have had it). The tier ranking then settles
-    who gets the current: the selected one first.
+    A running charger whose plan puts it later is stopped either because it is
+    cheaper later or because another session claimed this quarter. Only the second is
+    a capacity stop, which the minimum pause then holds off: it is the case when the
+    charger, planned alone on the capacity the others share, would have had this
+    quarter.
     """
     settings = ctx.settings
-    this_quarter = floor_to_quarter(now)
-    planned_now = [item for item in items if item.priority == 2]
+    this_quarter = floor_to_quarter(ctx.now)
     for item in items:
-        if (
-            item.priority != 4
-            or not item.was_selected
-            or not item.can_run
-            or item.deadline is None
-        ):
-            continue
-        limit = _earlier(item.deadline, settings.hysteresis)
-        if any(
-            other.charger.phases & item.charger.phases
-            and other.deadline is not None
-            and other.deadline < limit
-            for other in planned_now
-        ) or not any(
-            other.charger.phases & item.charger.phases for other in planned_now
-        ):
+        if item.priority != 4 or not item.can_run or _commanded(item, ctx) <= _EPS:
             continue
         alone = plan_sessions(
             _plan_requests([item]),
-            now,
+            ctx.now,
             prices,
             plan_cap,
             settings.voltage,
@@ -342,11 +353,9 @@ def _keep_places(
             settings.price_cap,
             settings.timezone,
         )[item.charger.id]
-        if any(q.start.astimezone(UTC) == this_quarter for q in alone.quarters):
-            item.plan = alone
-            item.priority = 2
-            item.code = ReasonCode.IN_PLAN
-            item.starved = False
+        item.displaced = any(
+            q.start.astimezone(UTC) == this_quarter for q in alone.quarters
+        )
 
 
 def _present(item: _Item) -> float:
@@ -830,8 +839,11 @@ def _new_memory(
                 fields["stopped_for_capacity"] = (
                     not running
                     and item.can_run
-                    and item.final_code
-                    in (ReasonCode.WAITING_FOR_CAPACITY, ReasonCode.MINIMUM_PAUSE)
+                    and (
+                        item.final_code
+                        in (ReasonCode.WAITING_FOR_CAPACITY, ReasonCode.MINIMUM_PAUSE)
+                        or item.displaced
+                    )
                 )
             fields["selected"] = running and item in active
         action = by_charger.get(charger_id)
@@ -1028,15 +1040,17 @@ def decide(snapshot: Snapshot) -> Decision:
         and not (i.reg is not None and i.reg.regulated_cap == 0)
     ]
     if to_plan:
+        prices = quarter_prices(snapshot.prices)
         plans = plan_sessions(
             _plan_requests(to_plan),
             now,
-            quarter_prices(snapshot.prices),
+            prices,
             plan_cap,
             settings.voltage,
             settings.min_block_quarters,
             settings.price_cap,
             settings.timezone,
+            _keepers(to_plan, ctx),
         )
         this_quarter = floor_to_quarter(now)
         for item in to_plan:
@@ -1051,7 +1065,7 @@ def decide(snapshot: Snapshot) -> Decision:
             # allocations or another session's plan. Calling it "planned for later"
             # would be false, since nothing is planned.
             item.starved = item.can_run and not item.plan.quarters
-        _keep_places(to_plan, now, ctx, quarter_prices(snapshot.prices), plan_cap)
+        _mark_displaced(to_plan, ctx, prices, plan_cap)
 
     smart = [i for i in items if i.group is _Group.SMART]
     tier = next(
