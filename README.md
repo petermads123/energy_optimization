@@ -1,52 +1,23 @@
-# template_repo
+# energy_optimization
 
-Repo description.
+Energy optimization for a household, starting with smart EV charging: a generic,
+pure-Python decision core that decides when, who and at how many amps the chargers behind
+one shared grid connection may charge, within per-phase safety limits. Built to be called
+from a Home Assistant / AppDaemon app, which gathers the input and executes the actions.
 
 ## Install as a dependency
 
 ```powershell
-pip install git+https://github.com/<repo_owner>/<repo_name>.git@main
+pip install git+https://github.com/petermads123/energy_optimization.git@main
 ```
 
 Or in `dependencies` in `pyproject.toml`:
 
 ```toml
-"<repo_name> @ git+https://github.com/<repo_owner>/<repo_name>.git@main"
+"energy_optimization @ git+https://github.com/petermads123/energy_optimization.git@main"
 ```
 
-## Creating a new repo from this template
-
-**Open Claude Code and let it run `/repo-setup`.** It is referenced from `CLAUDE.md`, so the
-first conversation in a fresh clone starts with it. It asks what the repo is for, writes that
-into this README, renames the package to match the repo, updates every file that names it,
-offers the branch ruleset, and then deletes its own reference from `CLAUDE.md` so it never
-runs again.
-
-What it does, for when you would rather do it by hand:
-
-1. Rename `src/template_repo/` to `src/<package_name>/`.
-2. `pyproject.toml`: set `[project] name` to `<package_name>`.
-3. `pyproject.toml`: set `[project] description`.
-4. `README.md`: update the title, the description and the two install URLs above.
-5. `pyproject.toml`: add runtime dependencies to `[project] dependencies`.
-6. `tests/test_hello_world.py`: change the import to `from <package_name>.hello_world import main`.
-7. `STRUCTURE.md`: update the tree, the package heading, the module paths and the import
-   example to the new package name, then `git grep template_repo` and clear every hit.
-8. `CLAUDE.md`: set the approver in the Review and merge table.
-9. Apply a branch ruleset to `main`: `.claude/skills/repo-setup/main_protect.solo.json` for
-   a solo repo, `main_protect.collab.json` when others work in it, via *Settings → Rules →
-   Rulesets → New ruleset → Import a ruleset*.
-10. Replace `src/<package_name>/hello_world.py` and `tests/test_hello_world.py` with real
-    code, updating `STRUCTURE.md` as you go.
-11. Remove the `/repo-setup` reference from `CLAUDE.md`.
-
-`development/` starts with only `TEMPLATE.md` in it. Leave that file alone — step 1 copies
-it into a new folder, named for the branch, for each piece of work.
-
-Little else references the package name: `__init__.py` uses a relative import,
-`[tool.setuptools.packages.find]` points at `src` rather than naming the package,
-`[tool.mypy] files` names directories, and everything under `.claude/` is package-name
-agnostic.
+## Layout
 
 ### Why `src/`
 
@@ -150,7 +121,7 @@ pipeline opens by itself, and you rarely need to know it is there.
 | `/feature <what to build>` | Anything new or changed that is not cosmetic: a module, a public function, a behaviour change. Opens the ten-step pipeline below at step 1. With no argument, reports where an in-flight feature got to. |
 | `/fix <symptom>` | Something that exists behaves wrongly: wrong output, a crash, a guard that lets something through. Reproduces it, finds the root cause and sizes what else the cause breaks **before** the pipeline opens, then runs the same ten steps as a fix round. Sends you to `/feature` or `/small-change` instead if the diagnosis says it is not a bug. |
 | `/small-change <what to change>` | Cosmetic edits with none of the pipeline: a local rename, a docstring reword, message text, plot styling, formatting. Refuses anything that adds or removes a file, changes a public signature, changes behaviour or needs a new test. |
-| `/repo-setup` | Once, in the first conversation after creating a repo from this template. Names the repo, renames the package, offers the branch ruleset, then removes itself from `CLAUDE.md`. |
+| `/repo-setup` | Already run for this repo. Only needed again for a deliberate package rename. |
 | `/build` | Resume a build that halted to ask you something, once you have answered. |
 | `/recommend` | Re-open step 8, if a session ended with a critical follow-up undecided. |
 | `/create-pr` | Open the pull request for a finished branch, if you did not do it in the session that finished it. |
