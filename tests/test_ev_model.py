@@ -21,6 +21,7 @@ from energy_optimization.ev.model import (
     Settings,
     Snapshot,
 )
+from energy_optimization.ev.model import main as showcase
 from energy_optimization.ev.quarters import quarter_prices
 
 CPH = ZoneInfo("Europe/Copenhagen")
@@ -785,3 +786,9 @@ def test_snapshot_normalises_lists_and_generators_to_tuples() -> None:
 def test_snapshot_accepts_missing_phase_currents() -> None:
     assert snapshot().phase_currents is None
     assert snapshot(phase_currents=PhaseCurrents(NOW, 1.0, None, None)).phase_currents
+
+
+def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:
+    showcase()
+
+    assert "rejected: " in capsys.readouterr().out

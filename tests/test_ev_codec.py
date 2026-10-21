@@ -40,6 +40,7 @@ from energy_optimization.ev import (
     snapshot_from_dict,
     snapshot_to_dict,
 )
+from energy_optimization.ev.codec import main as showcase
 from energy_optimization.ev.quarters import next_occurrence
 
 CPH = ZoneInfo("Europe/Copenhagen")
@@ -959,3 +960,9 @@ def test_decision_from_dict_of_an_empty_decision() -> None:
     empty = Decision((), (), PhaseAmps(0.0, 0.0, 0.0), Status.NORMAL, ())
 
     assert decision_round_trip(empty) == empty
+
+
+def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:
+    showcase()
+
+    assert "round trip equal: True" in capsys.readouterr().out

@@ -14,6 +14,7 @@ from energy_optimization.ev.quarters import (
     quarter_prices,
     quarter_starts,
 )
+from energy_optimization.ev.quarters import main as showcase
 
 CPH = "Europe/Copenhagen"
 ZONE = ZoneInfo(CPH)
@@ -400,3 +401,9 @@ def test_prices_fresh_across_the_fall_back_fold_in_one_zone() -> None:
 def test_prices_fresh_rejects_a_naive_now() -> None:
     with pytest.raises(ValueError, match="now"):
         prices_fresh(series(), naive("2026-01-01T00:00:00"), timedelta(minutes=60))
+
+
+def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:
+    showcase()
+
+    assert "quarters" in capsys.readouterr().out

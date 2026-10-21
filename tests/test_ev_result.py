@@ -20,6 +20,7 @@ from energy_optimization.ev.result import (
     Stage,
     Status,
 )
+from energy_optimization.ev.result import main as showcase
 
 NOW = datetime(2026, 10, 21, 20, 0, tzinfo=UTC)
 
@@ -145,3 +146,9 @@ def test_equal_decisions_compare_equal() -> None:
         return Decision((), (), PhaseAmps(1.0, 2.0, 3.0), Status.NORMAL, ())
 
     assert build() == build()
+
+
+def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:
+    showcase()
+
+    assert "status" in capsys.readouterr().out

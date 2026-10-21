@@ -18,6 +18,7 @@ from energy_optimization.ev.planning import (
     plan_sessions,
     remaining_need_kwh,
 )
+from energy_optimization.ev.planning import main as showcase
 from energy_optimization.ev.quarters import (
     QUARTER,
     next_occurrence,
@@ -840,3 +841,9 @@ def test_plan_invariants_hold_for_generated_inputs(
             sum(energy_per_quarter_kwh(q.current, 1, 230.0) for q in item.quarters)
         )
     assert all(total <= capacity + 1e-6 for total in per_quarter.values())
+
+
+def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:
+    showcase()
+
+    assert "need " in capsys.readouterr().out

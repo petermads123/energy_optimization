@@ -13,6 +13,7 @@ from energy_optimization.ev.allocation import (
     reserved_current,
     share,
 )
+from energy_optimization.ev.allocation import main as showcase
 from energy_optimization.ev.model import (
     Charger,
     ChargerKind,
@@ -594,3 +595,9 @@ def test_phase_capacity_does_not_mutate_the_snapshot() -> None:
     phase_capacity(snap, True)
 
     assert snap == before
+
+
+def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:
+    showcase()
+
+    assert "tight phase" in capsys.readouterr().out

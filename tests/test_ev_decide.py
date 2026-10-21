@@ -43,6 +43,7 @@ from energy_optimization.ev import (
     snapshot_from_dict,
     snapshot_to_dict,
 )
+from energy_optimization.ev.decide import main as showcase
 from energy_optimization.ev.planning import energy_per_quarter_kwh
 
 NOW = datetime(2026, 10, 21, 20, 0, tzinfo=UTC)  # 22:00 CEST
@@ -1945,3 +1946,9 @@ def test_generated_snapshots_survive_the_dict_round_trip_and_decide_the_same(
     restored = snapshot_from_dict(data)
 
     assert decision_to_dict(decide(restored)) == decision_to_dict(decide(snapshot))
+
+
+def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:
+    showcase()
+
+    assert "without measurements" in capsys.readouterr().out
