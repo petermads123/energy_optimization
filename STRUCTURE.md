@@ -155,7 +155,8 @@ compared directly because that ignores `fold`.
 ### `src/energy_optimization/ev/planning.py`
 
 Remaining need and cheapest-block planning with shared capacity, price cap and unpriced
-quarters.
+quarters; the current quarter can be held for the sessions named in `first` and closed to
+a `skip_current` request.
 
 | Signature | Description |
 |---|---|
@@ -294,10 +295,15 @@ Covers `src/energy_optimization/ev/planning.py` (T8-T10, T12): `remaining_need_k
 tables, the cheapest-block planner against a brute-force optimum on hand-checked series,
 the finishing rule, the price-cap precedence and boundary, unpriced quarters used last and
 latest first, shared capacity with the least-slack session first, the sessions named in
-`first` keeping only the current quarter (in the order given; never overbooking, a bare
-string refused, a `skip_current` request closed to it), whole-amp flooring, a
-zero `max_current` as unreachable, DST horizons, and a `hypothesis` property over generated
-requests; and the `main` showcase.
+`first` keeping only the current quarter (contested in the order given, ahead of
+urgency; a later one holding what the earlier ones left; an unknown id, an empty `first`
+or a session whose own plan skips the quarter holding nothing; duplicates read once; a
+list and a tuple alike; a bare string refused; arguments not mutated), a `skip_current`
+request starting with the next quarter and leaving the current one to the others,
+whole-amp flooring, a zero `max_current` as unreachable, DST horizons, and two
+`hypothesis` properties: one over generated requests, and one over generated holders and
+closed requests that never books beyond the capacity and does not depend on request
+order; and the `main` showcase.
 
 ### `tests/test_ev_allocation.py`
 
@@ -316,9 +322,11 @@ Covers `src/energy_optimization/ev/decide.py` (T3, T5-T7, T9, T13-T18, T20): doc
 priority tiers and reason codes, reservations and smart charging off, the fallback table,
 actions and their order, events, expected finish and `reaches_target`, DST nights, the
 float-residue and `user_current_limit=0` regressions, determinism across hash seeds, the
-standard-library-only AST scan, the 100 ms performance check, and a `hypothesis` property
-(T17) whose invariants are computed independently of the module's helpers; and the `main`
-showcase. Its `snap` helper hands every snapshot a warm memory (saved a minute ago, green
+standard-library-only AST scan, the 100 ms performance check, and two `hypothesis`
+properties over generated snapshots: one (T17) whose invariants, including that no plan
+books more than a phase holds, are computed independently of the module's helpers, and
+one that sends each snapshot through the dict round trip and gets the same decision; and
+the `main` showcase. Its `snap` helper hands every snapshot a warm memory (saved a minute ago, green
 for an hour, no charger history) so the round-1 scenarios run in steady state instead of
 the conservative start.
 
@@ -336,14 +344,15 @@ chargers, smart charging off); the guard levels (yellow, red, green hold, stale 
 emergency and its calm period, emergency countermanding an in-flight resume); pacing,
 in-flight suppression and settling; `next_check` for every source, the earliest winning,
 the memory expiry clamp and UTC arithmetic across the fold; the session start taken from
-memory. Two `hypothesis` properties (T15) run sequences of calls feeding memory forward and
+memory. Three `hypothesis` properties (T15) run sequences of calls feeding memory forward and
 check, independently of the module, the budget and amended phase-guard bounds, legal
 currents, no increase in yellow, red or a restart, the green hold, pacing, the
 minimum pause, emergency, action existence and order against the command in flight, and
-the memory round trip, and that no plan books more than a phase holds; one over arbitrary
-installations, one over plain installations where every timer can fire, and one over crowded
-installations with memory fed forward that checks only the plans. The 100 ms check also runs
-with a fully populated memory and with ten running chargers whose plan puts them later.
+the memory round trip: one over arbitrary installations, one over plain installations
+where every timer can fire, and one over crowded installations (overlapping phases, a
+tight budget, cars plugging in and out) that also checks after every call that no plan
+books more than a phase holds. The 100 ms check also runs with a fully populated memory
+and with ten running chargers whose plan puts them later.
 
 ### `tests/test_ev_codec.py`
 

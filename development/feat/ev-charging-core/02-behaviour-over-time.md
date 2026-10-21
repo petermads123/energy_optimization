@@ -1,6 +1,6 @@
 # EV charging core: behaviour over time
 
-<!-- claude-plan step=6 status=active -->
+<!-- claude-plan step=7 status=active -->
 
 | Field | Value |
 |---|---|
@@ -18,7 +18,7 @@
 | 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | done |
-| 6 | Concept check | `/concept-check` | in `/build` | pending |
+| 6 | Concept check | `/concept-check` | in `/build` | done |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
 | 9 | Pull request | `/create-pr` | with the user | pending |
@@ -1135,6 +1135,160 @@ Drift found, and what was done about it:
 | 1 | A8 | Deterministic, stdlib only | yes | Hash-seed determinism test and the `rglob` AST import scan (covers `guard.py` and `regulation.py`) green; oracle re-decide equality. |
 | 1 | A9 | Plain-dict round trip, missing/wrong field rejected | yes | Snapshot, decision and memory round-trip equal after `json.dumps`; decision dicts decode memory strictly with dotted paths; a malformed `memory` inside a *snapshot* dict is deliberately not an error (round 2 A1). |
 | 1 | A10 | 100 ms for 10 chargers and 48 h | yes | 7.0 ms minimum, 7.3 ms median with a full memory (`drv/perf.py`); the test asserts `< 0.1`. |
+
+### Re-run after the step 3 and step 5 re-runs (commits `8955853` to `1748061`)
+
+The audit above is kept as written; it found R-A2 and R-A4 and sent the work back. This is
+the first re-run, so the same criterion unmet for the same reason would be a halt. Neither
+comes back. The audit was done against section 1 first (round 2 A1-A8, round 1 A1-A10), then
+the code at `1748061`, with the gates re-run first: `ruff check .` clean, `ruff format
+--check .` 57 files, `mypy` 28 source files, `pytest` **1686 passed** (19.7 s). Probes were
+run from a scratch directory outside the repo (round 1's `decide` at `982a494` copied there
+as `eo_old`; the code at `21c5acd` unpacked with `git archive` for comparison); no worktree
+was made.
+
+**R-A2 re-probe (planned tier, the original reproduction).** a (ready 08:45) starts at
+22:00, b (ready 07:00) arrives at 22:05, calls every 5 minutes, actions executed:
+
+| Time | a | b |
+|---|---|---|
+| 22:00 | 6 A, tier 2, `in_plan` (starts) | no car |
+| 22:05, 22:10 | **6 A, `in_plan`** (was 0 A, `planned_later`, on `21c5acd`) | 0 A, tier 4, `planned_later` |
+| 22:15 | 0 A (on-time of 15 min is over; b is 105 min earlier) | 6 A, `in_plan` |
+| 22:20, 22:25 | 0 A, tier 2, **`minimum_pause`** | 6 A |
+| 22:30 onward | 0 A, `planned_later` (b holds the place) | 6 A |
+
+Variants: b ready 08:30 (inside the hysteresis) never takes the place (a 6 A to 23:00, 12
+calls); b at 08:15 (exactly 30 min earlier) does not either, at 08:14 it does (doc scenario
+6, three-call runs). Stopped-for-capacity restart: a runs from 22:00, b (07:00) arrives
+22:20 and leaves 22:25: a 0 A at 22:20, `minimum_pause` at 22:25 and 22:30, 6 A at 22:35,
+exactly 15 minutes after the stop. The tier-3 control (`probe4`) still behaves as before.
+**R-A2: met.** Mutation sanity: the same drivers on `21c5acd` reproduce the defect (a 0 A at
+22:05; a restarts at 22:15).
+
+**R-A4 re-probe.** `probe12` (a running, b ready 08:30 arrives, budget 6 A, 20:00/20:15/20:30):
+0 quarters planned above 6 A at every call (21c5acd: 18 quarters at 12 A); round 1 gives 0.
+An independent oracle written for this check (`a2fuzz`: 2-3 adjustable chargers on one
+phase, budgets 6/8/11 A, random arrival and ready times, memory fed forward, 24 calls each;
+it checks plan fit per quarter, the minimum on-time, the minimum pause and the hysteresis
+from the outputs alone): 1 500 + 3 000 + 3 000 sequences on `1748061` with **zero**
+violations; on `21c5acd` the same oracle reports 6 744 overbooked calls and 56 chargers
+dropped inside the minimum on-time (so it is live). The same with mixed phases (L1, L1+L2,
+all three, L2; `a4fuzz`): 1 500 sequences, 0 on `1748061`, 1 484 overbooked calls on
+`21c5acd`. And round 1's generator through the plan-fit oracle (`inv_plan`, fixed,
+unavailable and smart-off allocations taken off the budget): 300 sequences, 0 violations.
+**Round-1 A4: met.**
+
+**A8 oracle, re-run.** The independent invariants of the first audit over 2 x 4 000
+sequences of 6 calls (48 000 calls, memory fed forward, fresh/stale/partial measurements,
+emergency on and off): legal currents, per-phase budget, phase-guard bound, fallback cap,
+down before up, no increase in yellow/red/conservative start, emergency at 0, determinism:
+**zero violations**.
+
+**T14 differential, re-run.** Round 1's `decide` (`982a494`) against the current one with a
+blank warm memory, 2 x 30 000 generated snapshots (1-4 chargers of every kind, mixed
+phases, fresh/stale/partial/no measurements, price cap, charge now, smart off, user limits,
+0-40 hourly prices, optional emergency threshold): **21 608 and 21 556 identical**. Every
+difference is at guard level yellow, red or emergency (A5/A8, intended): allocation lower
+(no increase), the added `PHASE_GUARD_INTERVENED` event, or reason code `EMERGENCY`;
+**zero** unexplained, **zero** where round 2 allocates more than round 1. A further 20 000
+snapshots compared per charger: **0** differences in plan, priority, deadline or remaining
+need; 413 differences in expected finish / `reaches_target`, every one with a lower
+allocation. As the step 3 re-run changed `planning.py` and `decide.py`, this is the check
+that it is inert without memory: it is (`first` is empty and nothing is held off).
+
+**Multi-call differential, re-run** (memory fed forward, round 1 on the same state, 2 x
+4 000 sequences, 48 000 calls): 4 592 allocation differences, all but 40 carry a round-2
+mechanism (phase-guard hold, emergency, regulated cap / under-use, `minimum_pause`, a guard
+level, or another charger held by one of these). The 40 residual rows (20 per seed) are
+selected-first ranking in a shared tier; I took the 4 distinct events my automatic check
+could not classify and read them by hand: three are a contender more than the hysteresis
+earlier taking a selected charger's place (A2; the contenders are 45 minutes, 76 minutes and
+9 hours earlier), and one is the challenger case under *Observation* below.
+
+**Performance (A10).** 10 chargers, 48 h of prices, full memory: 13 ms; the same with every
+charger running and selected, half of them held off, and a tight budget: 7.7 to 12.3 ms.
+The 100 ms test passes (about 12 ms, ten running chargers planned later).
+
+**Showcases.** All nine modules (`model`, `result`, `quarters`, `planning`, `allocation`,
+`guard`, `regulation`, `decide`, `codec`) exit 0; `decide` prints the conservative first
+call, the follow-up that starts the garage at 16 A with `next check 22:05:30`, and the stale
+call. The `planning` showcase does not exercise `first` or `skip_current` (it keeps their
+defaults); the tests do.
+
+### Round 2 criteria, re-audited at `1748061`
+
+| # | Met | Evidence |
+|---|---|---|
+| A1 | yes | Probes: `Decision.memory` round-trips through `json.dumps` and `memory_from_dict`, inside snapshot and decision dicts (all `True`). No / garbage-dict / 31-minute-old / future-dated memory give `MEMORY_RESET` with `missing` / `invalid` / `out_of_date` / `future` and no increase; at exactly 30 minutes the memory is usable; the next call with the returned memory sends `resume 16`; a `ghost` entry is dropped. Tests `test_memory_usability_boundaries`, `test_a_call_without_memory_increases_nothing_but_still_decreases`. |
+| A2 | **yes (R-A2 now met)** | The R-A2 tables above: minimum on-time and minimum pause hold in the planned tier; doc scenario 6 (08:45 keeps against 08:30, also at exactly 30 min; 08:14 wins). Ranked tiers unchanged (`probe4`: dropped 22:15, `minimum_pause` 22:20). Charge now skips both (`test_charge_now_skips_the_pause_a_planned_displacement_started`). Budget, phase guard and fallback never broken (A8 oracle, 0). Tests: `test_a_planned_pair_does_not_flap_over_an_hour_with_memory_fed_forward`, `test_the_minimum_on_time_and_pause_end_exactly_on_their_boundaries_in_the_planned_tier`, the four reproductions. |
+| A3 | yes | Re-simulated (5-min calls): 16 A set / 7 A drawn: cap 8 at +15 min; 10 A / 2 A: `under_use`, pause, current to the other charger in the same call; 16 A / 14.5 A: nothing over 25 min; ramp 8, 10, 12, 14, 16 one step per 5 min and cap cleared at max; `HALVE` gives 8; on/off and no-power chargers never regulated. `test_ev_regulation.py` (55). |
+| A4 | yes | Cut at 22:15, `resume 16` at 23:15 and not before; unplug 22:30 / re-plug 22:35 resumes at 22:35; changed ready time at 22:30 resumes at 22:30. |
+| A5 | yes | Red cuts to fit with `phase_guard_intervened` (charge-now charger 16 to 14 to 12 A); yellow raises nothing; emergency pauses charge-now and smart-off chargers, status `emergency`, calm released at +360 s (resume 12 A), 16 A at +390 s; a stale call inside the latch keeps `emergency`; increases wait the 60 s green hold. `test_ev_guard.py` (45). Stale level is `None` (drift item 3 above, accepted at step 2). |
+| A6 | yes | Red cut 36 to 12 A sent once, not repeated at +10 / +20 s, car still drawing 16 A not cut again (`capped_by: phase`); increase to 16 A not re-sent at +10 s; in-flight resume countermanded by emergency (`pause`) or a smaller share (`set_current 8`); unchanged command not re-sent. |
+| A7 | yes | `next_check` 22:15:00 (under-use period), 22:15:30 (pacing window), 22:50:00 (memory-expiry clamp, probe pending at 23:15), 22:05:30 in the showcase. `test_next_check_*` (14). |
+| A8 | yes | Oracle above (48 000 calls, 0); the planned-tier rules add no increase path (the invariants "never above present setting / zero" hold by construction and by oracle); the property tests now also assert plan fit after every call; determinism, stdlib-only AST scan, 100 ms (13 ms) pass; no round-1 test weakened (`git diff 982a494 HEAD` on round-1 test files: 4 removed lines, all recorded at step 3 / step 5). |
+
+### Earlier rounds still hold, re-audited at `1748061`
+
+| Round | # | Still met | Evidence |
+|---|---|---|---|
+| 1 | A1 | yes | `ConfigError` with the field: `max_current: ... must be >= min_current`, `phase_budget: required`, `timezone: unknown timezone`, `emergency_threshold: must be > phase_threshold`, `ramp_step: must be >= 1`, naive `measured_at`. |
+| 1 | A2 | yes | Differential identical to round 1 at green and stale (2 x 30 000); doc scenarios 1-5 unchanged under the warm helper; the planned-tier tier membership is unchanged without memory (0 priority differences). |
+| 1 | A3 | yes | Oracle 48 000 calls, 0 budget / guard / legal-current / reservation violations; differential identical at green. |
+| 1 | A4 | **yes (R-A4 now met)** | Plans never book more than a phase holds: `probe12`, 7 500 single-phase and 1 500 mixed-phase crowded sequences and 300 generic ones, 0 violations (21c5acd: thousands). `planning.py` otherwise unchanged against `982a494` in blocks, cap, unpriced and DST behaviour (0 plan differences in 20 000 snapshots; DST tests green). The current quarter goes to the A2 order and every later quarter by least slack. |
+| 1 | A5 | yes | Zero differences at stale levels; stale-price snapshots unchanged (priority 3). |
+| 1 | A6 | yes | Down before up on every output; absolute targets; in-flight suppression only removes an action. `expected_finish` / `reaches_target` now follow a plan that fits the phase. |
+| 1 | A7 | yes | Round-1 property green, now also asserting plan fit; independent oracle 0 violations. |
+| 1 | A8 | yes | Hash-seed determinism and the AST import scan green over all modules; re-decide equality in the oracle. |
+| 1 | A9 | yes | Snapshot, decision and memory round trip equal after `json.dumps`; a malformed `memory` in a snapshot dict is deliberately not an error (round 2 A1). |
+| 1 | A10 | yes | 13 ms; worst tried 12.3 ms; test asserts `< 0.1`. |
+
+### Verdicts on the step 5 re-run decisions
+
+Each judged against section 1 (not section 2):
+
+| Decision | Verdict | Reasoning |
+|---|---|---|
+| Current-quarter-only holds: `plan_sessions(first=...)` plans each holder alone on what earlier holders left of the current quarter, keeps only that quarter, plans everything else most urgent first | **Within section 1** | A2 protects a charger's *place*, which is the quarter being decided now; it says nothing of later quarters, and every call re-decides. Round-1 A4 asks for least-slack-first claims and no quarter beyond the budget: later quarters still go by least slack, and the bound is shown by the oracles. The two split on exactly one quarter and the build gives it to A2. Both criteria hold as written. Reversing the step 3 re-run's "claim every quarter" choice was the correct reading of A4 (the more urgent newcomer is no longer starved of later quarters, tested). |
+| `_holders` contest ordered like the ranked tier (`_tier_key`: protected first, then deadline with a selected charger's taken the hysteresis earlier); a challenger takes part only if more than the hysteresis earlier than a selected charger on a shared phase and only if its own plan wants the quarter | **Within section 1** | A2 words the hysteresis as pairwise ("unless a contender's ready time is more than the hysteresis earlier") and round-1 A2 ranks by earliest ready time; the ranked tiers already did this. The planned tier now agrees with them. See the observation below for the one side effect. |
+| Held-off chargers skip the current quarter (`PlanRequest.skip_current`), still occupy their tier when they would have had it alone (`_plans_now`) | **Within section 1** | A2: a charger stopped for capacity "cannot restart before the minimum pause"; a held-off charger booking the quarter it cannot use idled capacity and could mark another charger displaced. Occupying the tier is the already-accepted `held-off charger occupies its tier` (first audit). |
+| Smart-charging-off squeeze is not another session's claim (`_mark_displaced` docstring); a running charger squeezed out of capacity is a capacity stop when it is starved of every quarter (`WAITING_FOR_CAPACITY`) | **Within section 1** | Capacity is one constant over the planning horizon, so a squeeze is all-or-nothing for a lone session: it either still fits (and then any loss of the quarter is another session's claim, marked displaced) or it fits nowhere (starved, a capacity stop). A2 is met in both. |
+| Min-block caveat: with the default two-quarter minimum block, a newcomer cannot use an isolated current quarter when the held-off charger's own plan takes the next one | **Within section 1** | Round-1 A4 requires blocks of at least the minimum length; A2 requires the pause. Both hold; the cost is capacity idling during a pause, the same cost already accepted for held-off chargers. Noted for step 8 as a `DEVELOPMENT.md` idea (not a defect against section 1). |
+
+**Observation (not a defect, for step 8 and the user's veto).** A challenger holder takes the
+current quarter ahead of a third session that has less slack, even when it displaces
+nobody. Seen once in the multi-call differential (call 5 of generated sequence 2662): c1
+(ready 05:45) is more than 30 minutes earlier than selected c2 (06:30), so it contests; c2
+keeps its place and there is room for both, so c0 (ready 07:30, least slack) gets nothing
+that call, where round 1 gave it the quarter. The ranked tiers rank by ready time (c1, c2,
+c0; doc section 6), so the two tier families agree; round-1 A4's slack order now governs only
+later quarters. Rare (1 event in 48 000 generated calls) and bounded to one quarter per call,
+but it is a choice the concept did not spell out; if the user wants slack to win there, it is
+a small change in `_holders` (a challenger takes part only if it would also displace the
+selected charger) and a new round.
+
+### Re-run drift and resolution
+
+1. **R-A2: met**, R-A4: **met** (probes, oracles and the mutation comparison above). No halt.
+2. **No new unmet criterion** in round 2 A1-A8 or round 1 A1-A10; no section 1 amendment.
+3. The step 3 re-run changed the public signature of `plan_sessions` and `PlanRequest`: the
+   plan (section 2) and `STRUCTURE.md` were updated at the time and match the code
+   (`structure-auditor`, below). Accepted-at-step-2 items of the first audit stand.
+4. For step 8 (`DEVELOPMENT.md`, not defects): the challenger observation above; the min-block
+   idling during a pause; the earlier items (conservative-start status wording, `next_check`
+   clamp, lost memory dropping the emergency latch, unbounded `yellow_margin`).
+
+### Reader report: `structure-auditor`, re-run
+
+Saved verbatim at `/tmp/claude-0/-home-user-energy-optimization/6ceb099d-e40c-56d7-8ca2-50b25e6eb191/scratchpad/auditor-r2-step6b.md`: every signature matches the code (including
+`plan_sessions(..., first: Sequence[str] = ())` and `PlanRequest(..., skip_current: bool =
+False)`); three stale test descriptions and one optional purpose line, all four applied to
+`STRUCTURE.md` here, the counts checked against `@given` in the test files first: the
+`test_ev_decide.py` round-2 paragraph (three properties; the plan check belongs to the crowded
+one only), the `test_ev_planning.py` entry (`first` and `skip_current` coverage, two
+properties), the `test_ev_decide.py` round-1 paragraph (two properties; plans fit), and the
+`planning.py` purpose line.
 
 ---
 
