@@ -118,7 +118,7 @@ ints.
 
 ### `src/energy_optimization/ev/result.py`
 
-Output types. No logic beyond `PhaseAmps.get`.
+Output types. No logic beyond `PhaseAmps.get` and the tuple normalisation in `ChargerDecision` and `Decision`.
 
 | Signature | Description |
 |---|---|
@@ -181,7 +181,7 @@ them, unless an emergency is latched.
 | `instant_level(currents: PhaseCurrents, phases: frozenset[Phase], settings: Settings) -> GuardLevel` | Level of one reading over `phases`; a missing value is skipped. |
 | `GuardState(level: GuardLevel \| None, green_since: datetime \| None, emergency_at: datetime \| None, increases_allowed: bool, intervened: bool)` | The guard after one call. |
 | `advance_guard(memory: Memory \| None, instant: GuardLevel \| None, now: datetime, settings: Settings) -> GuardState` | One step of the guard over time. |
-| `main() -> None` | Showcase: a red reading, then green calls until increases are allowed. |
+| `main() -> None` | Showcase: a red reading, then green calls until increases are allowed, then a stale call that leaves increases to the fallback cap. |
 
 ### `src/energy_optimization/ev/regulation.py`
 
