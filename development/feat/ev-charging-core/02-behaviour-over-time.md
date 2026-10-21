@@ -153,46 +153,302 @@ None.
 
 ## 2. Plan
 
-> Written in step 2, accepted by the user before step 3 starts. Concrete enough that
-> step 3 is transcription, not invention.
+Accepted by the user in advance: at the round-2 concept gate they chose "Confirm, same as
+round 1" — plan, have it reviewed, then build without stopping for the plan. Step 3 opens
+once the `plan-critic` findings below are applied.
+
+### Survey
+
+Round 1 left `src/energy_optimization/ev/` as: `model.py` (input types, `ConfigError`,
+validation), `result.py` (output types), `quarters.py`, `planning.py`, `allocation.py`
+(`share`, `phase_capacity`, `present_draw`, `reserved_current`, `measurements_fresh`),
+`decide.py` (one public function, `decide(snapshot) -> Decision`, built around a private
+per-charger `_Item` record: classify → limits → reservations → smart-off share → planning
+→ tier share → reasons/actions/events/status) and `codec.py` (dict conversion with dotted
+paths). Everything round 2 needs to *decide* is already computed there; what is missing is
+state carried between calls. Reused as is: `share` (the hard limits stay where they are),
+`plan_sessions`, `measurements_fresh`, `reserved_current`, the codec's `_Reader`
+machinery. `phase_capacity` gains one optional parameter (A6). The round-1 test suites
+build snapshots through one helper per file (`snap(...)` in `tests/test_ev_decide.py`),
+which is where a "warm" memory goes (Risk 1).
 
 ### Approach
 
-One paragraph on the chosen approach, and one on what was rejected and why.
+**Chosen: memory as an input type in `model.py`, two small pure modules for the two state
+machines that have nothing to do with sharing (`guard.py` for the phase-guard level,
+`regulation.py` for under-use / ramp / resume), and everything that interacts with
+ranking, sharing and actions — anti-flapping, hysteresis, pacing, the conservative start,
+the next-check time and building the new memory — inside `decide.py`.** The round-1
+allocation stays the *upper bound*: round 2 only ever narrows a claim before `share`
+(regulated cap, minimum pause) or lowers / holds a target after it (emergency, no-increase,
+pacing). Nothing in round 2 raises a target above what round 1 would have given, so every
+round-1 limit invariant holds by construction, and A8's new invariants are all of the form
+"never above the present setting" or "zero".
+
+**Rejected.** *A separate `Controller` class holding the memory* — stateful objects break
+round 1's purity (A8) and make the HA app's restart story the package's problem. *Memory in
+its own `memory.py`* — `Snapshot` must type it and `model.py` would import from a module
+that imports `ConfigError` back from `model.py`; keeping the memory types beside the other
+input types avoids the cycle at the cost of a longer `model.py`. *Doing all of round 2
+inside `decide.py`* — the guard latch and the regulation timers are self-contained state
+machines worth testing on their own; keeping them out of `decide.py` keeps it near its
+current size.
 
 ### Modules
 
 | Path | New or changed | Purpose |
 |---|---|---|
+| `src/energy_optimization/ev/model.py` | changed | `Reduction`, `GuardLevel`, `ChargerMemory`, `Memory`; new `Settings` fields; `Snapshot.memory` (A1, A3, A5, A6) |
+| `src/energy_optimization/ev/result.py` | changed | New `ReasonCode`, `EventKind`, `Status` members; `Decision.memory`, `.guard_level`, `.next_check` (A1, A5, A7) |
+| `src/energy_optimization/ev/guard.py` | new | Phase-guard level from one reading, and the level/green/emergency latch over time (A5) |
+| `src/energy_optimization/ev/regulation.py` | new | Under-use cut, ramp back, resume probe for one adjustable charger (A3, A4) |
+| `src/energy_optimization/ev/allocation.py` | changed | `phase_capacity` gains `settling` (A6) |
+| `src/energy_optimization/ev/decide.py` | changed | Memory usability, anti-flapping, hysteresis, regulation and guard wiring, pacing, next check, new memory (A1–A8) |
+| `src/energy_optimization/ev/codec.py` | changed | Memory in snapshot and decision dicts; `memory_to_dict`, `memory_from_dict` (A1) |
+| `src/energy_optimization/ev/__init__.py` | changed | Re-export the new public names |
+| `tests/test_ev_guard.py`, `tests/test_ev_regulation.py` | new | One test file per new module |
+| `tests/test_ev_*.py` (round 1) | changed | Snapshot helpers gain a warm memory (Risk 1); new cases for changed modules |
+| `STRUCTURE.md` | changed | New modules and test files by full path; changed signature rows |
 
 ### Public API
 
-> Every public class and function, with its full signature as it will be written.
-> `Covers` links back to the acceptance criteria above.
+Additions and changes only; round 1's table in `01-decision-core.md` stays the reference
+for everything not listed. Same conventions: frozen dataclasses validating in
+`__post_init__` and raising `ConfigError` naming the field; `StrEnum`s with lower-case
+values; tuple fields accept any sequence.
 
-| Signature | Module | Purpose | Covers |
-|---|---|---|---|
+**`ev/model.py`**
+
+| Signature | Purpose | Covers |
+|---|---|---|
+| `class Reduction(StrEnum)`: `TO_USE = "to_use"`, `HALVE = "halve"` | How an under-use cut is computed | A3 |
+| `class GuardLevel(StrEnum)`: `GREEN = "green"`, `YELLOW = "yellow"`, `RED = "red"`, `EMERGENCY = "emergency"` | The phase guard's level | A5 |
+| `ChargerMemory(charger_id: str, session_start: datetime \| None = None, car_connected: bool = False, session_key: str = "", running: bool = False, switched_at: datetime \| None = None, stopped_for_capacity: bool = False, selected: bool = False, regulated_cap: int \| None = None, under_use_since: datetime \| None = None, full_use_since: datetime \| None = None, under_use_stop_at: datetime \| None = None, last_target: float \| None = None, last_action_at: datetime \| None = None, decreased_at: datetime \| None = None)` | What one charger carries between calls. Datetimes aware; `regulated_cap ≥ 0`; `last_target ≥ 0`; `charger_id` non-empty | A1–A4, A6 |
+| `Memory(saved_at: datetime, chargers: tuple[ChargerMemory, ...] = (), level: GuardLevel = GuardLevel.GREEN, green_since: datetime \| None = None, emergency_at: datetime \| None = None)` | Everything carried between calls; `saved_at` is the `now` of the call that produced it. Datetimes aware; charger ids unique. Method `charger(self, charger_id: str) -> ChargerMemory \| None` | A1, A5 |
+| `Settings(...)` gains, after round 1's fields and in this order: `emergency_threshold: float \| None = None`, `emergency_calm: timedelta = timedelta(minutes=5)`, `yellow_margin: float = 2.0`, `green_hold: timedelta = timedelta(seconds=60)`, `deadband: float = 2.0`, `ramp_step: int = 2`, `ramp_period: timedelta = timedelta(minutes=5)`, `under_use_period: timedelta = timedelta(minutes=15)`, `reduction: Reduction = Reduction.TO_USE`, `under_use_margin: float = 1.0`, `min_pause: timedelta = timedelta(minutes=15)`, `hysteresis: timedelta = timedelta(minutes=30)`, `resume_probe: timedelta = timedelta(minutes=60)`, `min_action_interval: timedelta = timedelta(seconds=30)`, `max_memory_age: timedelta = timedelta(minutes=30)` | Validation: `emergency_threshold > phase_threshold` when set; `yellow_margin`, `deadband`, `under_use_margin ≥ 0`; `ramp_step ≥ 1`; `emergency_calm`, `green_hold`, `min_pause`, `hysteresis`, `min_action_interval ≥ 0`; `ramp_period`, `under_use_period`, `resume_probe`, `max_memory_age > 0` | A2–A6 |
+| `Snapshot(...)` gains `memory: Memory \| None = None` as its last field | The previous decision's memory | A1 |
+
+`max_memory_age` is the one setting section 1 did not list: A1's "out-of-date" needs a
+threshold, and 30 minutes is two missed 15-minute calls.
+
+**`ev/result.py`**
+
+| Signature | Purpose | Covers |
+|---|---|---|
+| `ReasonCode` gains `MINIMUM_PAUSE = "minimum_pause"`, `UNDER_USE = "under_use"`, `EMERGENCY = "emergency"` | Held off by anti-flapping; at 0 after an under-use cut, waiting for the probe; paused by the emergency level | A2–A5 |
+| `EventKind` gains `MEMORY_RESET = "memory_reset"`, `PHASE_GUARD_INTERVENED = "phase_guard_intervened"` | Conservative start; red or emergency | A1, A5 |
+| `Status` gains `EMERGENCY = "emergency"`, first in precedence | The emergency level is in force | A5 |
+| `Decision(...)` gains, after round 1's fields: `memory: Memory \| None = None`, `guard_level: GuardLevel \| None = None`, `next_check: datetime \| None = None` | `decide` always sets `memory`; `guard_level` is None when the phase measurements are not fresh; `next_check` in the settings timezone | A1, A5, A7 |
+
+**`ev/guard.py`** (new)
+
+| Signature | Purpose | Covers |
+|---|---|---|
+| `instant_level(currents: PhaseCurrents, phases: frozenset[Phase], settings: Settings) -> GuardLevel` | Level from one reading over `phases` (a `None` value is skipped): emergency if any reading `> emergency_threshold` (when set), else red if any `> phase_threshold`, else yellow if any `≥ phase_threshold − yellow_margin`, else green | A5 |
+| `GuardState(level: GuardLevel \| None, green_since: datetime \| None, emergency_at: datetime \| None, increases_allowed: bool, intervened: bool)` | The guard after one call | A5 |
+| `advance_guard(memory: Memory \| None, instant: GuardLevel \| None, now: datetime, settings: Settings) -> GuardState` | One step of the guard over time (guide 4) | A5 |
+
+**`ev/regulation.py`** (new)
+
+| Signature | Purpose | Covers |
+|---|---|---|
+| `Regulation(regulated_cap: int \| None, under_use_since: datetime \| None, full_use_since: datetime \| None, under_use_stop_at: datetime \| None, cut: bool)` | One adjustable charger's regulation after one call; `regulated_cap` 0 means stopped for under-use | A3, A4 |
+| `regulate(previous: ChargerMemory \| None, charger: Charger, state: ChargerState, reset: bool, now: datetime, settings: Settings) -> Regulation` | One step of under-use / ramp / probe (guide 5) | A3, A4 |
+
+**`ev/allocation.py`**
+
+| Signature | Purpose | Covers |
+|---|---|---|
+| `phase_capacity(snapshot: Snapshot, fresh: bool, settling: frozenset[str] = frozenset()) -> dict[Phase, float]` | As round 1, except a charger whose id is in `settling` counts at its **measured** per-phase draw (when known) instead of the smaller of setting and measured: a car still ramping down after a decrease is not mistaken for other load | A6 |
+
+**`ev/codec.py`**
+
+| Signature | Purpose | Covers |
+|---|---|---|
+| `memory_to_dict(memory: Memory) -> dict[str, object]` | Memory to a plain JSON-compatible dict | A1 |
+| `memory_from_dict(data: object) -> Memory \| None` | Dict to Memory; **never raises** — anything malformed gives None | A1 |
+
+`snapshot_to_dict`/`snapshot_from_dict` carry an optional `"memory"` key, decoded with
+`memory_from_dict` (malformed memory becomes `None`, never a `ConfigError`).
+`decision_to_dict`/`decision_from_dict` carry `"memory"`, `"guard_level"` and
+`"next_check"`; inside a decision the memory is decoded strictly, with dotted paths, like
+every other field. `decide(snapshot: Snapshot) -> Decision` is unchanged.
 
 ### Implementation guide
 
-Ordered. Each entry small enough to finish and check.
-
-1.
-2.
+1. **`model.py`.** Add the two enums, `ChargerMemory`, `Memory` (with `charger()`), the
+   `Settings` fields and their validation, and `Snapshot.memory` (validated as a `Memory`
+   or `None`; its charger entries are **not** cross-checked against the snapshot's
+   chargers — unknown ids are dropped by `decide`, guide 6.1). Showcase gains a memory.
+2. **`result.py`.** The new members and `Decision` fields.
+3. **`allocation.py`.** `phase_capacity`'s `settling`: for those ids (controllable,
+   available chargers only) the draw term is `measured_power_w / (voltage × phases)` when
+   measured, else `present_draw` as before.
+4. **`guard.py`.** `instant_level` per its row. `advance_guard`:
+   - **Stale** (`instant is None`): if the memory shows a latched emergency
+     (`memory.level is EMERGENCY`), level stays `EMERGENCY`, `green_since = None`,
+     `increases_allowed = False`, `intervened = True`. Otherwise `level = None`,
+     `green_since = None`, `emergency_at` carried, `increases_allowed = True` (round 1's
+     fallback rule governs stale data — its "increases up to the fallback are allowed" is
+     a round-1 decision A8 keeps), `intervened = False`.
+   - **Instant emergency**: level `EMERGENCY`, `emergency_at = now`, `green_since = None`.
+   - **Latched emergency** (`memory.level is EMERGENCY`, instant not emergency): if the
+     instant is green, `green_since` = the memory's `green_since` or `now`; the latch
+     releases (level green, `emergency_at = None`) once `now − green_since ≥
+     emergency_calm`, else level stays `EMERGENCY`. A non-green instant keeps
+     `EMERGENCY` and sets `green_since = None`.
+   - **Otherwise**: level = instant; `green_since` = (memory's `green_since` or `now`)
+     when green, else `None`. "Continuously across calls" therefore means every call since
+     `green_since` saw green.
+   - `increases_allowed` (fresh cases) = level green and `now − green_since ≥
+     green_hold`. With no memory `green_since = now`, so a memoryless call never increases
+     unless `green_hold` is 0 (the conservative start blocks it anyway, guide 6.8).
+   - `intervened` = level red or emergency.
+   Showcase: a red reading, then three green calls 30 s apart, printing level and
+   `increases_allowed`.
+5. **`regulation.py`.** `regulate`:
+   - Not `ADJUSTABLE` → `Regulation(None, None, None, None, False)`.
+   - Start from `previous` (all None when absent); if `reset`, clear all four fields.
+   - **Probe:** if `under_use_stop_at` is set and `now − under_use_stop_at ≥
+     resume_probe`, clear `regulated_cap` and `under_use_stop_at`.
+   - If paused, no car, or `measured_power_w is None`: clear both timers, keep
+     `regulated_cap` and `under_use_stop_at`, `cut=False`.
+   - `measured = measured_power_w / (voltage × len(phases))`, `setting =
+     current_setting`.
+   - **Under-use** (`measured < setting − deadband`): `under_use_since` = previous or
+     `now`; `full_use_since = None`. When `now − under_use_since ≥ under_use_period`:
+     `new = floor(measured + under_use_margin)` (`TO_USE`) or `floor(setting / 2)`
+     (`HALVE`); `new < min_current` → `regulated_cap = 0`, `under_use_stop_at = now`; else
+     `regulated_cap = new`; clear `under_use_since`; `cut = True`.
+   - **Otherwise (full use, including a draw above the setting)**: `under_use_since =
+     None`; `full_use_since` = previous or `now`. If `regulated_cap` is set and `> 0` and
+     `now − full_use_since ≥ ramp_period`: `regulated_cap += ramp_step`, `full_use_since =
+     now`; a cap `≥ max_current` is cleared (`None`).
+   Doc scenarios: 16 A set, 7 A drawn for 15 min → cap 8; 10 set, 2 drawn → 0 with
+   `under_use_stop_at`; 16 set, 14.5 drawn, deadband 2 → nothing; cap 10, 9.5 drawn for a
+   ramp period → 12. Showcase: those four.
+6. **`decide.py`.** In order, around round 1's pipeline:
+   1. **Memory.** `usable` = memory given, `saved_at ≤ now` and `now − saved_at ≤
+      max_memory_age`. Unusable → `memory = None`, `conservative = True`, and a
+      `MEMORY_RESET` event (with a param `reason`: `"missing"`, `"out_of_date"` or
+      `"future"`). Entries for charger ids not in the snapshot are ignored.
+   2. **Session start and reset.** Per charger with a car: `session_start` = memory's
+      when the memory says the car was already connected, else `now`. `session_key` = a
+      deterministic string of the session's `ready_time`, `energy_need_kwh`,
+      `target_soc_percent`, `charge_now` and `user_current_limit`. `reset` = the car was
+      not connected in memory (re-plug or first sight) or the key changed. When
+      `Session.plugged_in_at` is None, the deadline is seen from `session_start` (round 1
+      used `now`).
+   3. **Guard.** `instant = instant_level(...)` over the controllable phases when fresh,
+      else None; `guard = advance_guard(memory, instant, now, settings)`.
+   4. **Regulation.** For every controllable adjustable charger with a car,
+      `regulate(...)`; a `regulated_cap` lowers its effective max before `can_run` is
+      decided (`0` → cannot run, final code `UNDER_USE`). The plan request's max uses the
+      cap only when it is at or above the charger's minimum.
+   5. **Settling and capacity.** `settling` = ids whose memory `decreased_at` is within
+      `min_action_interval` of `now`; `raw = phase_capacity(snapshot, fresh, settling)`.
+   6. **Anti-flapping, before the tier share** (not for priority 1):
+      - *Minimum pause (off):* a smart charger whose memory says `stopped_for_capacity`,
+        not running, and `now − switched_at < min_pause` is left out of the claims —
+        allocation 0, final code `MINIMUM_PAUSE` (param `until`, ISO string) — but still
+        occupies its tier.
+      - *Ranking:* round 1's key, with an effective deadline: a charger running and within
+        `min_pause` of `switched_at` ranks first in its tier (minimum on-time); else a
+        `selected` charger's deadline is taken `hysteresis` earlier, ties to the selected
+        one (doc scenario 6: selected 08:45 beats newcomer 08:30; a newcomer at 08:14 wins).
+      - Smart-off chargers follow round 1 unchanged.
+   7. **Round 1's shares** run as before on these claims; call each result the *share*.
+   8. **Lowering, after the shares**, per controllable charger, in this order (each step
+      only lowers or holds; `present` as round 1's `_present`; `held(present)` = present
+      when it is 0 or at least the charger's minimum, else 0):
+      1. guard level `EMERGENCY` → target 0, final code `EMERGENCY`;
+      2. `conservative`, or `not guard.increases_allowed` → target = `min(share,
+         held(present))`, param `held_by` = `"memory_reset"` or `"phase_guard"`;
+      3. pacing: a target above `present` while `now − last_action_at <
+         min_action_interval` → target = `held(present)`, param `held_by = "pacing"`.
+   9. **Actions** from the final targets as round 1, except an action whose target equals
+      memory `last_target` while `now − last_action_at < min_action_interval` is not
+      emitted (in flight). Down actions are never held back by pacing.
+   10. **Status:** `EMERGENCY` first, then round 1's order. **Events:** round 1's, plus
+       `MEMORY_RESET` and `PHASE_GUARD_INTERVENED` (when `guard.intervened`; params
+       `level`). **Reasons:** a `regulated_cap` param when a cap applied; `held_by` per
+       8.2–8.3.
+   11. **New memory** (`saved_at = now`; level, `green_since`, `emergency_at` from
+       `guard`; one `ChargerMemory` per charger in snapshot order): `running` = final
+       target > 0; when `running` changed, `switched_at = now` and `stopped_for_capacity`
+       = it stopped while it could run and its final code is `WAITING_FOR_CAPACITY`;
+       `selected` = running and in the active tier; regulation fields from 4;
+       `last_target`/`last_action_at` set when an action was emitted for it, and
+       `decreased_at = now` when that action was a down action; a charger with no car
+       keeps only `charger_id` and `car_connected=False`.
+   12. **Next check:** the earliest of these that is after `now`, in the settings zone,
+       or None: the next quarter boundary when any smart session has a plan;
+       `green_since + green_hold` while increases are not yet allowed; `green_since +
+       emergency_calm` while the emergency latch holds; each `switched_at + min_pause`
+       that held a charger off or ranked it first; each `under_use_since +
+       under_use_period`, `full_use_since + ramp_period` (with a cap) and
+       `under_use_stop_at + resume_probe`; `last_action_at + min_action_interval` for each
+       paced increase; `prices.updated_at + max_price_age` while prices are fresh.
+   Showcase: the round-1 showcase, then two follow-up calls feeding the memory back.
+7. **`codec.py`.** Per the Public API notes; `timedelta` settings as seconds, enums by
+   value. `memory_from_dict` catches every `ConfigError`, `TypeError`, `ValueError` and
+   `OverflowError` and returns None.
+8. **`__init__.py`** re-exports `Reduction`, `GuardLevel`, `ChargerMemory`, `Memory`,
+   `memory_to_dict`, `memory_from_dict`.
+9. **STRUCTURE.md.** New sections for `guard.py`, `regulation.py`, their test files; the
+   changed rows.
 
 ### Test intents
 
-> High-level: what a test must prove, not how it is written. Step 5 turns each of these
-> into concrete cases, including the edge cases.
-
 | # | Must prove | Covers |
 |---|---|---|
-| T1 | | |
+| T1 | Memory and the new settings validate (aware datetimes, unique ids, ranges, emergency above threshold) with `ConfigError` naming the field | A1, A5 |
+| T2 | `memory_to_dict` / `memory_from_dict` round-trip through JSON, and inside snapshot and decision dicts; `memory_from_dict` returns None — never raises — for garbage, wrong types, huge numbers, naive datetimes | A1 |
+| T3 | Conservative start: no memory, out-of-date memory and future-dated memory each give no increase or resume that call and a `MEMORY_RESET` event with the right reason; decreases still go; unknown charger entries are ignored; the next call with that decision's memory behaves normally | A1 |
+| T4 | Minimum pause: a charger stopped for capacity is held off (`MINIMUM_PAUSE`) until `min_pause` has passed, then can start; charge-now ignores it; it never lets a held-off charger's share exceed the limits | A2 |
+| T5 | Hysteresis and minimum on-time: doc scenario 6 (selected 08:45 keeps its place against 08:30), a contender more than 30 min earlier wins, a just-started charger is not dropped for an equal-tier one, and none of it overrides budget, phase guard or fallback | A2 |
+| T6 | `regulate`: doc scenarios 8–11, the halving method, under-use not yet a whole period, a full-use call resetting the under-use timer, ramp only with a cap, cap cleared at max, on/off and missing power never regulated, reset clears | A3 |
+| T7 | Through `decide`: a cut frees current to another charger in the same call; a cap below the minimum gives 0 with `UNDER_USE`; the cap shows in params | A3 |
+| T8 | Resume probe: doc scenario 16 (60 min), re-plug and a session change each clear the cut early | A4 |
+| T9 | `instant_level` boundaries (exactly at threshold − margin, at threshold, at emergency; `None` phases; emergency unset) and `advance_guard` over call sequences: green hold, yellow/red blocking increases, emergency latch and calm release, stale data | A5 |
+| T10 | Through `decide`: red cuts to fit and raises `PHASE_GUARD_INTERVENED`; emergency pauses every controllable charger including charge-now and smart-off, status `EMERGENCY`, restarts only after the calm period; `guard_level` reported, None when stale | A5 |
+| T11 | Pacing: an increase within `min_action_interval` is held; a decrease always goes; an identical command still in flight is not re-sent; a settling charger's measured draw is used so a second decrease is not compounded (`phase_capacity` with `settling`) | A6 |
+| T12 | `next_check`: each source yields the expected instant, the earliest wins, None when nothing is pending | A7 |
+| T13 | Session start from memory gives the deadline when `plugged_in_at` is absent; a re-plug restarts it | A1, A4 |
+| T14 | Every round-1 test still passes with the warm-memory helper and unchanged expectations; round-1 scenario tests also hold under a differential against `01`'s `decide` for memory-free behaviour (guide Risk 1) | A8 |
+| T15 | Property (`hypothesis`): random sequences of 2–6 calls feeding each memory forward hold the §12 invariants plus no increase in yellow/red/conservative start, all controllable at 0 in emergency, down before up; deterministic; the 10-charger 48-hour call with a full memory under 100 ms | A8 |
+
+**Coverage check.** Every criterion has Public API: A1 memory types, `Snapshot.memory`,
+`Decision.memory`, codec functions, `MEMORY_RESET`; A2 `MINIMUM_PAUSE`, settings, memory
+fields; A3 `Reduction`, `regulate`, `UNDER_USE`; A4 `regulate`, memory fields; A5
+`GuardLevel`, guard module, `EMERGENCY` members, `Decision.guard_level`; A6 settings,
+`phase_capacity(settling)`, memory fields; A7 `Decision.next_check`; A8 `decide`. Every
+criterion has a test intent: A1 T1–T3, T13; A2 T4–T5; A3 T6–T7; A4 T8, T13; A5 T1, T9–T10;
+A6 T11; A7 T12; A8 T14–T15. Every new public name has a criterion.
 
 ### Risks
 
-What could make this harder than it looks, and what the build should do if it does —
-including whether it should halt.
+1. **Round-1 tests meet the conservative start.** Every round-1 `decide` test passes no
+   memory, which now means "no increases" — their expected allocations would collapse.
+   The build gives each round-1 test file's snapshot helper a *warm* memory (`saved_at =
+   now − 1 min`, `green_since = now − 1 h`, no charger entries) so their scenarios run in
+   steady state, and changes **no** expected value. A round-1 expectation that still
+   changes is a regression against A8: fix the code, and if the code is right because two
+   criteria disagree, halt.
+2. **Exact-shape codec tests.** Round-1 tests asserting the exact key set of a decision
+   dict, or rejecting unknown keys, must learn the three new keys; that is a deliberate
+   API addition, not a weakened test.
+3. **Interpretations decided here** (follow them, do not halt over them): (a) under stale
+   measurements round 1's fallback governs increases (guide 4); (b) an emergency latch
+   survives stale data; (c) a "switch for capacity reasons" is a stop whose final code is
+   `WAITING_FOR_CAPACITY`, and any start; (d) a session change is a change in the five
+   fields of guide 6.2; (e) the held value respects the 0/min rule (guide 6.8); (f)
+   planning uses a regulated cap only when it is at or above the minimum; (g)
+   `max_memory_age` = 30 min. Anything else undecided by section 1 or this plan is a halt.
+4. **Datetime pitfalls** as in round 1: compare in UTC; memory timestamps may arrive with
+   fixed offsets from the codec.
+5. **A10 / A8 timing.** The added work is linear in chargers; if the 100 ms check fails,
+   profile before changing algorithms; a second failure is a halt.
 
 ---
 
