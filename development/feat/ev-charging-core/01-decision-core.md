@@ -1,6 +1,6 @@
 # EV charging decision core
 
-<!-- claude-plan step=6 status=active -->
+<!-- claude-plan step=7 status=active -->
 
 | Field | Value |
 |---|---|
@@ -18,7 +18,7 @@
 | 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | done |
-| 6 | Concept check | `/concept-check` | in `/build` | pending |
+| 6 | Concept check | `/concept-check` | in `/build` | done |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
 | 9 | Pull request | `/create-pr` | with the user | pending |
@@ -985,6 +985,68 @@ Drift found, and what was done about it:
    changing"; all `ev/` modules, ten test files and five hooks checked) was applied; I did not
    re-derive it by hand. `ruff check .`, `ruff format --check .` and `mypy` clean; `pytest`
    1110 passed on the tree as audited.
+
+### Re-run audit after the A2 send-back (commits `9e8b11c`, `b2e115e`, `4cb6db3`, `711bdda`)
+
+The audit above stands as the record of the first pass. This is the second pass, on the tree
+the re-run left. Since the first audit (`348b2b0`) the only source file that changed is
+`ev/decide.py` (`git diff 348b2b0 HEAD --stat`: `decide.py`, `tests/test_ev_decide.py`, this
+file); `model`, `result`, `quarters`, `planning`, `allocation` and `codec` are untouched.
+`ruff check .`, `ruff format --check .`, `mypy` clean; `pytest` 1141 passed.
+
+**The section-6 failing input, re-probed.** Budget 32 A, a fixed charger reserved at 27 A on
+all phases, two adjustable 6-16 A chargers with `energy_need_kwh=10`, ready 07:00 / 09:00,
+flat 48 h prices, no charge-now. Before: status `normal`, both priority 4 `planned_later`.
+Now: status `waiting_for_capacity`, `available` 5.0 on every phase, both allocation 0,
+priority 4, reason `waiting_for_capacity` ("Priority 4 — waiting for capacity"), no action,
+two `target_unreachable` events with 0 kWh. The same with measurements zero and with the
+fixed charger measured at 27 A give the same result; the `charge_now=True` variant still gives
+`waiting_for_capacity`; one smart charger instead of two gives the same. The boundary holds:
+with exactly 6 A left (budget 33) charger `a` gets 6 A (priority 2, `limited_by_budget`) and
+`b` stays priority 4 `planned_later` with a ten-quarter plan, so it is not starved. Stale
+phase data on the same input reports `phase_data_stale`, as A5 requires.
+
+**Differential against `348b2b0`'s `decide`** (3000 generated snapshots: 1-5 chargers of all
+three kinds on mixed phases, fixed/stale/missing measurements, stale prices, charge-now,
+smart-off, user limits, price cap; scratch driver, not committed). 174 snapshots differ, and
+every difference is a reason code `planned_later` -> `waiting_for_capacity` (131) or a status
+change (`normal` -> `waiting_for_capacity` 30, `limited_by_*` -> `waiting_for_capacity` 8,
+`normal` -> `limited_by_*` 5). **No allocation, priority, plan, action, `available` or event
+differs in any snapshot.** The new `decide` was also equal to itself on a second call and
+every new decision survived `decision_from_dict(json.loads(json.dumps(decision_to_dict(d))))`
+unchanged, for all 3000.
+
+| # | Criterion | Met | Evidence |
+|---|---|---|---|
+| A1 | Rejects invalid configuration | yes | `model.py` and `codec.py` not touched since the first audit, whose 19-input probe stands; `tests/test_ev_model.py` and `tests/test_ev_codec.py` pass in the 1141. |
+| A2 | Priority 1-4, tier exclusivity, 0 or >= min, ranking, split, "waiting for capacity" | yes | The unmet clause is met: the section-6 input above gives `waiting_for_capacity` with everyone at 0 (doc scenario 4 with ordinary smart sessions; `test_doc_scenario_4_with_ordinary_smart_sessions_waits_for_capacity`, red on `b2e115e`'s predecessor, green now). Tier exclusivity, ranking, 15/15, 7/7/0, 6/0 and floor-plus-remainder are unchanged: the differential shows no priority or allocation differs in 3000 snapshots, and `test_doc_scenarios_2_to_5_*` and the 42 `test_share_*` cases pass. A charger with a non-empty later plan held back only by the current capacity stays `normal` / `planned_later` (probe: phase guard leaves 4 A, plan of 2 quarters later -> `normal`, `planned_later`), as the doc's "active group" wording asks; a priority-2 charger squeezed below its minimum by the phase guard reads `waiting_for_capacity`. |
+| A3 | Respects amp limits | yes | No allocation differs from `348b2b0` in 3000 generated snapshots; `test_the_invariants_hold_for_generated_snapshots` and the T6/T7 tests pass. |
+| A4 | Plans the cheapest quarters before the ready time | yes | `planning.py` and `quarters.py` untouched; no plan differs in the differential; T8-T12 tests pass. |
+| A5 | Falls back under doubt | yes | Probe: `phase_currents=None` on the section-6 input gives `phase_data_stale` with a `phase_data_stale` event (the status precedence puts it above `waiting_for_capacity`); `test_stale_phase_data_outranks_a_starved_charger_in_the_status` and `test_stale_prices_never_mark_a_session_starved` pass; no allocation differs in the differential, which includes stale and missing measurements and stale prices. |
+| A6 | Explainable, ordered output | yes | The reason that was false ("planned for later quarters" on a charger with no plan) is gone: every `planned_later` left in the differential output has a non-empty plan, and a session with an empty plan reads `waiting_for_capacity`, including when another session's plan used the capacity (probe: two sessions, one quarter, budget 16 -> `a` 16 A `in_plan`, `b` 0 A "waiting for capacity", status `limited_by_budget`). No action or event differs from `348b2b0`; down-before-up unchanged (`test_every_decrease_and_pause_comes_before_every_increase_and_resume`); a running starved charger is paused (`test_a_running_starved_charger_is_paused`); the decision still round-trips through JSON for all 3000 snapshots. Reason text and params are pinned by `test_the_starved_reason_has_a_stable_text_and_params`. |
+| A7 | Invariants for any input | yes | `test_the_invariants_hold_for_generated_snapshots` passes; the re-run changed no allocation, so the properties it checks are unaffected. |
+| A8 | Deterministic and dependency-free | yes | `decide(s) == decide(s)` over the 3000 snapshots; `test_a_starved_snapshot_is_pure_and_repeatable`, the hash-seed test and the AST import scan pass; `decide.py` imports only `dataclasses`, `datetime`, `enum`, `zoneinfo` and its siblings, and calls no clock. |
+| A9 | Round-trips plain dicts | yes | `codec.py` untouched; round trip of the new decisions (new reason code in the existing enum) verified for 3000 snapshots; `test_ev_codec.py` passes. |
+| A10 | Fast | yes | `test_ten_chargers_and_a_48_hour_series_decide_in_under_100_ms` passes (0.02 s for the test, five calls); the re-run added one `any()` per planned session and a list scan in `_status`, no loop over quarters. |
+
+**The three step-5 re-run decisions, each judged against section 1:**
+
+| Decision | Within section 1? | Why |
+|---|---|---|
+| (a) An empty plan reads reason `waiting_for_capacity` at priority 4 | **Yes, no amendment.** | A2 gives every connected smart charger a priority 1-4 and the doc's priority 4 "always gets 0"; a session with nothing planned cannot be priority 2 (current quarter not in plan) or 3 (ready time not passed, plan not completed), so 4 is the only tier that does not invent current for it. The tiers and priorities are unchanged (the differential shows no priority differs); only the reason, which A6 requires to be true, changed. The first audit already scoped the fix as "reason and status, priority stays 4; a different priority is a halt" and the re-run kept to it. |
+| (b) Status `waiting_for_capacity` while a smart-charging-off charger draws | **Yes, no amendment.** | A2 speaks of smart chargers ("every connected smart charger", "everyone gets 0"); section 1's order of service serves smart-off chargers first and gives the smart ones what is left, so with less than a minimum left every smart charger gets 0. The code already read it this way for an active tier at 0 beside a smart-off charger before the re-run (pinned by the existing smart-off test); the re-run extends the same reading to starved sessions. Probe: smart-off `a` at 16 A on a 16 A budget, smart `b` -> `b` 0 A `waiting_for_capacity`, status `waiting_for_capacity`. |
+| (c) A starved charger beside a served one reads `limited_by_budget` / `limited_by_phase`, not `normal` | **Yes, no amendment.** | Section 1 names the statuses and A2 fixes only the all-zero case; for a mixed case no criterion says `normal`, and `normal` would repeat the first audit's complaint (a status that says nothing is limited while a session can never be planned). `limited_by_budget` is what the budget does. Probes: starved `c1` on L1 beside a served `c2` on L2 -> `limited_by_budget`; budget 16 with one quarter, `a` takes it, `b` starved -> `limited_by_budget`. This is an interpretation the concept leaves open, recorded here; not a "better than the concept" change. |
+
+Drift in the re-run: none. Nothing was built from the out-of-scope list; the differential
+shows the re-run changed reasons and statuses only. The `structure-auditor` report for the
+re-run ("No edits needed": `decide(snapshot: Snapshot) -> Decision` and `main() -> None` are
+still `decide.py`'s only public names and match; the purpose line and the `main()` row are
+accurate; the changes are in private names; the new starved/waiting tests fall under the
+`tests/test_ev_decide.py` entry; all 9 files under `src/` and 10 under `tests/` have entries
+and none points to a missing file) was applied; I confirmed the public names with `ast` and
+did not re-derive the rest. The showcase `python -m energy_optimization.ev.decide` exits 0
+and reads as before. A2 is met, so this is not a second failure of the same criterion; step
+7 opens.
 
 ### Earlier rounds still hold
 
