@@ -6,14 +6,14 @@ blocks of a minimum length where the price cap, the horizon and the capacity all
 """
 
 import math
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from enum import StrEnum
 from zoneinfo import ZoneInfo
 
 from .model import Phase, Session
-from .quarters import QUARTER, quarter_starts
+from .quarters import QUARTER, floor_to_quarter, quarter_starts
 from .result import PlannedQuarter
 
 _EPS = 1e-9
@@ -87,6 +87,8 @@ class PlanRequest:
             all-or-nothing.
         need_kwh: Energy to deliver.
         deadline: The moment the energy is needed by, aware.
+        skip_current: Whether the quarter containing `now` is closed to this session
+            (it is held off for now); its plan then starts with the next quarter.
     """
 
     charger_id: str
@@ -95,6 +97,7 @@ class PlanRequest:
     max_current: float
     need_kwh: float
     deadline: datetime
+    skip_current: bool = False
 
 
 @dataclass(frozen=True)
@@ -174,11 +177,39 @@ def _blocks(slots: Sequence[_Slot], length: int) -> list[tuple[int, ...]]:
     return blocks
 
 
-def _select(slots: Sequence[_Slot], need_kwh: float, length: int) -> set[int]:
-    """Choose slot indices that cover the need, cheapest first, in blocks."""
+def _select(
+    slots: Sequence[_Slot],
+    need_kwh: float,
+    length: int,
+    forced: Collection[int] = frozenset(),
+) -> set[int]:
+    """Choose slot indices that cover the need, cheapest first, in blocks.
+
+    `forced` indices are chosen before anything else, in the cheapest minimum-length
+    block that contains them when there is one.
+    """
     blocks = _blocks(slots, length)
-    chosen: set[int] = set()
-    got = 0.0
+    chosen: set[int] = set(forced)
+    got = sum(slots[i].energy for i in chosen)
+    if chosen and length > 1:
+        anchor = min(chosen)
+        around = [
+            block
+            for block in blocks
+            if anchor in block
+            and all(slots[i].category <= slots[anchor].category for i in block)
+        ]
+        if around:
+            block = min(
+                around,
+                key=lambda b: _cheapest_key(
+                    slots, [i for i in b if i not in chosen] or [anchor], b
+                ),
+            )
+            for index in block:
+                if index not in chosen:
+                    chosen.add(index)
+                    got += slots[index].energy
     for tier in (_CAPPED, _OVER_CAP, _UNPRICED):
         tier_blocks = [
             block for block in blocks if max(slots[i].category for i in block) <= tier
@@ -264,9 +295,18 @@ def _plan_one(
     price_cap: float | None,
     zone: ZoneInfo,
     horizon: Sequence[datetime],
+    forced: datetime | None = None,
 ) -> SessionPlan:
-    """Plan one request against the remaining capacity and consume it."""
+    """Plan one request against the remaining capacity and consume it.
+
+    A `forced` quarter is planned whenever the session can use it at all.
+    """
     slots = _slots(request, horizon, prices, remaining, voltage, price_cap)
+    must = (
+        {i for i, slot in enumerate(slots) if slot.start == forced}
+        if forced is not None
+        else set()
+    )
     if request.need_kwh <= _EPS:
         indices: set[int] = set()
         reachable = True
@@ -274,7 +314,7 @@ def _plan_one(
         indices = set(range(len(slots)))
         reachable = False
     else:
-        indices = _select(slots, request.need_kwh, min_block_quarters)
+        indices = _select(slots, request.need_kwh, min_block_quarters, must)
         reachable = True
     quarters: list[PlannedQuarter] = []
     planned = 0.0
@@ -305,7 +345,7 @@ def plan_sessions(
     min_block_quarters: int,
     price_cap: float | None,
     timezone: str,
-    first: Collection[str] = frozenset(),
+    first: Sequence[str] = (),
 ) -> dict[str, SessionPlan]:
     """Plan every request against shared per-phase capacity, most urgent first.
 
@@ -319,32 +359,65 @@ def plan_sessions(
         min_block_quarters: Minimum length of a contiguous run of quarters.
         price_cap: Price above which quarters are avoided, None for off.
         timezone: IANA name; only sets the zone of `PlannedQuarter.start`.
-        first: Charger ids whose sessions claim capacity before all the others, each
-            group still most urgent first. A session that holds its place (it is
-            running and must not be displaced) is planned first, and the rest are
-            planned on what is left of every quarter, so the plans together never
-            book more than `capacity`.
+        first: Charger ids, in the order they contest it, of the sessions that hold
+            their place in the quarter containing `now`. Each one that would use that
+            quarter in a plan of its own, made on what the earlier ones left of it,
+            keeps it and is guaranteed the current it had there; everything else,
+            including those sessions' later quarters, is planned most urgent first
+            on what remains. The plans together never book more than `capacity`. An
+            id with no request, or whose own plan skips the quarter, holds nothing.
 
     Returns:
         Each session's plan, keyed by charger id. A request whose `max_current` is 0
         plans nothing and is unreachable.
 
     Raises:
+        TypeError: If `first` is a bare string, which would be read as a set of
+            characters rather than one id.
         ValueError: If `now` or a deadline is naive.
         ZoneInfoNotFoundError: If `timezone` is not a known zone.
     """
+    if isinstance(first, str):
+        raise TypeError(f"first must be a sequence of charger ids, got {first!r}")
     zone = ZoneInfo(timezone)
-    horizons = {
-        request.charger_id: quarter_starts(now, request.deadline)
-        for request in requests
-    }
+    horizons: dict[str, list[datetime]] = {}
+    for request in requests:
+        starts = quarter_starts(now, request.deadline)
+        horizons[request.charger_id] = starts[1:] if request.skip_current else starts
     remaining: dict[datetime, dict[Phase, float]] = {}
     for horizon in horizons.values():
         for start in horizon:
             if start not in remaining:
                 remaining[start] = {phase: capacity.get(phase, 0.0) for phase in Phase}
 
-    def urgency(request: PlanRequest) -> tuple[bool, float, datetime, str]:
+    def plan_alone(
+        request: PlanRequest,
+        room: dict[datetime, dict[Phase, float]],
+        forced: datetime | None = None,
+    ) -> SessionPlan:
+        return _plan_one(
+            request,
+            prices,
+            room,
+            voltage,
+            min_block_quarters,
+            price_cap,
+            zone,
+            horizons[request.charger_id],
+            forced,
+        )
+
+    this_quarter = floor_to_quarter(now) if first else None
+    holds = (
+        _holds(requests, first, this_quarter, remaining, horizons, plan_alone)
+        if this_quarter is not None
+        else {}
+    )
+    for charger_id, current in holds.items():
+        for phase in _by_id(requests)[charger_id].phases:
+            remaining[this_quarter][phase] -= current  # type: ignore[index]  # holds is empty unless this_quarter is set
+
+    def urgency(request: PlanRequest) -> tuple[float, datetime, str]:
         per_quarter = energy_per_quarter_kwh(
             request.max_current, len(request.phases), voltage
         )
@@ -356,26 +429,67 @@ def plan_sessions(
             else math.inf
         )
         slack = len(horizons[request.charger_id]) - max(needed, 0)
-        return (
-            request.charger_id not in first,
-            slack,
-            request.deadline.astimezone(UTC),
-            request.charger_id,
-        )
+        return slack, request.deadline.astimezone(UTC), request.charger_id
 
     plans: dict[str, SessionPlan] = {}
     for request in sorted(requests, key=urgency):
-        plans[request.charger_id] = _plan_one(
-            request,
-            prices,
-            remaining,
-            voltage,
-            min_block_quarters,
-            price_cap,
-            zone,
-            horizons[request.charger_id],
+        held = holds.get(request.charger_id)
+        if held is not None:
+            # Its own hold is room it may use again; nobody else could take it.
+            for phase in request.phases:
+                remaining[this_quarter][phase] += held  # type: ignore[index]  # holds is empty unless this_quarter is set
+        plans[request.charger_id] = plan_alone(
+            request, remaining, this_quarter if held is not None else None
         )
     return plans
+
+
+def _by_id(requests: Sequence[PlanRequest]) -> dict[str, PlanRequest]:
+    """Index the requests by charger id."""
+    return {request.charger_id: request for request in requests}
+
+
+def _holds(
+    requests: Sequence[PlanRequest],
+    first: Sequence[str],
+    this_quarter: datetime,
+    remaining: dict[datetime, dict[Phase, float]],
+    horizons: Mapping[str, Sequence[datetime]],
+    plan_alone: Callable[
+        [PlanRequest, dict[datetime, dict[Phase, float]]], SessionPlan
+    ],
+) -> dict[str, float]:
+    """Find the current each holding session keeps in the current quarter.
+
+    Sessions are tried in the order given. Each is planned alone on a copy of the
+    capacity less what the earlier ones hold in the current quarter, and holds the
+    current it has there in that plan, if it has one.
+    """
+    by_id = _by_id(requests)
+    holds: dict[str, float] = {}
+    claimed = dict.fromkeys(Phase, 0.0)
+    for charger_id in dict.fromkeys(first):
+        request = by_id.get(charger_id)
+        if request is None or this_quarter not in horizons[charger_id]:
+            continue
+        trial = {start: dict(remaining[start]) for start in horizons[charger_id]}
+        for phase in Phase:
+            trial[this_quarter][phase] -= claimed[phase]
+        plan = plan_alone(request, trial)
+        current = next(
+            (
+                q.current
+                for q in plan.quarters
+                if q.start.astimezone(UTC) == this_quarter
+            ),
+            None,
+        )
+        if current is None:
+            continue
+        holds[charger_id] = current
+        for phase in request.phases:
+            claimed[phase] += current
+    return holds
 
 
 def main() -> None:

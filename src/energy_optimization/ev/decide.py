@@ -289,39 +289,90 @@ def _plan_requests(items: list[_Item]) -> list[PlanRequest]:
                 top,
                 item.need or 0.0,
                 item.deadline,
+                skip_current=item.held_off,
             )
         )
     return requests
 
 
-def _keepers(items: list[_Item], ctx: _Context) -> frozenset[str]:
-    """Pick the planned sessions that hold their place against the others.
+def _held_off(item: _Item, ctx: _Context) -> bool:
+    """Whether the minimum pause still keeps a charger stopped for capacity off."""
+    prev = item.mem
+    return bool(
+        prev is not None
+        and prev.stopped_for_capacity
+        and not prev.running
+        and prev.switched_at is not None
+        and ctx.now.astimezone(UTC) - prev.switched_at.astimezone(UTC)
+        < ctx.settings.min_pause
+    )
+
+
+def _holders(items: list[_Item], ctx: _Context) -> tuple[str, ...]:
+    """Name the planned sessions that contest the current quarter, best claim first.
 
     The planner gives the current quarter to the session with the least slack, so a
     newcomer whose ready time is only a little earlier would displace a charger that
     is already running. That is the flapping the minimum on-time and the selection
-    hysteresis prevent, and they hold in this tier too: a charger that started less
-    than the minimum pause ago keeps its place, and a selected one keeps it unless a
-    contender sharing a phase has a ready time more than the hysteresis earlier. The
-    planner claims capacity for these first and plans everyone else on what is left,
-    so there is one plan and it never books more than the phase holds.
+    hysteresis prevent, and they hold in this tier as they do in the ranked ones: a
+    charger that started less than the minimum pause ago ranks first, then the
+    ready times in order with a selected charger's taken the hysteresis earlier. A
+    session takes part when it is protected or selected, or when its ready time is
+    more than the hysteresis earlier than that of a selected charger it shares a
+    phase with, since only such a session can take that charger's place. A charger
+    held off by the minimum pause never takes part.
+
+    The planner lets each of them keep the current quarter, if its own plan has it
+    there, in this order; every later quarter is planned most urgent first.
     """
-    candidates = [item for item in items if item.can_run and item.deadline is not None]
-    keepers: set[str] = set()
-    for item in candidates:
-        if item.protected:
-            keepers.add(item.charger.id)
-        elif item.was_selected and item.deadline is not None:
-            limit = _earlier(item.deadline, ctx.settings.hysteresis)
-            if not any(
-                other is not item
-                and other.deadline is not None
-                and other.deadline < limit
-                and other.charger.phases & item.charger.phases
-                for other in candidates
-            ):
-                keepers.add(item.charger.id)
-    return frozenset(keepers)
+    settings = ctx.settings
+    candidates = [
+        item
+        for item in items
+        if item.can_run and item.deadline is not None and not item.held_off
+    ]
+    selected = [item for item in candidates if item.was_selected and not item.protected]
+
+    def challenges(item: _Item) -> bool:
+        return any(
+            other is not item
+            and other.deadline is not None
+            and item.deadline is not None
+            and bool(other.charger.phases & item.charger.phases)
+            and item.deadline < _earlier(other.deadline, settings.hysteresis)
+            for other in selected
+        )
+
+    holders = [
+        item
+        for item in candidates
+        if item.protected or item.was_selected or challenges(item)
+    ]
+    holders.sort(key=lambda item: _tier_key(item, ctx))
+    return tuple(item.charger.id for item in holders)
+
+
+def _plans_now(
+    item: _Item,
+    ctx: _Context,
+    prices: dict[datetime, float],
+    plan_cap: dict[Phase, float],
+) -> bool:
+    """Whether a session, planned alone on the shared capacity, charges in this quarter."""
+    settings = ctx.settings
+    request = replace(_plan_requests([item])[0], skip_current=False)
+    alone = plan_sessions(
+        [request],
+        ctx.now,
+        prices,
+        plan_cap,
+        settings.voltage,
+        settings.min_block_quarters,
+        settings.price_cap,
+        settings.timezone,
+    )[item.charger.id]
+    this_quarter = floor_to_quarter(ctx.now)
+    return any(q.start.astimezone(UTC) == this_quarter for q in alone.quarters)
 
 
 def _mark_displaced(
@@ -336,26 +387,18 @@ def _mark_displaced(
     cheaper later or because another session claimed this quarter. Only the second is
     a capacity stop, which the minimum pause then holds off: it is the case when the
     charger, planned alone on the capacity the others share, would have had this
-    quarter.
+    quarter. What smart-charging-off chargers and reservations take is already out of
+    that capacity, so it is not counted as another session's claim.
     """
-    settings = ctx.settings
-    this_quarter = floor_to_quarter(ctx.now)
     for item in items:
-        if item.priority != 4 or not item.can_run or _commanded(item, ctx) <= _EPS:
+        if (
+            item.priority != 4
+            or not item.can_run
+            or item.held_off
+            or _commanded(item, ctx) <= _EPS
+        ):
             continue
-        alone = plan_sessions(
-            _plan_requests([item]),
-            ctx.now,
-            prices,
-            plan_cap,
-            settings.voltage,
-            settings.min_block_quarters,
-            settings.price_cap,
-            settings.timezone,
-        )[item.charger.id]
-        item.displaced = any(
-            q.start.astimezone(UTC) == this_quarter for q in alone.quarters
-        )
+        item.displaced = _plans_now(item, ctx, prices, plan_cap)
 
 
 def _present(item: _Item) -> float:
@@ -1041,6 +1084,8 @@ def decide(snapshot: Snapshot) -> Decision:
     ]
     if to_plan:
         prices = quarter_prices(snapshot.prices)
+        for item in to_plan:
+            item.held_off = _held_off(item, ctx)
         plans = plan_sessions(
             _plan_requests(to_plan),
             now,
@@ -1050,7 +1095,7 @@ def decide(snapshot: Snapshot) -> Decision:
             settings.min_block_quarters,
             settings.price_cap,
             settings.timezone,
-            _keepers(to_plan, ctx),
+            _holders(to_plan, ctx),
         )
         this_quarter = floor_to_quarter(now)
         for item in to_plan:
@@ -1058,13 +1103,18 @@ def decide(snapshot: Snapshot) -> Decision:
             in_plan = any(
                 q.start.astimezone(UTC) == this_quarter for q in item.plan.quarters
             )
+            # A charger the minimum pause holds off cannot use the quarter, so the
+            # plan leaves it out; it still wants it when it would have it alone, and
+            # then occupies the tier like the held-off chargers of the ranked ones.
+            if item.held_off and item.can_run and not in_plan:
+                in_plan = _plans_now(item, ctx, prices, plan_cap)
             item.priority = 2 if in_plan else 4
             item.code = ReasonCode.IN_PLAN if in_plan else ReasonCode.PLANNED_LATER
             # A session that can run but got no quarter at all is waiting for
             # capacity, whatever consumed it: the reservations, the smart-charging-off
             # allocations or another session's plan. Calling it "planned for later"
             # would be false, since nothing is planned.
-            item.starved = item.can_run and not item.plan.quarters
+            item.starved = item.can_run and not item.held_off and not item.plan.quarters
         _mark_displaced(to_plan, ctx, prices, plan_cap)
 
     smart = [i for i in items if i.group is _Group.SMART]
@@ -1077,15 +1127,7 @@ def decide(snapshot: Snapshot) -> Decision:
     )
     if tier != 1:
         for item in active:
-            prev = item.mem
-            item.held_off = bool(
-                prev is not None
-                and prev.stopped_for_capacity
-                and not prev.running
-                and prev.switched_at is not None
-                and now.astimezone(UTC) - prev.switched_at.astimezone(UTC)
-                < settings.min_pause
-            )
+            item.held_off = _held_off(item, ctx)
     claimants = [i for i in active if not i.held_off]
     shares = share([_claim(i) for i in claimants], cap)
     for item in claimants:
