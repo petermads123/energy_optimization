@@ -132,26 +132,27 @@ def main() -> None:
     )
     charger = Charger("carport", frozenset({Phase.L1}), ChargerKind.ADJUSTABLE, 6, 16)
     long_ago = now - settings.under_use_period
+    reset = False  # True clears the regulation, e.g. after a re-plug
 
     # 16 A set, about 7 A drawn for a whole under-use period: cut to 8 A.
     state = ChargerState("carport", True, 16, False, measured_power_w=7 * 230.0)
     previous = ChargerMemory("carport", car_connected=True, under_use_since=long_ago)
 
-    regulation = regulate(previous, charger, state, False, now, settings)
+    regulation = regulate(previous, charger, state, reset, now, settings)
 
     print(f"16 A set, 7 A drawn for 15 min: cap {regulation.regulated_cap} A")
 
     # 10 A set, 2 A drawn: the cut falls below the 6 A minimum, so the charger stops.
     state = ChargerState("carport", True, 10, False, measured_power_w=2 * 230.0)
 
-    regulation = regulate(previous, charger, state, False, now, settings)
+    regulation = regulate(previous, charger, state, reset, now, settings)
 
     print(f"10 A set, 2 A drawn: cap {regulation.regulated_cap} A (0 means stopped)")
 
     # 16 A set, 14.5 A drawn: inside the 2 A deadband, nothing changes.
     state = ChargerState("carport", True, 16, False, measured_power_w=14.5 * 230.0)
 
-    regulation = regulate(previous, charger, state, False, now, settings)
+    regulation = regulate(previous, charger, state, reset, now, settings)
 
     print(f"16 A set, 14.5 A drawn: cap {regulation.regulated_cap}")
 
@@ -164,7 +165,7 @@ def main() -> None:
         full_use_since=now - settings.ramp_period,
     )
 
-    regulation = regulate(previous, charger, state, False, now, settings)
+    regulation = regulate(previous, charger, state, reset, now, settings)
 
     print(f"cap 10 A, 9.5 A drawn for 5 min: cap {regulation.regulated_cap} A")
 

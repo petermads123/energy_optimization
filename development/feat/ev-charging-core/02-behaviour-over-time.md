@@ -1,6 +1,6 @@
 # EV charging core: behaviour over time
 
-<!-- claude-plan step=4 status=active -->
+<!-- claude-plan step=5 status=active -->
 
 | Field | Value |
 |---|---|
@@ -16,7 +16,7 @@
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done |
-| 4 | Verify | `/verify` | in `/build` | pending |
+| 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
@@ -578,12 +578,80 @@ implementer, and small additions, each recorded here:
 
 | Check | Result |
 |---|---|
-| `ruff check .` | |
-| `ruff format --check .` | |
-| `mypy` | |
-| Plan completeness | every signature in the Public API table exists as written |
-| `STRUCTURE.md` | in sync |
-| `python -m <package>.<module>` | |
+| `ruff check .` | `All checks passed!` |
+| `ruff format --check .` | `55 files already formatted` |
+| `mypy` | `Success: no issues found in 26 source files` |
+| `pytest` | `1142 passed in 10.31s` |
+| Plan completeness | every signature in the Public API table exists as written (table below) |
+| `STRUCTURE.md` | in sync (auditor findings below) |
+| `python -m energy_optimization.ev.<module>` | all nine modules exit 0 with readable output (below) |
+
+### Plan completeness
+
+Checked by introspection (`dataclasses.fields`, `inspect.signature`) against the Public API
+table of section 2, plus round 1's table for the names round 2 did not touch.
+
+| Name | Result |
+|---|---|
+| `Reduction`, `GuardLevel` (members and lower-case values) | matches |
+| `ChargerMemory` (15 fields, order and defaults) | matches |
+| `Memory` (5 fields) and `Memory.charger(self, charger_id: str) -> ChargerMemory \| None` | matches |
+| `Settings` (15 new fields, order and defaults) | matches |
+| `Snapshot.memory: Memory \| None = None` (last field) | matches |
+| `ReasonCode` (`MINIMUM_PAUSE`, `UNDER_USE`, `EMERGENCY`), `EventKind` (`MEMORY_RESET`, `PHASE_GUARD_INTERVENED`) | matches |
+| `Status.EMERGENCY` first in precedence | matches |
+| `Decision.memory`, `.guard_level`, `.next_check` (after round 1's fields, default None) | matches |
+| `guard.instant_level`, `guard.GuardState`, `guard.advance_guard` | matches |
+| `regulation.Regulation`, `regulation.regulate` | matches |
+| `allocation.phase_capacity(snapshot, fresh, settling: frozenset[str] = frozenset())` | matches |
+| `codec.memory_to_dict`, `codec.memory_from_dict` (never raises) | matches |
+| `decide(snapshot: Snapshot) -> Decision` | unchanged, as planned |
+| `ev.__all__` gains `Reduction`, `GuardLevel`, `ChargerMemory`, `Memory`, `memory_to_dict`, `memory_from_dict` | matches |
+
+No Missing, no Deviation (section 3 records only implementer choices and the `_INVALID_MEMORY`
+private marker), no Unplanned public surface. Round 1's table is unchanged for everything
+else.
+
+### `structure-auditor` findings (12 edits) and what was done
+
+Step 3 had already applied most of them; each was checked against `STRUCTURE.md` as it
+stood.
+
+| # | Finding | Result |
+|---|---|---|
+| 1 | `Settings` row missing 15 fields | already present |
+| 2 | `Snapshot` row missing `memory` | already present |
+| 3 | `Decision` row missing three fields | already present |
+| 4 | `phase_capacity` row missing `settling` | already present |
+| 5 | `ReasonCode`, `Status`, `EventKind` members | already present |
+| 6 | `model.py`: `Reduction`, `GuardLevel`, `ChargerMemory`, `Memory` rows | rows already present; applied now: intro sentence naming `Reduction` and `GuardLevel` as `StrEnum`s, and the `main` row (snapshot carrying a memory) |
+| 7 | `codec.py`: memory functions, intro, `snapshot_from_dict`/`decision_from_dict`/`main` rows | functions already present; applied now: intro ("Snapshot, decision and memory"), `snapshot_from_dict` (malformed memory becomes the invalid-memory marker), `decision_from_dict` (including bad `memory`), `main` (malformed memory decoding to None) |
+| 8 | Dependency-order paragraph | already present |
+| 9 | `guard.py` and `regulation.py` sections | already present |
+| 10 | Subpackage description | already present |
+| 11 | `ev/__init__.py` description | already present |
+| 12 | `decide.py` intro and `main` row | already present |
+
+The test sections for `test_ev_guard.py` and `test_ev_regulation.py` are step 5's, as the
+brief said.
+
+### Changed here to get green
+
+Nothing failed. One showcase-form fix: `regulation.main` passed the literal `False` as the
+`reset` argument inline in four calls; it is now a named `reset = False` with a comment.
+
+### Showcase output
+
+`python -m energy_optimization.ev.<module>` for `model`, `result`, `quarters`, `planning`,
+`allocation`, `guard`, `regulation`, `decide`, `codec`: exit 0 each (plus the expected
+`RuntimeWarning`). Highlights:
+
+```
+guard:      +0 s 33.0 A -> red, increases allowed: False ... +90 s green, increases allowed: True; stale: level None, increases allowed: True
+regulation: cap 8 A / cap 0 A (0 means stopped) / cap None / cap 12 A   (guide 5's four doc scenarios)
+decide:     call 1 "held by memory reset"; after 0:05:00 the garage gets 16.0 A; next check 2026-10-21 22:05:30+02:00; stale call falls back
+codec:      snapshot and memory round trips equal: True; malformed memory decodes to: None; rejected: chargers[0].max_current: must be a number, got 'sixteen'
+```
 
 ---
 

@@ -92,7 +92,7 @@ the `Params` alias, importable from `result`), `decide`, and the six codec funct
 
 ### `src/energy_optimization/ev/model.py`
 
-Input types and their validation. `Phase`, `ChargerKind` are `StrEnum`s; the dataclasses
+Input types and their validation. `Phase`, `ChargerKind`, `Reduction`, `GuardLevel` are `StrEnum`s; the dataclasses
 below are frozen and check themselves in `__post_init__`. Tuple fields accept any sequence
 and become tuples. Numeric fields reject `bool` and non-finite floats; float fields accept
 ints.
@@ -114,7 +114,7 @@ ints.
 | `Memory(saved_at: datetime, chargers: tuple[ChargerMemory, ...] = (), level: GuardLevel \| None = None, green_since: datetime \| None = None, emergency_at: datetime \| None = None)`; `charger(self, charger_id: str) -> ChargerMemory \| None` | Everything carried between calls; charger ids unique. |
 | `Settings(phase_budget: float, phase_threshold: float, fallback_current: int, timezone: str, voltage: float = 230.0, min_block_quarters: int = 2, price_cap: float \| None = None, default_energy_need_kwh: float = 30.0, max_price_age: timedelta = timedelta(minutes=60), max_measurement_age: timedelta = timedelta(seconds=60), emergency_threshold: float \| None = None, emergency_calm: timedelta = timedelta(minutes=5), yellow_margin: float = 2.0, green_hold: timedelta = timedelta(seconds=60), deadband: float = 2.0, ramp_step: int = 2, ramp_period: timedelta = timedelta(minutes=5), under_use_period: timedelta = timedelta(minutes=15), reduction: Reduction = Reduction.TO_USE, under_use_margin: float = 1.0, min_pause: timedelta = timedelta(minutes=15), hysteresis: timedelta = timedelta(minutes=30), resume_probe: timedelta = timedelta(minutes=60), min_action_interval: timedelta = timedelta(seconds=30), max_memory_age: timedelta = timedelta(minutes=30))` | Installation settings; budget, threshold, fallback and timezone are required; the rest govern behaviour over time (emergency off when unset). |
 | `Snapshot(now: datetime, settings: Settings, chargers: tuple[Charger, ...], states: tuple[ChargerState, ...], sessions: tuple[Session, ...], prices: PriceSeries, phase_currents: PhaseCurrents \| None = None, memory: Memory \| None = None)` | One call's input; cross-checks ids between chargers, states and sessions (memory entries for unknown chargers are allowed and dropped by `decide`). |
-| `main() -> None` | Showcase: build a snapshot, then trigger a `ConfigError`. |
+| `main() -> None` | Showcase: build a snapshot carrying a memory, then trigger a `ConfigError`. |
 
 ### `src/energy_optimization/ev/result.py`
 
@@ -226,7 +226,7 @@ events, the new memory and the next check.
 
 ### `src/energy_optimization/ev/codec.py`
 
-Snapshot and decision to and from plain JSON-compatible dicts. Keys are field names, enums
+Snapshot, decision and memory to and from plain JSON-compatible dicts. Keys are field names, enums
 go by value, datetimes are ISO 8601 with offset, `time` is `time.isoformat()`, `timedelta`
 is seconds, phase sets are sorted lists. A snapshot's `memory` that cannot be decoded
 does not fail the snapshot: `decide` sees it as invalid and starts conservatively. Inside a
@@ -237,12 +237,12 @@ typed fields with a `ConfigError` whose `field` is a dotted path such as
 | Signature | Description |
 |---|---|
 | `snapshot_to_dict(snapshot: Snapshot) -> dict[str, object]` | Snapshot to a plain dict. |
-| `snapshot_from_dict(data: Mapping[str, object]) -> Snapshot` | Dict to snapshot; `ConfigError` with a dotted path on bad input. |
+| `snapshot_from_dict(data: Mapping[str, object]) -> Snapshot` | Dict to snapshot; `ConfigError` with a dotted path on bad input, except that a malformed `memory` becomes the invalid-memory marker. |
 | `decision_to_dict(decision: Decision) -> dict[str, object]` | Decision to a plain dict. |
-| `decision_from_dict(data: Mapping[str, object]) -> Decision` | Dict to decision, same error rules. |
+| `decision_from_dict(data: Mapping[str, object]) -> Decision` | Dict to decision; `ConfigError` with a dotted path on bad input, including bad `memory`. |
 | `memory_to_dict(memory: Memory) -> dict[str, object]` | Memory to a plain dict. |
 | `memory_from_dict(data: object) -> Memory \| None` | Dict to memory; never raises, anything malformed gives None. |
-| `main() -> None` | Showcase: snapshot to JSON and back; memory to JSON and back; a rejected bad field. |
+| `main() -> None` | Showcase: snapshot to JSON and back; memory to JSON and back, and malformed memory decoding to None; a rejected bad field. |
 
 ## Tests: `tests/`
 
