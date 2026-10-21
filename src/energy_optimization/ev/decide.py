@@ -93,6 +93,7 @@ class _Item:
     plan: SessionPlan | None = None
     final_code: ReasonCode | None = None
     covered_event: bool = False
+    starved: bool = False
 
 
 @dataclass(frozen=True)
@@ -440,7 +441,8 @@ def _status(
         return Status.PHASE_DATA_STALE
     if not ctx.prices_ok:
         return Status.PRICES_STALE
-    if active and all(item.allocation <= 0 for item in active):
+    waiting = active + [item for item in items if item.starved]
+    if waiting and all(item.allocation <= 0 for item in waiting):
         return Status.WAITING_FOR_CAPACITY
     served = active + [
         item for item in items if item.group is _Group.SMART_OFF and item.can_run
@@ -537,6 +539,15 @@ def decide(snapshot: Snapshot) -> Decision:
             )
             item.priority = 2 if in_plan else 4
             item.code = ReasonCode.IN_PLAN if in_plan else ReasonCode.PLANNED_LATER
+            # Nothing can ever be planned when the budget left after the
+            # reservations is below the charger's minimum on one of its phases:
+            # that is waiting for capacity, not for cheaper quarters.
+            low = _low_current(item.charger)
+            item.starved = (
+                item.can_run
+                and not item.plan.quarters
+                and any(plan_cap[phase] < low - _EPS for phase in item.charger.phases)
+            )
 
     smart = [i for i in items if i.group is _Group.SMART]
     tier = next(
@@ -552,6 +563,8 @@ def decide(snapshot: Snapshot) -> Decision:
     for item in smart:
         if not item.can_run:
             item.final_code = ReasonCode.BELOW_MINIMUM
+        elif item.starved:
+            item.final_code = ReasonCode.WAITING_FOR_CAPACITY
         elif item.priority == 4:
             item.final_code = ReasonCode.PLANNED_LATER
         elif item not in active:

@@ -1,6 +1,6 @@
 # EV charging decision core
 
-<!-- claude-plan step=3 status=active -->
+<!-- claude-plan step=4 status=active -->
 
 | Field | Value |
 |---|---|
@@ -15,7 +15,7 @@
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
-| 3 | Implement | `/implement` | in `/build` | in progress |
+| 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | pending |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
@@ -680,6 +680,29 @@ what step 3 built.
 - `codec`: a huge integer or duration is a `ConfigError` naming its path;
   `snapshot_from_dict` documents that a field that only has a default may be omitted but
   not null.
+
+### Changed in step 3, re-run after step 6 (A2, first send-back)
+
+Section 6 found "waiting for capacity" missing when the budget left after reservations is
+below a charger's minimum and the sessions are ordinary smart ones: they fell to priority 4
+with an empty plan, reason `planned_later`, status `normal`. Fixed in `ev/decide.py` only;
+no public signature, no `ReasonCode` member and no tier changed (the session keeps priority 4).
+
+- A smart session that can run, was planned, and got an empty plan while the planning
+  capacity (budget minus reservations and smart-charging-off allocations, `plan_cap`) is below
+  its minimum on one of its phases is marked *starved* (private `_Item.starved`). Its final
+  reason is `WAITING_FOR_CAPACITY` ("Priority 4 — waiting for capacity") instead of
+  `PLANNED_LATER`.
+- `_status` returns `WAITING_FOR_CAPACITY` when every charger in the active tier **and** every
+  starved charger got 0 (and at least one exists), where it used to look at the active tier
+  alone. A priority-4 charger with a non-empty later plan, held back only by the current
+  (phase-guard) capacity, is not starved and keeps `normal`/`planned_later`.
+- Tests added to `tests/test_ev_decide.py` (the old suite needed no change; it never encoded
+  the wrong behaviour): `test_doc_scenario_4_with_ordinary_smart_sessions_waits_for_capacity`
+  (the section 6 input; red on the previous code, green now) and two pins for the boundary,
+  `test_a_priority_four_charger_with_a_later_plan_is_not_waiting_for_capacity` and
+  `test_a_planned_charger_held_back_only_by_the_phase_guard_stays_normal`.
+- Not touched: `STRUCTURE.md` (no public change).
 
 ---
 

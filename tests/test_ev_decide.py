@@ -209,6 +209,61 @@ def test_doc_scenarios_2_to_5_split_equally_and_cut_the_latest_ready_time(
             assert by_id(result)[cid].reason.code is ReasonCode.WAITING_FOR_CAPACITY
 
 
+def test_doc_scenario_4_with_ordinary_smart_sessions_waits_for_capacity() -> None:
+    chargers = [fixed("f", ALL, 27.0), adj("a", ALL), adj("b", ALL)]
+    states = [idle("f", 27.0, False), idle("a"), idle("b")]
+    sessions = [
+        sess("a", ready=time(7, 0), need=10.0),
+        sess("b", ready=time(9, 0), need=10.0),
+    ]
+    prices = hourly([0.20] * 48)
+
+    result = decide(
+        snap(chargers, states, sessions, prices, budget=32.0, threshold=60.0)
+    )
+
+    assert result.status is Status.WAITING_FOR_CAPACITY
+    assert result.available == PhaseAmps(5.0, 5.0, 5.0)
+    for cid in "ab":
+        decision = by_id(result)[cid]
+        assert decision.allocation == 0.0
+        assert decision.priority == 4
+        assert decision.reason.code is ReasonCode.WAITING_FOR_CAPACITY
+        assert "waiting for capacity" in decision.reason.text
+    assert result.actions == ()
+
+
+def test_a_priority_four_charger_with_a_later_plan_is_not_waiting_for_capacity() -> (
+    None
+):
+    prices = hourly([0.50] * 2 + [0.10] * 4 + [0.50] * 42)
+
+    result = decide(snap([adj()], sessions=[sess(need=2.0)], prices=prices))
+
+    decision = by_id(result)["a"]
+    assert decision.priority == 4
+    assert decision.plan
+    assert decision.reason.code is ReasonCode.PLANNED_LATER
+    assert result.status is Status.NORMAL
+
+
+def test_a_planned_charger_held_back_only_by_the_phase_guard_stays_normal() -> None:
+    prices = hourly([0.50] * 2 + [0.10] * 4 + [0.50] * 42)
+    currents = PhaseCurrents(
+        NOW, 30.0, 0.0, 0.0
+    )  # guard leaves 2 A, below the 6 A minimum
+
+    result = decide(
+        snap([adj()], sessions=[sess(need=2.0)], prices=prices, currents=currents)
+    )
+
+    decision = by_id(result)["a"]
+    assert decision.priority == 4
+    assert decision.plan
+    assert decision.reason.code is ReasonCode.PLANNED_LATER
+    assert result.status is Status.NORMAL
+
+
 def test_equal_ready_times_rank_the_larger_remaining_need_first() -> None:
     chargers = [adj("small"), adj("big")]
     sessions = [
