@@ -1,6 +1,6 @@
 # EV charging decision core
 
-<!-- claude-plan step=6 status=active -->
+<!-- claude-plan step=3 status=active -->
 
 | Field | Value |
 |---|---|
@@ -15,9 +15,9 @@
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
-| 3 | Implement | `/implement` | in `/build` | done |
-| 4 | Verify | `/verify` | in `/build` | done |
-| 5 | Test | `/test` | in `/build` | done |
+| 3 | Implement | `/implement` | in `/build` | in progress |
+| 4 | Verify | `/verify` | in `/build` | pending |
+| 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
@@ -808,9 +808,62 @@ planning/allocation/decide) were merged; duplicates dropped, every contradiction
 
 | # | Criterion | Met | Evidence |
 |---|---|---|---|
-| A1 | | | |
+| A1 | Rejects invalid configuration | yes | Driven by hand (19 inputs): min > max → `max_current`; min 0 / −1 → `min_current`; empty and unknown phase → `phases`; `None` budget / threshold / fallback → `phase_budget` / `phase_threshold` / `fallback_current` ("required"); budget 0 and −3 → `phase_budget`; unknown and `None` timezone → `timezone`; duplicate charger id → `chargers`; session for unknown charger → `sessions`; naive `now`, `plugged_in_at`, price bound and `measured_at` → the field. Each is a `ConfigError` whose `field` and message name the field and the value. Suite: `tests/test_ev_model.py` (206 cases for T1). |
+| A2 | Priority 1–4, tier exclusivity, 0 or ≥ min, ranking, split, "waiting for capacity" | **partially** | Met: tier exclusivity and ranking (probe: charge-now 32 A, priority 2 and 3 get 0 with `waiting_for_higher_priority`); 15/15, 7/7/0, 6/0/0 and 16/16/16 splits (`test_doc_scenarios_2_to_5_*`, 5 rows); `share` floors and hands out the remainder 1 A at a time in ranking order (`tests/test_ev_allocation.py`, 42 `test_share_*` cases). **Unmet clause: "with less than min available everyone gets 0 and the status is 'waiting for capacity'".** The test builds scenario 4 only with charge-now sessions (`now_session`, priority 1). With ordinary smart sessions whose ready time is in the future, when the budget left after reservations is below the minimum — e.g. budget 32 A, a fixed charger reserved at 27 A on all phases, two adjustable 6–16 A chargers with `energy_need_kwh=10`, ready 07:00 / 09:00, flat 48 h prices — `decide` returns status `normal`, `available` 5.0 on every phase, both chargers allocation 0, priority 4 and reason `planned_later` ("charging is planned for later quarters"), plus two `target_unreachable` events with 0.0 kWh. The planning capacity (`plan_cap`, `decide.py:498-518`) is below the minimum in every quarter, so no quarter can be planned, the sessions fall to priority 4 and never reach the tier that `_status` (`decide.py:443`) checks. The same snapshot with `charge_now=True`, or with ready time passed, gives `waiting_for_capacity`. A user opening the status sees "normal" and the reason says charging is planned, while nothing can ever be planned. |
+| A3 | Respects amp limits | yes | Probes: doc scenario 7 (29 A other load on L1, threshold 35, budget 32 → 6 A, `limited_by_phase`, `available.l1` = 6); scenario 12 (16 A three-phase + 10 A single-phase on one shared phase, budget 25 → 15 A / 10 A); `share` of a 3-phase and two single-phase claims on 25 A per phase → 13 / 12 / 12 (max-min fair, no phase over 25); scenario 20 (on/off 10 A + adjustable, budget 18 → 10 A and 8 A, on/off never partial); fixed charger reserved at its level (27 A) with no action; unavailable adjustable set 12 A drawing 14 A reserved at 14 A (`available.l1` 18 = 32 − 14) with no action; smart-off at its user limit 12 A served first, the charge-now smart charger gets the 8 A that is left. `test_the_invariants_hold_for_generated_snapshots` and the T6 / T7 tests pass. |
+| A4 | Plans the cheapest quarters before the ready time | yes | Driven by hand: 07:00 → 07:00 on 2026-03-28/29 gives 92 quarters and on 2026-10-24/25 gives 100 (deadlines 05:00 UTC and 06:00 UTC); 20 kWh at 16 A × 3 phases over 28 quarters with random prices plans 8 quarters (ceil(20 / 2.76) = 8) in runs `[2, 2, 2, 2]`, finish 07:00, `reaches_target` True; 170 kWh with prices only to midnight plans 62 quarters of which 6 are unpriced (`price` None), the latest quarters, `reaches_target` True; a cap of 0.5 with 12 cheap quarters and a need of 15 quarters plans 15 and raises `price_cap_exceeded`, while a need of 11 quarters stays under the cap with no event; the unreachable case raises `target_unreachable` with `reachable_kwh` and `target_kwh`; hourly intervals are split (`test_plan_hourly_intervals_split_*`). Shared capacity: `test_plan_*shared*` group. |
+| A5 | Falls back under doubt | yes | Probes: measurements 5 min old, `None` object and a reading dated 5 min ahead all give status `phase_data_stale`, a `phase_data_stale` event, charger `a` 6 A (global fallback), charger `b` 10 A (its own `fallback_current`), on/off 10 A and adjustable min 8 A both 0 with `below_minimum`; budget and tiers still apply. Stale prices (3 h old): the non-charge-now session is priority 3, the charge-now one stays priority 1, status `prices_stale`, event `prices_stale`, no plan. Paused charger with 2300 W measured adds to the other load (L1 cap 6 A = 16 − 10); missing power is taken as drawing the setting (cap 16 A). `test_ev_decide.py` T13 / T14 groups pass. |
+| A6 | Explainable, ordered output | yes | Probe: `x` 16 → 8 A emitted as `set_current` stage `down` before `y` 6 → 16 A `set_current` stage `up`; resume / pause carry absolute targets; no action for fixed, unavailable, carless or unchanged chargers. Every `ChargerDecision` carries allocation, priority, `Reason(code, text, params)`, plan (with `price` None for unpriced), `expected_finish`, `reaches_target`; `Decision.available` and `status` set; the four event kinds named in section 1 are raised in the probes above (`target_unreachable`, `price_cap_exceeded`, `phase_data_stale`, `prices_stale`; `charge_now_need_covered` in `test_charge_now_*`). The A6 weakness found under A2 (reason "planned for later quarters" on a charger with an empty plan) is part of that one finding. |
+| A7 | §12 invariants for any input | yes | `test_the_invariants_hold_for_generated_snapshots`: 300 generated snapshots, `derandomize=True`, checks written independently in `assert_invariants`; section 5 records that dropping the phase guard, the reservation, the down-before-up order or the fallback cap each turns it red. Passes in the full run (1110 passed). |
+| A8 | Deterministic and dependency-free | yes | `decide(s) == decide(s)` in the probe; `test_the_output_does_not_depend_on_the_hash_seed` (three `PYTHONHASHSEED`s), `test_the_package_imports_only_the_standard_library_and_itself` (AST scan); `grep` over `src/` finds no import outside the standard library and no `datetime.now` / clock call. |
+| A9 | Round-trips plain dicts | yes | Probe: `snapshot_from_dict(json.loads(json.dumps(snapshot_to_dict(s)))) == s` and the same for a 10-charger `Decision`, both True, with `l2: null` kept as `None`; ISO 8601 with offset, `ready_time` `"07:00:00"`, durations as seconds; a missing `settings.phase_budget`, a string `phase_budget` and a string `chargers[1].max_current` are rejected naming `settings.phase_budget` / `chargers[1].max_current`. Optional fields (`measured_power_w`, `soc_percent`, `user_current_limit`, `plugged_in_at`, `energy_need_kwh`, `fallback_current`, `price_cap`, `phase_currents`) accept null; defaulted fields (`available`, `delivered_kwh`, `voltage`) reject it and accept omission. |
+| A10 | Fast | yes | Probe: 10 chargers (1- and 3-phase), 200 quarters of prices (50 h), with and without a price cap: best of five `decide` calls 2.7 ms. `test_ten_chargers_and_a_48_hour_series_decide_in_under_100_ms` passes. |
 
 Drift found, and what was done about it:
+
+1. **A2 — "waiting for capacity" missing when the budget left after reservations is below the
+   minimum** (code wrong, concept clear). Section 1 states the outcome outright, so no
+   amendment is needed; the work goes **back to step 3**. Scope for the fix, so step 3 need not
+   guess: when no quarter can be planned for a session that can run and still has need because
+   the planning capacity (budget minus reservations and smart-charging-off allocations) is
+   below its minimum on one of its phases, the overall status is `waiting_for_capacity` and the
+   charger's reason says it is waiting for capacity rather than "planned for later quarters".
+   A priority-4 charger whose plan is non-empty but later, with only the *current* capacity
+   (the phase guard) below the minimum, keeps `normal`: it is not waiting for capacity, it is
+   waiting for its cheaper quarters. If the fix turns out to need a different *priority* for
+   such a session (the tiers are fixed by section 1), that is a halt, not a code decision. Add a
+   test with ordinary smart sessions (not charge-now) for doc scenario 4.
+2. **Judgement calls recorded in sections 3 and 5 — all within section 1, none amends it:**
+   - `next_occurrence` between the two fold occurrences returns the second occurrence: section 1
+     says the horizon runs "to the next occurrence of the ready time in the settings'
+     timezone", and the second occurrence is the next moment the local clock reads that time.
+   - Partial quarters credited as whole quarters (the one holding `now`; the last one before an
+     off-grid ready time): A4 states the quantity as "ceil(remaining need / (V × A × phases /
+     4))", a count of whole quarters, and every call re-plans. For `reaches_target` the error is
+     conservative (finish is the end of the quarter); for the quarter holding `now` it is up to
+     one quarter of energy optimistic, corrected on the next call. Not drift; already noted for
+     step 8.
+   - `null` on a field that only has a default is rejected: A1 "never a best guess" and A9
+     "wrongly typed … rejected". Section 1's "missing values allowed" is listed field by field
+     (SOC, measured power, phase currents), and every one of those accepts null.
+   - `present_draw` for a fixed or unavailable charger is its measured draw when known, else its
+     reservation: A3 reserves it at "the higher of … and measured draw"; the change only makes
+     the phase-guard term tighter and removes a double count. Within A3.
+   - Also within section 1: on/off `present_draw` is min(assumed, measured) (section 1: "charges
+     least"); user limit applied to an on/off charger (cannot run below its assumed current);
+     `PRICE_CAP_EXCEEDED` on an unreachable plan; `TARGET_REACHED` for SOC ≥ 100 (priority none,
+     section 1 gives priority 1–4 "or none").
+3. **Out of scope, surface, connections:** nothing from the out-of-scope list was built (no
+   memory between calls, hysteresis, deadband, ramp-up, pause timers; `grep` finds none); no
+   I/O or HA code; `hello_world.py` and its test are gone; nothing outside `src/`, `tests/`,
+   `pyproject.toml`, `STRUCTURE.md`, `DEVELOPMENT.md` and `development/` changed. Public API
+   matches what the concept asks for (snapshot / decision types, `decide`, four codec
+   functions); the helper modules are importable but not re-exported. All seven showcases
+   exit 0 and read as worked examples.
+4. **Structure:** the `structure-auditor` report ("STRUCTURE.md matches the code: nothing needs
+   changing"; all `ev/` modules, ten test files and five hooks checked) was applied; I did not
+   re-derive it by hand. `ruff check .`, `ruff format --check .` and `mypy` clean; `pytest`
+   1110 passed on the tree as audited.
 
 ### Earlier rounds still hold
 
