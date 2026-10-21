@@ -293,6 +293,62 @@ def _plan_requests(items: list[_Item]) -> list[PlanRequest]:
     return requests
 
 
+def _keep_places(
+    items: list[_Item],
+    now: datetime,
+    ctx: _Context,
+    prices: dict[datetime, float],
+    plan_cap: dict[Phase, float],
+) -> None:
+    """Let a selected planned charger keep its quarter against a planned contender.
+
+    The planner gives the current quarter to the session with the least slack, so a
+    newcomer whose ready time is only a little earlier would displace a charger that
+    is already running. That is the flapping the selection hysteresis prevents, and
+    it holds in this tier too: a displaced selected charger is put back in the plan
+    for this quarter when a contender sharing a phase is not earlier than its
+    deadline minus the hysteresis, and the quarter was lost to capacity rather than
+    to price (planned alone, it would have had it). The tier ranking then settles
+    who gets the current: the selected one first.
+    """
+    settings = ctx.settings
+    this_quarter = floor_to_quarter(now)
+    planned_now = [item for item in items if item.priority == 2]
+    for item in items:
+        if (
+            item.priority != 4
+            or not item.was_selected
+            or not item.can_run
+            or item.deadline is None
+        ):
+            continue
+        limit = item.deadline - settings.hysteresis
+        if any(
+            other.charger.phases & item.charger.phases
+            and other.deadline is not None
+            and other.deadline < limit
+            for other in planned_now
+        ) or not any(
+            other.charger.phases & item.charger.phases for other in planned_now
+        ):
+            continue
+        alone = plan_sessions(
+            _plan_requests([item]),
+            now,
+            prices,
+            plan_cap,
+            settings.voltage,
+            settings.min_block_quarters,
+            settings.price_cap,
+            settings.timezone,
+        )[item.charger.id]
+        if any(q.start.astimezone(UTC) == this_quarter for q in alone.quarters):
+            item.plan = alone
+            item.priority = 2
+            item.code = ReasonCode.IN_PLAN
+            item.starved = False
+
+
 def _present(item: _Item) -> float:
     """Return the current a charger is at now, 0 when paused."""
     if item.state.paused:
@@ -302,15 +358,44 @@ def _present(item: _Item) -> float:
     return float(item.charger.assumed_current or 0.0)
 
 
-def _in_flight(item: _Item, target: float, ctx: _Context) -> bool:
-    """Say whether the same command was sent a moment ago and may not have landed."""
+def _shifted(moment: datetime, span: timedelta = timedelta(0)) -> datetime | None:
+    """Return `moment + span` in UTC, None when that leaves the datetime range."""
+    try:
+        return moment.astimezone(UTC) + span
+    except OverflowError:
+        return None
+
+
+def _window_open(item: _Item, ctx: _Context) -> bool:
+    """Say whether a command was sent to the charger within the action interval."""
     mem = item.mem
     if mem is None or mem.last_target is None or mem.last_action_at is None:
         return False
-    if abs(mem.last_target - target) > _EPS:
-        return False
     age = ctx.now.astimezone(UTC) - mem.last_action_at.astimezone(UTC)
     return timedelta(0) <= age < ctx.settings.min_action_interval
+
+
+def _commanded(item: _Item, ctx: _Context) -> float:
+    """Return the current a charger is at, or on its way to.
+
+    A command sent within the action interval may not have landed, so the state
+    still shows the old value; the charger is taken to be at the command, which is
+    what it will draw. Lowering and pacing are judged against this, so an increase
+    still in flight is countermanded by an emergency or a smaller share instead of
+    landing unchecked.
+    """
+    mem = item.mem
+    if mem is not None and mem.last_target is not None and _window_open(item, ctx):
+        return mem.last_target
+    return _present(item)
+
+
+def _in_flight(item: _Item, target: float, ctx: _Context) -> bool:
+    """Say whether the same command was sent a moment ago and may not have landed."""
+    mem = item.mem
+    if mem is None or mem.last_target is None or not _window_open(item, ctx):
+        return False
+    return abs(mem.last_target - target) <= _EPS
 
 
 def _actions(items: list[_Item], ctx: _Context) -> tuple[Action, ...]:
@@ -324,14 +409,14 @@ def _actions(items: list[_Item], ctx: _Context) -> tuple[Action, ...]:
         if not item.acts:
             continue
         target = item.allocation
-        present = _present(item)
+        present = _commanded(item, ctx)
         charger_id = item.charger.id
         if _in_flight(item, target, ctx):
             continue
         if target <= 0:
             if present > 0:
                 down.append(Action(charger_id, ActionKind.PAUSE, 0.0, Stage.DOWN))
-        elif item.state.paused:
+        elif item.state.paused and not _window_open(item, ctx):
             up.append(Action(charger_id, ActionKind.RESUME, target, Stage.UP))
         elif abs(target - present) > _EPS:
             kind = ActionKind.SET_CURRENT
@@ -362,7 +447,7 @@ def _expected_finish(item: _Item, ctx: _Context) -> datetime | None:
         return None
     if item.allocation > 0:
         hours = need * 1000 / (voltage * item.allocation * phase_count)
-        return (ctx.now + timedelta(hours=hours)).astimezone(ctx.zone)
+        return (ctx.now.astimezone(UTC) + timedelta(hours=hours)).astimezone(ctx.zone)
     return None
 
 
@@ -454,8 +539,9 @@ def _reason(item: _Item, ctx: _Context, raw: dict[Phase, float]) -> Reason:
         and item.mem is not None
         and item.mem.switched_at is not None
     ):
-        until = item.mem.switched_at + ctx.settings.min_pause
-        params["until"] = until.astimezone(ctx.zone).isoformat()
+        until = _shifted(item.mem.switched_at, ctx.settings.min_pause)
+        if until is not None:
+            params["until"] = until.astimezone(ctx.zone).isoformat()
     if item.held_by is not None:
         params["held_by"] = item.held_by
     else:
@@ -602,14 +688,18 @@ def _usable_memory(snapshot: Snapshot) -> tuple[Memory | None, str | None]:
     memory = snapshot.memory
     if memory is None:
         return None, "missing"
-    if memory is _INVALID_MEMORY:
+    if memory == _INVALID_MEMORY:
         return None, "invalid"
     now = snapshot.now.astimezone(UTC)
-    saved = memory.saved_at.astimezone(UTC)
     known = {charger.id for charger in snapshot.chargers}
-    if saved > now or any(
-        moment.astimezone(UTC) > saved for moment in _timestamps(memory, known)
-    ):
+    try:
+        saved = memory.saved_at.astimezone(UTC)
+        future = saved > now or any(
+            moment.astimezone(UTC) > saved for moment in _timestamps(memory, known)
+        )
+    except OverflowError:
+        return None, "invalid"  # a time no UTC date can hold is not a time
+    if future:
         return None, "future"
     if now - saved > snapshot.settings.max_memory_age:
         return None, "out_of_date"
@@ -620,7 +710,11 @@ def _session_key(session: Session | None) -> str:
     """Fingerprint the session fields whose change means a new session."""
     if session is None:
         return ""
-    plugged = session.plugged_in_at.isoformat() if session.plugged_in_at else ""
+    plugged = ""
+    if session.plugged_in_at is not None:
+        # The same instant written with another offset is the same plug-in.
+        moment = _shifted(session.plugged_in_at) or session.plugged_in_at
+        plugged = moment.isoformat()
     return "|".join(
         (
             session.ready_time.isoformat(),
@@ -643,14 +737,13 @@ def _held(item: _Item, present: float) -> float:
 
 def _lower(items: list[_Item], ctx: _Context) -> None:
     """Lower or hold the shares: emergency, no increases, pacing. Never raises one."""
-    interval = ctx.settings.min_action_interval
     for item in items:
         if item.group not in (_Group.SMART, _Group.SMART_OFF, _Group.IDLE):
             continue
         if not item.acts:
             continue
         share_ = item.allocation
-        present = _present(item)
+        present = _commanded(item, ctx)
         if ctx.guard.level is GuardLevel.EMERGENCY:
             if share_ > 0 or present > 0:
                 item.final_code = ReasonCode.EMERGENCY
@@ -663,14 +756,7 @@ def _lower(items: list[_Item], ctx: _Context) -> None:
         if ctx.conservative or not ctx.guard.increases_allowed:
             target = min(target, _held(item, present))
             held_by = "memory_reset" if ctx.conservative else "phase_guard"
-        last = item.mem.last_action_at if item.mem is not None else None
-        if (
-            last is not None
-            and target > present + _EPS
-            and timedelta(0)
-            <= ctx.now.astimezone(UTC) - last.astimezone(UTC)
-            < interval
-        ):
+        if target > present + _EPS and _window_open(item, ctx):
             target = _held(item, present)
             held_by = "pacing"
         if target < share_ - _EPS:
@@ -689,10 +775,19 @@ def _new_memory(
     entries: list[ChargerMemory] = []
     for item in items:
         charger_id = item.charger.id
-        if not item.state.car_connected:
-            entries.append(ChargerMemory(charger_id))
-            continue
         previous = item.mem or ChargerMemory(charger_id)
+        if not item.state.car_connected:
+            # An unplug keeps what the minimum pause needs: a re-plug is no reason to
+            # skip it.
+            entries.append(
+                ChargerMemory(
+                    charger_id,
+                    switched_at=previous.switched_at,
+                    stopped_for_capacity=previous.stopped_for_capacity
+                    and not previous.running,
+                )
+            )
+            continue
         fields: dict[str, object] = {
             "session_start": item.start,
             "car_connected": True,
@@ -712,10 +807,12 @@ def _new_memory(
                 full_use_since=item.reg.full_use_since,
                 under_use_stop_at=item.reg.under_use_stop_at,
             )
+        else:
+            fields.update(under_use_since=None, full_use_since=None)
         if item.acts:
             running = item.allocation > _EPS
             fields["running"] = running
-            if running != (_present(item) > _EPS):
+            if running != (_commanded(item, ctx) > _EPS):
                 fields["switched_at"] = ctx.now
                 fields["stopped_for_capacity"] = (
                     not running
@@ -743,18 +840,23 @@ def _new_memory(
 def _next_check(
     items: list[_Item], ctx: _Context, memory: Memory, prices: PriceSeries
 ) -> datetime | None:
-    """Find the earliest moment a new call could change the decision."""
+    """Find the earliest moment a new call could change the decision.
+
+    Everything is added in UTC. When anything is pending the answer is never later
+    than the moment the new memory goes out of date, so a caller that wakes only at
+    this time still finds its memory usable.
+    """
     settings = ctx.settings
     now = ctx.now.astimezone(UTC)
-    found: list[datetime] = []
+    found: list[datetime | None] = []
     if any(item.plan is not None and item.plan.quarters for item in items):
-        found.append(floor_to_quarter(ctx.now) + QUARTER)
+        found.append(_shifted(floor_to_quarter(ctx.now) + QUARTER))
     guard = ctx.guard
     if guard.green_since is not None:
         if guard.level is GuardLevel.EMERGENCY:
-            found.append(guard.green_since + settings.emergency_calm)
+            found.append(_shifted(guard.green_since, settings.emergency_calm))
         elif not guard.increases_allowed:
-            found.append(guard.green_since + settings.green_hold)
+            found.append(_shifted(guard.green_since, settings.green_hold))
     for item in items:
         mem = item.mem
         if (
@@ -762,26 +864,31 @@ def _next_check(
             and mem.switched_at is not None
             and (item.held_off or item.protected)
         ):
-            found.append(mem.switched_at + settings.min_pause)
+            found.append(_shifted(mem.switched_at, settings.min_pause))
         if item.state.car_connected and item.deadline is not None:
-            found.append(item.deadline)
+            found.append(_shifted(item.deadline))
     for entry in memory.chargers:
         if entry.under_use_since is not None:
-            found.append(entry.under_use_since + settings.under_use_period)
+            found.append(_shifted(entry.under_use_since, settings.under_use_period))
         if (
             entry.full_use_since is not None
             and entry.regulated_cap is not None
             and entry.regulated_cap > 0
         ):
-            found.append(entry.full_use_since + settings.ramp_period)
+            found.append(_shifted(entry.full_use_since, settings.ramp_period))
         if entry.under_use_stop_at is not None:
-            found.append(entry.under_use_stop_at + settings.resume_probe)
+            found.append(_shifted(entry.under_use_stop_at, settings.resume_probe))
         if entry.last_action_at is not None:
-            found.append(entry.last_action_at + settings.min_action_interval)
+            found.append(_shifted(entry.last_action_at, settings.min_action_interval))
     if ctx.prices_ok:
-        found.append(prices.updated_at + settings.max_price_age)
-    later = [moment.astimezone(UTC) for moment in found if moment.astimezone(UTC) > now]
-    return min(later).astimezone(ctx.zone) if later else None
+        found.append(_shifted(prices.updated_at, settings.max_price_age))
+    later = [moment for moment in found if moment is not None and moment > now]
+    if not later:
+        return None
+    expiry = _shifted(ctx.now, settings.max_memory_age)
+    if expiry is not None:
+        later.append(expiry)
+    return min(later).astimezone(ctx.zone)
 
 
 def decide(snapshot: Snapshot) -> Decision:
@@ -804,7 +911,12 @@ def decide(snapshot: Snapshot) -> Decision:
     states = {state.charger_id: state for state in snapshot.states}
     sessions = {session.charger_id: session for session in snapshot.sessions}
     memory, reset_reason = _usable_memory(snapshot)
-    entries = {entry.charger_id: entry for entry in memory.chargers} if memory else {}
+    known = {charger.id for charger in snapshot.chargers}
+    entries = (
+        {e.charger_id: e for e in memory.chargers if e.charger_id in known}
+        if memory
+        else {}
+    )
     controllable = frozenset(
         phase
         for charger in snapshot.chargers
@@ -926,6 +1038,7 @@ def decide(snapshot: Snapshot) -> Decision:
             # allocations or another session's plan. Calling it "planned for later"
             # would be false, since nothing is planned.
             item.starved = item.can_run and not item.plan.quarters
+        _keep_places(to_plan, now, ctx, quarter_prices(snapshot.prices), plan_cap)
 
     smart = [i for i in items if i.group is _Group.SMART]
     tier = next(

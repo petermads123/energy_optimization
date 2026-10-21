@@ -176,9 +176,13 @@ def present_draw(charger: Charger, state: ChargerState, voltage: float) -> float
 
 
 def _settling_draw(charger: Charger, state: ChargerState, voltage: float) -> float:
-    """Return the draw of a charger still ramping down after a decrease."""
+    """Return the draw of a charger still ramping down after a decrease.
+
+    Without a car there is nothing ramping down, so a leftover power reading counts
+    for nothing, as in `present_draw`.
+    """
     controllable = charger.kind is not ChargerKind.FIXED and state.available
-    if controllable and state.measured_power_w is not None:
+    if controllable and state.car_connected and state.measured_power_w is not None:
         return _measured_per_phase(state, len(charger.phases), voltage)
     return present_draw(charger, state, voltage)
 
@@ -198,7 +202,7 @@ def phase_capacity(
 
     Returns:
         `min(budget, threshold - (measured - sum of present draws))` per phase when
-        `fresh`, else the budget. A phase whose measurement is missing gets the
+        `fresh`, else the budget; a settling charger counts at its measured draw. A phase whose measurement is missing gets the
         budget. May be negative.
     """
     settings: Settings = snapshot.settings

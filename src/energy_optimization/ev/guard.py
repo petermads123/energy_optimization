@@ -52,7 +52,7 @@ class GuardState:
             latched.
         green_since: Since when every call has seen green, None otherwise.
         emergency_at: When the emergency level was last entered, None when none is
-            latched.
+            latched; carried over unchanged when the measurements are stale.
         increases_allowed: Whether the guard permits any increase now.
         intervened: Whether the level is red or emergency.
     """
@@ -91,6 +91,8 @@ def advance_guard(
     """
     latched = memory is not None and memory.level is GuardLevel.EMERGENCY
     previous_green = memory.green_since if memory is not None else None
+    if memory is not None and memory.level in (GuardLevel.YELLOW, GuardLevel.RED):
+        previous_green = None  # a call that was not green ended any green run
     previous_emergency = memory.emergency_at if memory is not None else None
     if instant is None:
         if latched:

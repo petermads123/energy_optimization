@@ -70,10 +70,18 @@ def regulate(
     """
     if charger.kind is not ChargerKind.ADJUSTABLE:
         return Regulation(None, None, None, None, False)
+    low = charger.min_current or 0
+    high = charger.max_current or 0
     cap = previous.regulated_cap if previous and not reset else None
     under_since = previous.under_use_since if previous and not reset else None
     full_since = previous.full_use_since if previous and not reset else None
     stop_at = previous.under_use_stop_at if previous and not reset else None
+    if cap is not None and 0 < cap < low:
+        cap = 0  # a cap the charger cannot run at is a stop, whoever wrote it
+    if cap == 0 and stop_at is None:
+        stop_at = now  # a stop with no start time is probed from the first sight
+    if cap != 0:
+        stop_at = None
     if (
         stop_at is not None
         and _elapsed_seconds(now, stop_at) >= settings.resume_probe.total_seconds()
@@ -101,7 +109,12 @@ def regulate(
             reduced = math.floor(setting / 2)
         else:
             reduced = math.ceil(measured + settings.under_use_margin)
-        if reduced < (charger.min_current or 0):
+        # A cut only ever lowers: never above the setting, the existing cap or the
+        # charger's maximum, which a deadband smaller than the margin could allow.
+        ceiling = min(high, high if cap is None else cap, math.ceil(setting))
+        if reduced >= ceiling:
+            return Regulation(cap, None, None, stop_at, False)
+        if reduced < low:
             return Regulation(0, None, None, now, True)
         return Regulation(reduced, None, None, stop_at, True)
     if measured >= setting - settings.under_use_margin / 2:
@@ -112,9 +125,12 @@ def regulate(
             and _elapsed_seconds(now, full_since)
             >= settings.ramp_period.total_seconds()
         ):
-            cap = min(cap, math.floor(setting)) + settings.ramp_step
+            # Climb one step from the lower of the cap and the setting, but never
+            # below the cap: a setting held down by the guard or by pacing neither
+            # lets the cap climb nor drags it down below the minimum.
+            cap = max(cap, min(cap, math.floor(setting)) + settings.ramp_step)
             full_since = now
-            if cap >= (charger.max_current or 0):
+            if cap >= high:
                 cap = None
         return Regulation(cap, None, full_since, stop_at, False)
     return Regulation(cap, None, None, stop_at, False)
