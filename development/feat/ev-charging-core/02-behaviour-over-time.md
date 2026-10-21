@@ -1,6 +1,6 @@
 # EV charging core: behaviour over time
 
-<!-- claude-plan step=5 status=active -->
+<!-- claude-plan step=6 status=active -->
 
 | Field | Value |
 |---|---|
@@ -17,7 +17,7 @@
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | done |
-| 5 | Test | `/test` | in `/build` | pending |
+| 5 | Test | `/test` | in `/build` | done |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
@@ -570,6 +570,44 @@ implementer, and small additions, each recorded here:
   `ReasonCode`, `Status` and `EventKind` member sets gained the new names. No expected value
   changed; the full suite is green (1142 passed; the plan's 1141 was round 1's count).
 
+### Changed at step 5 (bugs the tests found; no public signature changed)
+
+Four test-designer reports (two briefs on guard/regulation/model/allocation/codec, two on
+`decide`) converged on the items below; each was fixed in the code and pinned by a test.
+Where the fix differs from the implementation guide, the guide's text is superseded:
+
+- **Ramp (guide 5).** `min(cap, floor(setting)) + step` could lower a cap or leave one
+  between 0 and the minimum with no probe; it is now `max(cap, min(cap, floor(setting)) +
+  step)`. A cut only ever lowers: it is skipped when the new value is not below
+  `min(max_current, existing cap, ceil(setting))`. A cap in `(0, min_current)` is read as a
+  stop, and a cap of 0 with no `under_use_stop_at` is stopped from now (probe after the
+  resume probe time).
+- **Commanded value (guide 6.8, 6.9, 6.11).** A command sent within
+  `min_action_interval` counts as where the charger is (`_commanded`): lowering, pacing,
+  action choice and the `running`/`switched_at` update compare against it, so an emergency,
+  a smaller share or a pacing hold also countermands an increase or resume still in
+  flight, and a pacing hold no longer marks an in-flight resume as not running.
+- **Unplug (guide 6.2 over 6.11).** A no-car entry keeps `switched_at` and
+  `stopped_for_capacity` (the latter only if it was not running), so a re-plug does not skip
+  the minimum pause.
+- **Smart-off / unregulated (guide 6.4 with 6.11).** Entries of chargers that were not
+  regulated this call clear `under_use_since` and `full_use_since`.
+- **Tier-2 hysteresis (new `_keep_places`, after planning).** A selected, displaced
+  (priority 4) charger is put back in the plan for this quarter when a planned contender
+  sharing a phase is not earlier than its deadline minus the hysteresis and planning it alone
+  would have given it this quarter.
+- **Next check (guide 6.12).** Never later than the new memory's expiry when anything is
+  pending (None stays None); all additions in UTC (`_shifted`); the `until` parameter too.
+- **Never an error.** A memory time no UTC date can hold (known entries and the top
+  level) is an `"invalid"` restart; unknown entries are ignored before any arithmetic;
+  durations and hysteresis so large they overflow a date are skipped (`_shifted`,
+  `_earlier`); `_expected_finish` returns None for a trickle of current; a
+  `regulated_cap` too large for a float is rejected by `ChargerMemory`.
+- **Invalid-memory marker** is recognised by equality, so it survives a snapshot round trip.
+- **Session key** normalises `plugged_in_at` to UTC.
+- **Settling** counts a charger's measured draw only when it has a car (`allocation`).
+- **Guard** ignores a `green_since` carried by a yellow or red memory.
+
 ---
 
 ## 4. Verification log
@@ -659,10 +697,73 @@ codec:      snapshot and memory round trips equal: True; malformed memory decode
 
 > Written in step 5: the dynamic half.
 
-| Intent | Test names | Result |
+Final run: `ruff check .`, `ruff format --check .` and `mypy` clean; `pytest`: **1637
+passed** (1142 before the round-2 tests). Every module still runs under `python -m`.
+No round-1 test was weakened (the only edits to existing test lines are three stronger
+showcase assertions and one import).
+
+| Intent | Test names (files) | Result |
 |---|---|---|
+| T1 | `test_settings_*`, `test_charger_memory_*`, `test_memory_*`, `test_snapshot_memory_*`, `test_guard_level_and_reduction_have_exact_lower_case_values` (`test_ev_model.py`) | pass |
+| T2 | `test_memory_round_trips_through_json`, `test_memory_from_dict_*` (non-dict, 29 malformed shapes, deep nesting), `test_snapshot_from_dict_*memory*`, `test_the_invalid_memory_marker_survives_a_snapshot_round_trip`, `test_decision_round_trips_*`, `test_decision_from_dict_reads_the_round_two_fields_strictly`, `test_settings_dict_*` (`test_ev_codec.py`) | pass |
+| T3 | `test_a_call_without_memory_increases_nothing_but_still_decreases`, `test_the_next_call_with_that_memory_starts_the_charger`, `test_memory_usability_boundaries` (10 rows), `test_memory_written_with_another_offset_*`, `test_a_time_no_utc_date_can_hold_*` (8), `test_an_extreme_time_on_an_unknown_charger_is_ignored`, `test_a_held_charger_is_floored_*`, `test_a_huge_*_never_overflows` (`test_ev_decide.py`) | pass |
+| T4 | `test_the_minimum_pause_*`, `test_a_capacity_stop_can_restart_*`, `test_charge_now_skips_the_minimum_pause`, `test_charge_now_skips_the_pause_but_not_the_pacing`, `test_an_observed_unplug_and_replug_*`, `test_a_held_off_charger_still_occupies_its_tier` | pass |
+| T5 | `test_a_selected_charger_keeps_its_place_*`, `test_a_contender_more_than_the_hysteresis_earlier_*` (tier ranking and planned tier), `test_a_just_started_charger_is_not_dropped_*`, `test_an_in_flight_resume_still_counts_as_running_*`, `test_the_hysteresis_holds_in_the_planned_tier_too`, `test_a_huge_hysteresis_*` | pass |
+| T6 | `test_ev_regulation.py` (55 tests: scenarios, boundaries, both methods, steady draw over calls, held setting, cut never raises, bad memory, reset, kinds, UTC) | pass |
+| T7 | `test_an_under_use_cut_frees_current_*`, `test_a_cut_below_the_minimum_stops_*`, `test_a_cut_charger_alone_*`, `test_a_steady_draw_after_a_cut_*`, `test_whole_ramp_periods_*`, `test_chargers_that_cannot_be_regulated_are_never_cut` (3), `test_a_smart_charging_off_period_forgets_*` | pass |
+| T8 | `test_a_cut_charger_is_offered_current_again_after_the_probe_time`, `test_a_session_change_clears_an_under_use_stop_early` (4), `test_a_replug_clears_*`, `test_the_same_plug_in_time_written_with_another_offset_*` | pass |
+| T9 | `test_ev_guard.py` (45 tests) | pass |
+| T10 | `test_red_cuts_to_fit_*`, `test_yellow_allows_no_increase_*`, `test_just_below_yellow_*`, `test_increases_wait_for_the_green_hold_*`, `test_stale_measurements_*`, `test_a_stale_call_in_the_middle_*`, `test_an_emergency_*` (pauses all, calm, yellow restart, stale, countermands a resume), `test_without_an_emergency_threshold_*`, `test_a_lost_memory_forgets_the_emergency_latch_*` | pass |
+| T11 | `test_an_increase_inside_the_action_interval_*`, `test_a_command_still_in_flight_is_not_sent_again`, `test_a_decrease_in_flight_is_not_raised_*`, `test_an_increase_in_flight_is_cut_back_*`, `test_a_second_decrease_is_not_compounded_*`, `test_a_decrease_that_never_landed_*`, `test_once_the_window_closes_*`, `test_phase_capacity_settling_*` (14, `test_ev_allocation.py`) | pass |
+| T12 | `test_next_check_*` (14: none, hold, price, clamp, quarter, deadline, under-use, action window, probe, ramp, earliest, expiry round trip, fall-back night, UTC addition) | pass |
+| T13 | `test_the_deadline_is_seen_from_the_session_start_*`, `test_without_memory_the_deadline_*`, `test_a_replug_restarts_the_deadline`, `test_a_given_plugged_in_time_*` | pass |
+| T14 | the 1142 round-1 tests, unchanged expectations, under the warm helper | pass |
+| T15 | `test_the_promises_hold_across_sequences_of_calls_feeding_memory_forward` (150 sequences, arbitrary installations), `test_the_promises_hold_across_plain_sequences_where_every_timer_can_fire` (120 sequences), `test_ten_chargers_and_a_48_hour_series_decide_in_under_100_ms_with_a_full_memory`. The oracle recomputes freshness, the amended phase-guard bound, the command in flight, action existence/stage/order, increases blocked (restart, yellow/red/emergency, green hold, pacing), minimum pause, emergency, legal currents, memory round trip and next check without the module's helpers. Run offline at 4 000 + 2 000 sequences: no failure. | pass |
+
+Mutation check: 17 single-line reversions of the fixes below (and of guide behaviour) were
+each run against the suite; every one is caught by a named test.
+
+### Reader reports: every case and contradiction, and its disposition
+
+*Applied* = fixed in the code and pinned by a test. *Pinned* = behaviour kept as built,
+asserted by a test. *Rebutted* = the expectation was wrong.
+
+| # | Finding (reader) | Disposition |
+|---|---|---|
+| 1 | `OverflowError` from extreme memory timestamps in `_usable_memory` (A in, A con, B con) | **Applied**: `"invalid"` restart; unknown entries ignored before arithmetic |
+| 2 | `OverflowError` from huge durations in `_next_check` / `until` / `hysteresis` (A in) | **Applied** (`_shifted`, `_earlier`); incl. round-1 `max_price_age` |
+| 3 | Ramp lowers the cap / leaves 0 < cap < min with no probe (all four) | **Applied** (`max(cap, …)`, such a cap read as a stop) |
+| 4 | Cut raises the cap above setting/max (A in, A con) | **Applied** (cut only if below `min(max, cap, ceil(setting))`) |
+| 5 | `regulated_cap=0` without `under_use_stop_at` never probed (A in, A con) | **Applied** (stopped from now) |
+| 6 | Unplug wipes anti-flapping fields; 6.2 vs 6.11 (B in, B con) | **Applied** in favour of 6.2 and A2: no-car entry keeps `switched_at`, `stopped_for_capacity`. Not a halt: A2 is worded per charger and says re-plug is no reason |
+| 7 | `next_check` later than memory expiry (B in, B con) | **Applied** (clamp when anything is pending; `None` stays `None`, T12) |
+| 8 | Pacing hold marks an in-flight resume as not running (B in) | **Applied** (`running`/`switched_at` judged against the commanded value) |
+| 9 | Smart-off periods carry stale under-use timers (B in) | **Applied** |
+| 10 | `session_key` sensitive to the UTC offset (A in, B in, B con) | **Applied** |
+| 11 | Settling counts power with no car (A in) | **Applied** |
+| 12 | `next_check` / `until` wall-clock arithmetic (A in) | **Applied** (UTC) |
+| 13 | Invalid-memory marker lost in a round trip (A in, A con, B con) | **Applied** (equality) |
+| (i) | In-flight increase/resume never countermanded (B con 1-2, I14; B con 6 "down" that is an increase) | **Applied, no halt**: an open `last_target` is the present value when lowering and pacing (`_commanded`). Emergency now pauses an in-flight resume, a smaller share cuts an in-flight increase back (a SET_CURRENT DOWN even on a paused-looking charger), and nothing is raised inside the window. This changes no criterion: A5 "pauses every controllable charger" and A6 "no increase within the interval, decreases always go" are met more fully, and A8's budget invariants now also hold for the command in flight (I14 asserted by T15) |
+| (ii) | Hysteresis only within the active tier; planner can displace a selected charger in tier 2 (B in 2) | **Applied, no halt**: A2 as written has no tier qualifier ("a selected charger keeps its place unless a contender's ready time is more than the hysteresis earlier"), so it covers tier 2; `_keep_places` implements it |
+| 14 | `advance_guard` trusts `green_since` of a yellow/red memory (A con 5, B in 9) | **Applied** for yellow/red (level `None` stays trusted: hand-built and warm memories) |
+| 15 | Lost memory drops the emergency latch (B con 7) | **Pinned**: the calm lives in the memory; the restart is conservative and A1 says treat as a restart. Test documents it. Noted for step 8 as a `DEVELOPMENT.md` idea, not a defect against section 1 |
+| 16 | Charger preempted by charge-now gets no minimum pause (B in 11) | **Pinned** (guide Risk 3c decided it) |
+| 17 | Held-off charger still occupies its tier (B con 10) | **Pinned** by `test_a_held_off_charger_still_occupies_its_tier` |
+| 18 | A6 not compounded only with a power reading (B in 10) | **Pinned** (plan: "when known") |
+| 19 | `yellow_margin` has no upper bound (A in 6) | **Pinned**: a configuration footgun, not decided by section 1; test documents it |
+| 20 | `switched_at` drifts while a command is in flight (B in 5) | **Applied** with #8 |
+| 21 | `-20 A` reading, "negative export" (A in) | **Rebutted**: `PhaseCurrents` rejects negative readings (round 1) |
+| 22 | `regulated_cap` of 10**400 accepted by `ChargerMemory` (found while testing) | **Applied** (finite-float check) |
+| 23 | `_expected_finish` overflow for a trickle of reserved current (found by T15) | **Applied** (returns None); latent in round 1 |
+| 24 | Docstring drift (`GuardState.emergency_at`, `phase_capacity`, `memory_from_dict`) | **Applied** |
 
 Edge cases considered and deliberately skipped, with reasons:
+
+- Text/non-ASCII ids in memory: ids are only compared exactly (one `charger("A")` case).
+- Purity of `advance_guard` / `regulate`: frozen types, covered by one idempotency test each.
+- A `now` within an offset of `datetime.min`/`max` in the snapshot itself: round 1's domain.
+- Soft start and one-step red reduction: out of scope in section 1.
+- A wall-clock `now` that jumps backwards (negative age): becomes a `"future"` memory; covered by the one-microsecond-in-the-future row.
 
 ---
 

@@ -189,7 +189,10 @@ Regulation of one adjustable charger to what its car actually draws: after a who
 under-use period the charger is cut to its measured draw plus a margin (or halved), a cut
 below the minimum becomes 0, each whole ramp period of full use then raises the cap one
 step, and a charger cut to 0 is offered current again after the resume probe or when the
-session is reset. On/off chargers and chargers without a power reading are never
+session is reset. A cut only ever lowers (never above the setting, the existing cap or the
+maximum) and the ramp never lowers a cap or leaves one between 0 and the minimum; a cap
+the charger cannot run at, or a 0 with no stop time, is taken as a stop and probed from
+the first sight. On/off chargers and chargers without a power reading are never
 regulated.
 
 | Signature | Description |
@@ -209,15 +212,19 @@ Phase capacity, draw and reservations, measurement freshness and max-min-fair sh
 | `measurements_fresh(currents: PhaseCurrents \| None, now: datetime, max_age: timedelta, phases: frozenset[Phase]) -> bool` | Measurement present, recent and complete for `phases`. |
 | `present_draw(charger: Charger, state: ChargerState, voltage: float) -> float` | What a charger is taken to draw now on each phase, for the phase guard: 0 when paused or without a car, the smaller of setting and measured draw otherwise; a fixed or unavailable charger counts at its measured draw (its reservation when power is missing), the rest of its reservation being held back by `decide`. |
 | `reserved_current(charger: Charger, state: ChargerState, voltage: float) -> float` | What a fixed or unavailable charger is reserved at on each phase. |
-| `phase_capacity(snapshot: Snapshot, fresh: bool, settling: frozenset[str] = frozenset()) -> dict[Phase, float]` | Per phase, budget intersected with the phase guard when `fresh`; may be negative. A charger in `settling` (sent a decrease a moment ago) counts at its measured draw instead of the smaller of setting and measured. |
+| `phase_capacity(snapshot: Snapshot, fresh: bool, settling: frozenset[str] = frozenset()) -> dict[Phase, float]` | Per phase, budget intersected with the phase guard when `fresh`; may be negative. A charger in `settling` (sent a decrease a moment ago) counts at its measured draw instead of the smaller of setting and measured, provided it has a car and a power reading. |
 | `main() -> None` | Showcase: sharing on mixed phases and on a tight phase. |
 
 ### `src/energy_optimization/ev/decide.py`
 
 The decision core: memory usability, classification, regulation, priority tiers with
-anti-flapping (minimum pause, hysteresis), planning, sharing, the lowering steps
-(emergency, no increases, pacing), actions with in-flight suppression, reasons, status,
-events, the new memory and the next check.
+anti-flapping (minimum pause, hysteresis, kept in the planned tier too), planning,
+sharing, the lowering steps (emergency, no increases, pacing), actions with in-flight
+suppression, reasons, status, events, the new memory and the next check. A command sent
+within the action interval counts as where the charger is (it may not have landed), so
+an emergency, a smaller share or a pacing hold is judged against it; an unplug keeps
+what the minimum pause needs; the next check is never later than the new memory's
+expiry; all arithmetic is in UTC and a time no UTC date can hold is an invalid memory.
 
 | Signature | Description |
 |---|---|
@@ -258,7 +265,10 @@ asserting the `ConfigError.field` — a missing budget, threshold or fallback pa
 duplicate phases given as a list, an unloadable timezone, naive timestamps, overlapping or
 misaligned price intervals (judged in UTC, including across the fall-back fold), snapshot
 cross-links — plus the accepted boundaries, normalisation to tuples, ints and floats, and
-the `main` showcase.
+the `main` showcase. Round 2 (T1) adds the new `Settings` fields (every span, margin,
+step and the emergency threshold against the phase threshold), `ChargerMemory` (every
+time field, flags, cap and last target, session key), `Memory` (ids, level, times,
+lookup) and `Snapshot.memory`.
 
 ### `tests/test_ev_result.py`
 
@@ -290,7 +300,9 @@ max-min fairness on mixed phases, all-or-nothing claims, tolerance, empty and ne
 capacity, purity), `measurements_fresh` boundaries, `reserved_current`, `present_draw`
 (smaller of setting and measured, paused, no car, fixed at its measured draw) and
 `phase_capacity` (negative values, missing phases, fixed reservations); and the `main`
-showcase.
+showcase. Round 2 (T11) adds `phase_capacity` with `settling`: the measured draw of a
+charger still ramping down, a paused car still drawing, no car or no reading, three
+phases, and the cases where it is ignored (stale, unknown id, fixed, unavailable).
 
 ### `tests/test_ev_decide.py`
 
@@ -304,12 +316,56 @@ showcase. Its `snap` helper hands every snapshot a warm memory (saved a minute a
 for an hour, no charger history) so the round-1 scenarios run in steady state instead of
 the conservative start.
 
+Round 2 adds multi-call scenarios that feed each decision's memory into the next
+snapshot (T3-T13): the conservative start and every memory-usability boundary, times no
+UTC date can hold, huge duration settings; minimum pause (including across an unplug and
+charge now), selection hysteresis and minimum on-time in both the tier ranking and the
+planned tier, an in-flight resume; regulation through `decide` (a cut freeing current,
+a stop, the probe, a session change or re-plug clearing it, ramp back, never-regulated
+chargers, smart charging off); the guard levels (yellow, red, green hold, stale data,
+emergency and its calm period, emergency countermanding an in-flight resume); pacing,
+in-flight suppression and settling; `next_check` for every source, the earliest winning,
+the memory expiry clamp and UTC arithmetic across the fold; the session start taken from
+memory. Two `hypothesis` properties (T15) run sequences of calls feeding memory forward and
+check, independently of the module, the budget and amended phase-guard bounds, legal
+currents, no increase in yellow, red or a restart, the green hold, pacing, the
+minimum pause, emergency, action existence and order against the command in flight, and
+the memory round trip; one over arbitrary installations, one over plain installations where
+every timer can fire. The 100 ms check also runs with a fully populated memory.
+
 ### `tests/test_ev_codec.py`
 
 Covers `src/energy_optimization/ev/codec.py` (T2, T19): JSON round trips of snapshots and decisions (negative
 prices, odd offsets, `None` measurements, every enum, parameter types kept), plain-type
 output, and rejection of missing, unknown, wrongly typed, huge, null-on-defaulted and
-invalid fields with the exact dotted path; and the `main` showcase.
+invalid fields with the exact dotted path; and the `main` showcase. Round 2 (T2) adds
+`memory_to_dict` / `memory_from_dict` (every field, every level, offsets and the fall-back
+fold compared as instants, plain types, none-for-anything-malformed including deep
+nesting), the `memory` key in snapshot dicts (absent, null, malformed becoming the invalid
+marker that survives a round trip, a bad charger field still reported), the new decision
+keys read strictly with dotted paths, and the new settings fields.
+
+### `tests/test_ev_guard.py`
+
+Covers `src/energy_optimization/ev/guard.py` (round 2 T9): `instant_level` at every
+boundary (just under, at and just over the yellow, red and emergency limits, no emergency
+threshold, zero margin, missing and unlisted phases, no phases) and `advance_guard` over
+call sequences — the green hold at its boundary, yellow and red blocking increases, green
+having to be continuous, a green run ended by a non-green memory, the emergency latch and
+calm release at their boundary (zero calm, hold longer than calm, a non-green call
+restarting it), stale data with and without a latch, and times compared in UTC across the
+fold and in other offsets; and the `main` showcase.
+
+### `tests/test_ev_regulation.py`
+
+Covers `src/energy_optimization/ev/regulation.py` (round 2 T6, T8): the concept's own
+scenarios (a cut to draw plus margin, a cut below the minimum, the deadband, a ramp step,
+the probe), the boundaries of the under-use, ramp and probe periods and of the three
+zones, both reduction methods, a steady draw after a cut neither ramped nor cut again over
+several calls, a held setting neither raising nor lowering the cap, a cut that never
+raises (deadband below the margin, an existing cap), a cap between 0 and the minimum or a
+0 with no stop time treated as a stop, reset, on/off and fixed chargers, missing power,
+paused and no-car calls, and times compared in UTC; and the `main` showcase.
 
 ### `tests/test_guard_git.py`
 

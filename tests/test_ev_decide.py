@@ -2699,7 +2699,7 @@ def test_an_extreme_time_on_an_unknown_charger_is_ignored() -> None:
     ],
 )
 def test_a_huge_duration_setting_never_overflows(name: str) -> None:
-    huge = timedelta(days=10**6)
+    huge = timedelta(days=999_999_999)
     chargers = [adj("a", L1), adj("b", L2), adj("c", L3)]
     states = [running("a", 16.0, 7.0), running("b", 10.0, 9.5), idle("c")]
     sessions = [
@@ -2736,14 +2736,42 @@ def test_a_huge_duration_setting_never_overflows(name: str) -> None:
 
     if result.next_check is not None:
         assert result.next_check > second.now
-        assert result.next_check <= second.now + second.settings.max_memory_age
+        limit = second.settings.max_memory_age
+        assert limit >= timedelta(days=3_000_000) or (
+            result.next_check <= second.now + limit
+        )
+
+
+def test_a_huge_hysteresis_never_overflows_and_keeps_the_selected_charger() -> None:
+    chargers = [adj("a"), adj("b")]
+    first = snap(
+        chargers,
+        [running("a", 10.0), idle("b", car=False)],
+        [sess("a", ready=time(8, 45), need=0.0)],
+        budget=10.0,
+    )
+    d1 = decide(first)
+
+    _, d2 = run(
+        first,
+        5 * MIN,
+        d1,
+        states=(running("a", 10.0), idle("b")),
+        sessions=(
+            sess("a", ready=time(8, 45), need=0.0),
+            sess("b", ready=time(0, 30), need=0.0),
+        ),
+        settings=replace(first.settings, hysteresis=timedelta(days=999_999_999)),
+    )
+
+    assert allocations(d2) == {"a": 10.0, "b": 0.0}
 
 
 def test_a_huge_emergency_calm_never_overflows() -> None:
     first = with_settings(
         snap([adj("a")], [idle("a")], [now_session("a")]),
         emergency_threshold=40.0,
-        emergency_calm=timedelta(days=10**6),
+        emergency_calm=timedelta(days=999_999_999),
     )
     d1 = decide(replace(first, phase_currents=readings(NOW, 41.0)))
 
@@ -3577,6 +3605,25 @@ def test_stale_measurements_do_not_release_an_emergency() -> None:
     assert d2.status is Status.EMERGENCY
     assert d2.actions == ()
     assert all(allocations(d2)[cid] == 0.0 for cid in "asp")
+
+
+def test_a_lost_memory_forgets_the_emergency_latch_but_starts_conservatively() -> None:
+    first = emergency_installation()
+    d1 = decide(first)
+    green = readings(NOW + MIN, 10.0, 10.0, 10.0)
+
+    lost = replace(
+        at(first, MIN, d1, states=all_stopped(), currents=green), memory=None
+    )
+    d2 = decide(lost)
+    _, d3 = run(lost, 2 * MIN, d2, states=all_stopped())
+
+    # Documented limit: the calm period lives in the memory, so without it the guard
+    # starts green; the restart itself still increases nothing for that call.
+    assert d2.guard_level is GuardLevel.GREEN
+    assert reason_of(d2) == "missing"
+    assert d2.actions == ()
+    assert {a.charger_id for a in d3.actions} >= {"a", "s"}
 
 
 def test_without_an_emergency_threshold_red_is_the_strongest_reaction() -> None:
