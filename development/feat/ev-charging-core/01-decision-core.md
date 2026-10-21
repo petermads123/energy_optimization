@@ -1,6 +1,6 @@
 # EV charging decision core
 
-<!-- claude-plan step=2 status=active -->
+<!-- claude-plan step=3 status=active -->
 
 | Field | Value |
 |---|---|
@@ -14,7 +14,7 @@
 | # | Step | Skill | Runs | Status |
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
-| 2 | Plan | `/plan` | with the user | pending |
+| 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | pending |
 | 4 | Verify | `/verify` | in `/build` | pending |
 | 5 | Test | `/test` | in `/build` | pending |
@@ -241,14 +241,13 @@ the reduction, nothing else.
 | `src/energy_optimization/ev/codec.py` | new | Snapshot and Decision to and from plain JSON-compatible dicts (A1, A9) |
 | `tests/test_ev_model.py` … `tests/test_ev_codec.py` | new | One test file per module; property-based invariants and the performance check live in `tests/test_ev_decide.py` |
 | `pyproject.toml` | changed | Dev dependencies `hypothesis>=6.170,<7` and `tzdata>=2026.5` |
-| `STRUCTURE.md` | changed | Tree and one line per `ev/` file (full paths, so the stop gate sees them); hello_world entries removed |
-| `.claude/rules/structure-ev.md` | new | Per-module signature tables for `ev/`, `paths: ["src/energy_optimization/ev/**", "tests/test_ev_*.py"]` — the STRUCTURE.md growth rule for a subpackage |
+| `STRUCTURE.md` | changed | Tree gains `ev/`; a section per `ev/` module and test file by full path (so the stop gate sees them) with its signature table; hello_world entries removed. The tables stay here this round rather than in `.claude/rules/`: section 1 touches nothing under `.claude/`, and the `structure-auditor` reads only STRUCTURE.md |
 
 ### Public API
 
 Every type below is a `@dataclass(frozen=True)` unless it is an enum (`enum.StrEnum`) or
 an exception. Tuple-typed fields also accept any sequence and are converted to a tuple in
-`__post_init__` (via `object.__setattr__`), so equality and repr are stable.
+`__post_init__` (via `object.__setattr__`), so equality and repr are stable. **Wherever output depends on a set of phases — text, params, lists, dict order — iterate phases in `Phase` order (L1, L2, L3), never in `frozenset` order**, which is hash-randomised between processes.
 
 **`ev/model.py`**
 
@@ -264,9 +263,9 @@ an exception. Tuple-typed fields also accept any sequence and are converted to a
 | `PriceSeries(intervals: tuple[PriceInterval, ...], updated_at: datetime)` | The price series. `updated_at` aware; intervals may come in any order but must not overlap. | A1, A4, A5 |
 | `PhaseCurrents(measured_at: datetime, l1: float \| None, l2: float \| None, l3: float \| None)` | Measured current per phase for the whole connection. Aware; each value `None` (missing) or `≥ 0`. Method `get(self, phase: Phase) -> float \| None`. | A1, A3, A5 |
 | `Settings(phase_budget: float, phase_threshold: float, fallback_current: int, timezone: str, voltage: float = 230.0, min_block_quarters: int = 2, price_cap: float \| None = None, default_energy_need_kwh: float = 30.0, max_price_age: timedelta = timedelta(minutes=60), max_measurement_age: timedelta = timedelta(seconds=60))` | Installation settings. Budget, threshold, voltage `> 0`; fallback `≥ 0`; `timezone` must load with `zoneinfo.ZoneInfo`; `min_block_quarters ≥ 1`; default need `≥ 0`; both ages `> 0`; `price_cap` finite when set. | A1, A3, A4, A5 |
-| `Snapshot(now: datetime, settings: Settings, chargers: tuple[Charger, ...], states: tuple[ChargerState, ...], sessions: tuple[Session, ...], prices: PriceSeries, phase_currents: PhaseCurrents \| None = None)` | One call's input. `now` aware; charger ids unique; exactly one state per charger and none for an unknown id; at most one session per charger, none for an unknown id, none on a fixed charger. `phase_currents=None` = missing. | A1 |
+| `Snapshot(now: datetime, settings: Settings, chargers: tuple[Charger, ...], states: tuple[ChargerState, ...], sessions: tuple[Session, ...], prices: PriceSeries, phase_currents: PhaseCurrents \| None = None)` | One call's input. `now` aware; charger ids unique; exactly one state per charger and none for an unknown id; at most one session per charger, none for an unknown id. A session on a fixed charger is accepted and ignored for control. `phase_currents=None` = missing. | A1 |
 
-Numeric fields reject `bool` and non-finite floats. `ConfigError.field` is the dataclass
+Numeric fields reject `bool` and non-finite floats; float fields accept ints. A1's "negative or zero limits" means `phase_budget`, `phase_threshold`, `voltage`, `min_current`, `max_current` and `assumed_current` (all `> 0`); `fallback_current` and `user_current_limit` may be 0 on purpose ("never charge under doubt", "user says stop"). `ConfigError.field` is the dataclass
 field name (`"max_current"`), and the message names the offending value and, inside a
 charger, its id: `ConfigError("max_current", "charger 'carport': must be ≥ min_current (6), got 4")`.
 
@@ -277,7 +276,7 @@ charger, its id: `ConfigError("max_current", "charger 'carport': must be ≥ min
 | `class Stage(StrEnum)`: `DOWN = "down"`, `UP = "up"` | Which phase of execution an action belongs to | A6 |
 | `class ActionKind(StrEnum)`: `SET_CURRENT = "set_current"`, `PAUSE = "pause"`, `RESUME = "resume"` | What to do to a charger | A6 |
 | `Action(charger_id: str, kind: ActionKind, target_current: float, stage: Stage)` | One change with an absolute target: `PAUSE` has `target_current=0.0`; `RESUME` carries the current to resume at | A6 |
-| `class ReasonCode(StrEnum)`: `CHARGE_NOW`, `IN_PLAN`, `READY_TIME_PASSED`, `PRICES_STALE`, `PLANNED_LATER`, `WAITING_FOR_HIGHER_PRIORITY`, `WAITING_FOR_CAPACITY`, `TARGET_REACHED`, `BELOW_MINIMUM`, `SMART_CHARGING_OFF`, `FIXED`, `UNAVAILABLE`, `NO_CAR`, `NO_SESSION` — values are the lower-case names | Stable reason codes | A6 |
+| `class ReasonCode(StrEnum)`: `CHARGE_NOW`, `IN_PLAN`, `READY_TIME_PASSED`, `PLAN_COMPLETED`, `PRICES_STALE`, `PLANNED_LATER`, `WAITING_FOR_HIGHER_PRIORITY`, `WAITING_FOR_CAPACITY`, `TARGET_REACHED`, `BELOW_MINIMUM`, `SMART_CHARGING_OFF`, `FIXED`, `UNAVAILABLE`, `NO_CAR`, `NO_SESSION` — values are the lower-case names | Stable reason codes | A6 |
 | `Reason(code: ReasonCode, text: str, params: dict[str, str \| float \| int \| bool] = field(default_factory=dict))` | Why a charger got what it got, as a code, its parameters and an English sentence | A6 |
 | `PlannedQuarter(start: datetime, price: float \| None, current: float)` | One planned quarter: its start (in the settings timezone), its price (`None` = unpriced) and the planned amps | A4, A6 |
 | `ChargerDecision(charger_id: str, allocation: float, priority: int \| None, reason: Reason, plan: tuple[PlannedQuarter, ...] = (), remaining_need_kwh: float \| None = None, deadline: datetime \| None = None, expected_finish: datetime \| None = None, reaches_target: bool \| None = None)` | Everything decided for one charger. For a fixed or unavailable charger `allocation` is the current reserved for it | A6 |
@@ -293,10 +292,10 @@ charger, its id: `ConfigError("max_current", "charger 'carport': must be ≥ min
 |---|---|---|
 | `QUARTER: timedelta = timedelta(minutes=15)` | The planning step | A4 |
 | `floor_to_quarter(moment: datetime) -> datetime` | Start of the quarter containing an aware moment, in UTC; `ValueError` if naive | A4 |
-| `next_occurrence(ready_time: time, after: datetime, timezone: str) -> datetime` | First moment strictly after `after` whose local time in `timezone` is `ready_time`, in UTC. A ready time inside a spring-forward gap resolves to the first valid moment after it; inside a fall-back fold, to the first occurrence. `ValueError` if `after` is naive | A4 |
+| `next_occurrence(ready_time: time, after: datetime, timezone: str) -> datetime` | First moment strictly after `after` whose local time in `timezone` is `ready_time`, in UTC. A ready time inside a spring-forward gap is shifted forward by the gap's length, as `astimezone` gives (02:30 on 2026-03-29 in Copenhagen → 03:30 CEST = 01:30 UTC); inside a fall-back fold it is the first occurrence (02:30 on 2026-10-25 → 02:30 CEST = 00:30 UTC). `ValueError` if `after` is naive | A4 |
 | `quarter_starts(start: datetime, end: datetime) -> list[datetime]` | UTC quarter starts from `floor_to_quarter(start)` while `< end`; empty when `end <= start` | A4 |
 | `quarter_prices(series: PriceSeries) -> dict[datetime, float]` | Every interval split into quarters, keyed by UTC quarter start | A4 |
-| `prices_fresh(series: PriceSeries, now: datetime, max_age: timedelta) -> bool` | `now - series.updated_at <= max_age` | A5 |
+| `prices_fresh(series: PriceSeries, now: datetime, max_age: timedelta) -> bool` | `abs(now - series.updated_at) <= max_age` — a timestamp far in the future is as untrustworthy as one far in the past | A5 |
 
 **`ev/planning.py`**
 
@@ -315,10 +314,10 @@ charger, its id: `ConfigError("max_current", "charger 'carport': must be ≥ min
 |---|---|---|
 | `Claim(charger_id: str, phases: frozenset[Phase], min_current: float, max_current: float)` | One charger asking for current; `min_current == max_current` means all-or-nothing | A2, A3 |
 | `share(claims: Sequence[Claim], capacity: Mapping[Phase, float]) -> dict[str, float]` | Share capacity among claims given in ranking order: 0/min selection in order, then max-min-fair 1 A increments; every claim's id is in the result | A2, A3 |
-| `measurements_fresh(currents: PhaseCurrents \| None, now: datetime, max_age: timedelta, phases: frozenset[Phase]) -> bool` | Not None, `now − measured_at <= max_age`, and every phase in `phases` has a value | A5 |
+| `measurements_fresh(currents: PhaseCurrents \| None, now: datetime, max_age: timedelta, phases: frozenset[Phase]) -> bool` | Not None, `abs(now − measured_at) <= max_age`, and every phase in `phases` has a value | A5 |
 | `present_draw(charger: Charger, state: ChargerState, voltage: float) -> float` | What a charger is taken to draw now on each of its phases, for the phase-guard calculation | A3 |
 | `reserved_current(charger: Charger, state: ChargerState, voltage: float) -> float` | What a fixed or unavailable charger is reserved at on each of its phases | A3 |
-| `phase_capacity(snapshot: Snapshot, fresh: bool) -> dict[Phase, float]` | Per phase, what all chargers together may use: `min(budget, threshold − (measured − Σ present_draw))` when `fresh`, else `budget`. May be negative | A3, A5 |
+| `phase_capacity(snapshot: Snapshot, fresh: bool) -> dict[Phase, float]` | Per phase, what all chargers together may use: `min(budget, threshold − (measured − Σ present_draw))` when `fresh`, else `budget`; a phase whose measurement is `None` gets `budget` (when `fresh`, no controllable charger uses it). May be negative | A3, A5 |
 
 **`ev/decide.py`**
 
@@ -380,36 +379,52 @@ Every module also has `main() -> None`, the showcase the conventions require.
       voltage)`.
    5. If the energy of all usable quarters is below the need, the plan is **every** usable
       quarter, `reachable=False`.
-   6. Otherwise select in passes until the selected energy reaches the need: pass 1 uses
-      usable priced quarters at or below `price_cap` (all priced quarters when there is no
-      cap); pass 2 adds priced quarters above the cap (`price_cap_exceeded=True` if any is
-      chosen); pass 3 adds unpriced quarters (`uses_unpriced=True`). In passes 1 and 2 the
-      unit of choice is a **block**: a run of `L = min_block_quarters` consecutive usable
-      quarters (consecutive = starts `QUARTER` apart) all allowed in that pass, which may
-      overlap quarters already selected. A block's score is the mean price of its *new*
-      quarters; blocks with no new quarter are skipped. Each step picks the block with the
-      lowest score, ties to the earliest start — but when some block's new quarters would
-      reach the remaining need without overshooting by a whole quarter, only such blocks
-      are eligible (this ends a plan with an extension of an existing run rather than a
-      fresh pair). Pass 3 uses the same blocks but scores by latest start first. When a
-      pass has no complete block left (a run shorter than `L`, e.g. a horizon of one
-      quarter), single quarters of that pass are allowed, cheapest first (latest first in
-      pass 3).
+   6. Otherwise select in passes until the selected energy reaches the need. Each usable
+      quarter has a **category**: 1 = priced at or below `price_cap` (every priced quarter
+      when there is no cap), 2 = priced above the cap, 3 = unpriced. Pass *k* may use
+      quarters of categories ≤ *k*.
+      - **Blocks first.** The unit of choice is a block: a run of `L = min_block_quarters`
+        consecutive usable quarters (consecutive = starts `QUARTER` apart) whose categories
+        are all ≤ *k*, which may overlap quarters already selected and may straddle
+        categories. A block is eligible in pass *k* when it adds at least one new quarter
+        and at least one of its new quarters is of category *k*. Its score is the mean price
+        of its new quarters (pass 3: its latest new quarter's start, latest first; unpriced
+        quarters have no price). Each step takes the lowest score, ties to the earliest
+        start (pass 3: ties to the cheapest priced part, then latest). **Finishing rule:**
+        let `R` be the energy still needed; when some eligible block *finishes* the plan —
+        its new energy `≥ R` and its new energy minus the smallest energy among its new
+        quarters `< R` — only finishing blocks are eligible.
+      - **Then single quarters of category *k*,** cheapest first (pass 3: latest first),
+        but only when pass *k* has no eligible block left and the need is still not met.
+      - **Then pass *k + 1*.**
+      **Precedence, stated outright:** contiguity is a preference (doc §7.6 "prefer blocks
+      of a minimum length"); the price cap and known-before-unpriced are rules (doc §7.8,
+      §1 "known quarters only"). So an isolated quarter under the cap is taken before a
+      block that would break the cap, and a priced single quarter before an unpriced
+      block. A4's "contiguous blocks" therefore holds whenever the cap, the horizon and
+      the capacity leave room for blocks; it gives way only to those three.
+      `price_cap_exceeded` is set when any chosen quarter is category 2, `uses_unpriced`
+      when any is category 3 — in the unreachable case of step 5 too.
    7. Subtract the chosen currents from `remaining` on the request's phases, then plan the
       next request.
    8. `PlannedQuarter.start` is converted to `timezone`; quarters are returned in time
       order; `planned_kwh` is the sum of their energy.
    Showcase: two cars on a shared phase, the second planned around the first.
 7. **`ev/allocation.py`.**
-   - `present_draw`: nominal = 0 if `state.paused`; else `current_setting` (adjustable,
-     unavailable of any kind), `assumed_current` (on/off, fixed). If `measured_power_w` is
-     known, measured per-phase draw = `measured_power_w / (voltage × len(phases))`, and the
-     result is `min(nominal, measured)`; else nominal. (The doc §13 formula subtracts the
-     *setting*; taking the smaller of setting and measured draw estimates the other load as
-     at least as large, so the free current is never larger than A3's bound — a car drawing
-     less than it is set to no longer inflates the free current.)
-   - `reserved_current`: `max(nominal, measured per-phase draw or 0)` with the same nominal,
-     for a fixed charger or any charger whose `available` is False.
+   - `present_draw` (controllable, available charger): 0 if `state.paused` or not
+     `state.car_connected` (a charger without a car cannot draw); else nominal =
+     `current_setting` (adjustable) or `assumed_current` (on/off). If `measured_power_w`
+     is known, measured per-phase draw = `measured_power_w / (voltage × len(phases))`, and
+     the result is `min(nominal, measured)`; else nominal. For a fixed or unavailable
+     charger `present_draw` returns `reserved_current`. (The doc §13 formula subtracts the
+     *setting*; taking the smaller of setting and measured draw estimates the other load
+     as at least as large, so the free current is never larger than A3's bound — a car
+     drawing less than it is set to no longer inflates the free current.)
+   - `reserved_current`: fixed → `max(assumed_current, measured per-phase draw or 0)`;
+     unavailable → `max(current_setting` for adjustable or `assumed_current` for on/off`,
+     measured per-phase draw or 0)`. `paused` and `car_connected` are ignored for both: a
+     charger that does not communicate, or has stopped communicating, is assumed to go on
+     drawing its last known level.
    - `phase_capacity`: as its row; the Σ runs over every charger on that phase.
    - `share`: work on a copy of `capacity`. Pass 1, in claim order: a claim with `max <
      min` is skipped (0); otherwise include it at `min_current` if `min_current ≤
@@ -425,14 +440,18 @@ Every module also has `main() -> None`, the showcase the conventions require.
       controllable phases = union of phases of non-fixed, available chargers; `fresh =
       measurements_fresh(..., controllable phases)`; `fallback = not fresh`.
    2. **Classify** each charger, in snapshot order, by the first rule that applies:
-      unavailable → reserved (`UNAVAILABLE`); fixed → reserved (`FIXED`); no car →
-      0 (`NO_CAR`); no session → 0 (`NO_SESSION`); `smart_charging` False → smart-off group
-      (`SMART_CHARGING_OFF`; its need is reported but not acted on — an unmanaged charger
-      charges until the car stops it); remaining need 0 → 0 (`TARGET_REACHED`, plus a
-      `CHARGE_NOW_NEED_COVERED` event if `charge_now`); `charge_now` → priority 1 (`CHARGE_NOW`);
-      prices not fresh → priority 3 (`PRICES_STALE`); deadline ≤ now → priority 3
-      (`READY_TIME_PASSED`); otherwise planned, then priority 2 if the quarter containing
-      `now` is in its plan (`IN_PLAN`), else priority 4 (`PLANNED_LATER`).
+      unavailable → reserved (`UNAVAILABLE`); fixed → reserved (`FIXED`; a session on it
+      only reports its need); no car → 0 (`NO_CAR`); no session → 0 (`NO_SESSION`);
+      `smart_charging` False → smart-off group (`SMART_CHARGING_OFF`; its need is reported
+      but not acted on — an unmanaged charger charges until the car stops it);
+      `soc_percent` known and `≥ 100` → 0 (`TARGET_REACHED`: the car cannot take more);
+      `charge_now` → priority 1 (`CHARGE_NOW`), plus a `CHARGE_NOW_NEED_COVERED` event when
+      its remaining need is 0 — it keeps priority 1 until the caller resets the flag (doc
+      §8); remaining need 0 → priority 3 (`PLAN_COMPLETED`: "plan completed, charging on
+      spare capacity", doc §6 and §1 Outputs); prices not fresh → priority 3
+      (`PRICES_STALE`); deadline ≤ now → priority 3 (`READY_TIME_PASSED`); otherwise
+      **to be planned** — step 6 plans it and then assigns priority 2 if the quarter
+      containing `now` is in its plan (`IN_PLAN`), else priority 4 (`PLANNED_LATER`).
       **Deadline** = `next_occurrence(ready_time, plugged_in_at or now, zone)`: seen from
       the session start when the caller gives one (doc §9), else from now.
    3. **Effective max** for a controllable charger: adjustable `min(max_current,
@@ -447,8 +466,12 @@ Every module also has `main() -> None`, the showcase the conventions require.
    5. **Smart-off group:** claims ranked by deadline, then larger remaining need, then id;
       `share` against `cap`; subtract.
    6. **Planning:** capacity per phase = `budget − reserved − smart-off allocations`,
-      clipped at 0 (the phase guard is a now-quantity and is not projected); requests for
-      every session that reached the "otherwise planned" rule; `plan_sessions`. Charge-now
+      clipped at 0 (the phase guard is a now-quantity and is not projected); one
+      `PlanRequest` per "to be planned" session: adjustable `min_current=min_current`,
+      `max_current=min(max_current, user_current_limit)` (no fallback cap, per Risk e);
+      on/off `assumed_current` for both. A session whose user limit is below its minimum
+      is still requested: it plans nothing, so it is unreachable and raises
+      `TARGET_UNREACHABLE`. `plan_sessions`, then priority 2 or 4 per step 2. Charge-now
       sessions are not planned and do not consume planning capacity.
    7. **Active tier:** the lowest of priorities 1, 2, 3 that has at least one charger that
       can run; nobody in priority 4 ever gets current. Active claims ranked by deadline
@@ -464,11 +487,11 @@ Every module also has `main() -> None`, the showcase the conventions require.
       by charger id.
    9. **Expected finish and reaches_target:** with a plan, the end of the first quarter at
       which cumulative planned energy reaches the need, else None; without a plan and with
-      allocation > 0, `now + need / (voltage × allocation × phases)` hours; else None.
+      allocation > 0, `now + timedelta(hours=need_kwh * 1000 / (voltage * allocation * len(phases)))`; a need of 0 finishes at `now`; else None.
       `reaches_target` = finish is not None and finish ≤ deadline (False once the deadline
       has passed); None when there is no session. Datetimes in the result are in `zone`.
    10. **Events:** `TARGET_UNREACHABLE` per unreachable plan (params `reachable_kwh` =
-       delivered + planned, `target_kwh` = delivered + need, `deadline`);
+       delivered + planned, `target_kwh` = delivered + need, `deadline` as an ISO 8601 string, since params hold only `str | float | int | bool`);
        `PRICE_CAP_EXCEEDED` per plan that broke the cap; `CHARGE_NOW_NEED_COVERED`;
        `PHASE_DATA_STALE` when `fallback`; `PRICES_STALE` when not `prices_ok`.
    11. **Status**, first that applies: `PHASE_DATA_STALE` if fallback; `PRICES_STALE` if
@@ -487,7 +510,7 @@ Every module also has `main() -> None`, the showcase the conventions require.
    then the same snapshot with stale measurements, to show the fallback.
 9. **`ev/codec.py`.** Keys are the dataclass field names; enums by value; datetimes
    `isoformat()` (offset included) and parsed with `datetime.fromisoformat`, rejecting a
-   naive result; `time` as `"HH:MM"` or `"HH:MM:SS"`; `timedelta` as seconds (number);
+   naive result; `time` encoded with `time.isoformat()` and parsed with `time.fromisoformat` (so `"07:00"` and `"07:00:00"` both parse, and seconds survive the round trip); `timedelta` as seconds (number);
    `frozenset[Phase]` as a sorted list, where a duplicate is rejected; tuples as lists.
    Optional fields may be omitted. Unknown keys are rejected. Int fields accept an
    integral float; bool is never a number. Any `ConfigError` raised while building an
@@ -495,32 +518,31 @@ Every module also has `main() -> None`, the showcase the conventions require.
    Showcase: snapshot → dict → `json.dumps` → back, printing the JSON and the equality.
 10. **`ev/__init__.py`.** Relative re-exports of every public name above except the
     planning/allocation/quarters helpers (importable from their modules), with `__all__`.
-11. **STRUCTURE.md and `.claude/rules/structure-ev.md`.** Tree gains `ev/`; one line per
-    `ev/` file and per test file, by full path; the per-module signature tables go in the
-    rules file.
+11. **STRUCTURE.md.** Tree gains `ev/`; one section per `ev/` module and per test file,
+    by full path, each with its signature table, in the existing style.
 
 ### Test intents
 
 | # | Must prove | Covers |
 |---|---|---|
-| T1 | Every invalid case listed in A1 raises `ConfigError` whose `field` names the field, for direct construction — including fields that do not belong to a kind, an unloadable timezone, overlapping or misaligned price intervals, non-finite numbers and bools as numbers | A1 |
+| T1 | Every invalid case listed in A1 raises `ConfigError` whose `field` names the field, for direct construction (a missing budget, threshold or fallback is passed as `None`; omitting the argument is Python's `TypeError` and is proven through the codec in T2) — including fields that do not belong to a kind, an unloadable timezone, overlapping or misaligned price intervals, non-finite numbers and bools as numbers | A1 |
 | T2 | `snapshot_from_dict` and `decision_from_dict` reject missing, unknown, wrongly typed and invalid fields with a dotted path, and a duplicated phase in a list | A1, A9 |
 | T3 | Doc scenarios 1–5 through `decide`: tier exclusivity, 15/15 split, 7/7/0 with the latest ready time cut, all-0 with "waiting for capacity", earliest ready time wins at 6 A | A2 |
 | T4 | `share`: 0/min selection in ranking order, a later claim on another phase still fits, floor and 1 A remainder in order, max and all-or-nothing respected, empty claims, zero or negative capacity | A2, A3 |
-| T5 | Priority assignment: charge-now → 1; current quarter in plan → 2; deadline passed (from `plugged_in_at`) → 3; plan later → 4; need 0 → target reached with the charge-now event; a priority-1 charger below its minimum does not occupy the tier | A2 |
-| T6 | Doc scenarios 7 (the phase binds at 6 A), 12 (mixed phases share max-min fairly; the shared phase never exceeds the budget) and 20 (on/off accounted at its assumed current, never partially) | A3 |
-| T7 | Fixed and unavailable chargers are reserved at the higher of level/setting and measured draw, receive no actions, and shrink everyone else's capacity; smart-off chargers are served first and cut only when every smart charger is at 0; `present_draw` takes the smaller of setting and measured draw, paused counts 0 | A3, A5 |
-| T8 | Doc scenario 14: 20 kWh at 11 kW in an 8-hour horizon plans 8 quarters with no run shorter than 2; the plan is the cheapest such selection on a hand-checked series | A4 |
+| T5 | Priority assignment: charge-now → 1, staying 1 with the `CHARGE_NOW_NEED_COVERED` event once its need is 0; current quarter in plan → 2; deadline passed (from `plugged_in_at`) → 3; need 0 with SOC below 100 or unknown → 3 `PLAN_COMPLETED`; SOC ≥ 100 → 0 `TARGET_REACHED`; plan later → 4; a priority-1 charger below its minimum does not occupy the tier; a session on a fixed charger is accepted and changes nothing | A2 |
+| T6 | Doc scenarios 7 (the phase binds at 6 A), 12 (16 A three-phase + 10 A single-phase on a shared phase, budget 25 → 15 A and 10 A; the shared phase never exceeds the budget) and 20 (on/off accounted at its assumed current, never partially) | A3 |
+| T7 | Fixed and unavailable chargers are reserved at the higher of level/setting and measured draw, receive no actions, and shrink everyone else's capacity — a fixed charger flagged `paused` is still reserved at its level, an unavailable on/off charger at its assumed current; smart-off chargers are served first and cut only when every smart charger is at 0; `present_draw` takes the smaller of setting and measured draw, and counts 0 when paused or without a car | A3, A5 |
+| T8 | Doc scenario 14: 20 kWh at 11 kW in an 8-hour horizon plans 8 quarters with no run shorter than 2; on a hand-checked series where it is also the cheapest selection with runs ≥ 2, it matches the greedy selection of guide 6 | A4 |
 | T9 | Doc scenario 15: an unreachable target plans every usable quarter and raises `TARGET_UNREACHABLE` with reachable and target kWh | A4 |
 | T10 | Doc scenario 17 (known quarters only): published quarters are used first, unpriced quarters only when needed and latest first, flagged; supplying the prices changes the plan | A4 |
-| T11 | Doc scenario 18: 92 and 100 quarters on the 2026 Copenhagen DST days, a correct deadline across midnight and across both transitions, a ready time inside the gap and the fold | A4 |
-| T12 | Price cap skipped when the need fits under it, broken with `PRICE_CAP_EXCEEDED` when it does not; hourly intervals split into four equal quarters; shared capacity plans the least-slack session first and never plans a phase beyond its capacity | A4 |
-| T13 | Fallback: stale, missing (None object, a missing used phase, a future-dated reading counts as fresh) → every controllable charger ≤ its own fallback or the global one; below-min and on/off-above-fallback → 0; budget and tiers still apply; status and event. Stale prices → no plans, priority 3, status and event | A5 |
-| T14 | Contradictory input charges least: a paused charger with measured power adds to the other load; measured draw above the setting does not raise free current; a connected car with SOC above target needs 0 | A5 |
+| T11 | Doc scenario 18: 92 and 100 quarters on the 2026 Copenhagen DST days, a correct deadline across midnight and across both transitions; 02:30 on 2026-03-29 → 01:30 UTC, 02:30 on 2026-10-25 → 00:30 UTC | A4 |
+| T12 | Price cap skipped when the need fits under it, broken with `PRICE_CAP_EXCEEDED` when it does not; alternating prices around a cap give single quarters under the cap rather than a block above it (guide 6.6 precedence), while without a cap the same series gives no run shorter than L; hourly intervals split into four equal quarters; shared capacity plans the least-slack session first and never plans a phase beyond its capacity; the unreachable plan's `price_cap_exceeded`/`uses_unpriced` flags | A4 |
+| T13 | Fallback: stale, missing (None object, a missing used phase, a reading dated beyond the max age in the future), while a `None` on a phase only fixed chargers use keeps fresh and gets the budget → every controllable charger ≤ its own fallback or the global one; below-min and on/off-above-fallback → 0; budget and tiers still apply; status and event. Stale prices → no plans, priority 3, status and event | A5 |
+| T14 | Contradictory input charges least: a paused charger with measured power adds to the other load; measured draw above the setting does not raise free current; a charger without a car counts 0 in the phase-guard draw; a connected car with SOC above target needs 0 | A5 |
 | T15 | Doc scenario 19: every down action precedes every up action; targets are absolute; no action when nothing changes, for reserved chargers or for chargers without a car; pause/resume/set-current chosen per the guide | A6 |
 | T16 | Every charger carries the right reason code and params; `expected_finish` and `reaches_target` for planned, unplanned and passed-deadline sessions; `available` per phase; result datetimes are in the settings timezone | A6 |
 | T17 | Property-based (`hypothesis`): for generated snapshots, every output holds 0 or min…effective max (on/off: 0 or assumed), Σ on each phase ≤ budget − reserved, ≤ the phase-guard limit when fresh, ≤ fallback when not, and down before up — computed independently in the test, not via the module's helpers | A7 |
-| T18 | `decide` called twice on the same snapshot gives equal decisions and leaves the snapshot equal to a deep copy taken before; every module under `src/energy_optimization/` imports only the standard library and itself (AST scan against `sys.stdlib_module_names`) | A8 |
+| T18 | `decide` called twice on the same snapshot gives equal decisions, and output text and lists name phases in L1, L2, L3 order and leaves the snapshot equal to a deep copy taken before; every module under `src/energy_optimization/` imports only the standard library and itself (AST scan against `sys.stdlib_module_names`) | A8 |
 | T19 | `snapshot_from_dict(json.loads(json.dumps(snapshot_to_dict(s)))) == s`, same for decisions, including `None` measurements, negative prices, non-UTC offsets and every enum value | A9 |
 | T20 | 10 chargers and a 48-hour series: the best of five `decide` calls is under 100 ms | A10 |
 
@@ -541,7 +563,12 @@ Public API entry names a criterion; nothing is there without one.
   action; (d) a tier is occupied only by chargers that can run; (e) planning ignores the
   phase guard and fallback (now-quantities) and does not reserve capacity for charge-now
   sessions; (f) the block rule may plan up to `L − 1` quarters beyond the need when no
-  extension fits; (g) a future-dated measurement counts as fresh. Anything **else** the
+  extension fits; (g) contiguity yields to the price cap and to known-before-unpriced
+  (guide 6.6); (h) a car whose need is covered but whose SOC is below 100 % (or unknown)
+  stays at priority 3 and charges on spare capacity (doc §6), with `TARGET_REACHED` only
+  for SOC ≥ 100; (i) doc scenario 12's "single-phase charger is cut" is read under the
+  agreed max-min-fair rule as "the shared phase is held to the budget": 16 A three-phase +
+  10 A single-phase on one shared phase with budget 25 gives 15 A and 10 A. Anything **else** the
   build finds undecided by section 1 or this plan is a halt.
 - **Datetime pitfalls.** Same-`ZoneInfo` comparisons ignore `fold`; compare in UTC
   everywhere (guide 5). If a DST test fails in a way that suggests the deadline semantics
@@ -554,8 +581,45 @@ Public API entry names a criterion; nothing is there without one.
   break shows two acceptance criteria contradict each other, halt.
 - **Hypothesis flakiness.** Use `@settings(deadline=None, max_examples=200,
   derandomize=True)` so the suite is deterministic and not timing-sensitive.
-- **The stop gate's file check** needs every `ev/` path written in full in STRUCTURE.md;
-  the rules file alone does not satisfy it.
+- **The stop gate's file check** needs every `ev/` path written in full in STRUCTURE.md.
+### Critique
+
+The `plan-critic` read section 1, then this section, the source doc and the repo; verdict
+"accept with changes". Each finding and what was done:
+
+1. *"Plan completed" priority 3 missing (A2, §1 example reason).* **Applied:** need 0 with
+   SOC below 100 or unknown → priority 3 `PLAN_COMPLETED`; `TARGET_REACHED` only for
+   SOC ≥ 100; charge-now keeps priority 1 with the need-covered event. This is the literal
+   reading of section 1, so no question to the user; flagged in the report.
+2. *Block/pass rules break contiguity and leave choices open.* **Applied** the straddling
+   passes, the finishing-rule definition and the unreachable-case flags. **Rebutted** the
+   suggested precedence: the critic proposed contiguity beats the cap; doc §7.6 calls
+   contiguity a preference and §7.8 calls the cap a rule, so the cap wins and an isolated
+   quarter under the cap is taken first. Stated in guide 6.6 and Risk (g), and flagged in
+   the report.
+3. *Gap semantics contradict the guide.* **Applied:** the `astimezone` behaviour (shift
+   forward by the gap) with exact UTC instants in T11.
+4. *`phase_capacity` crashes on a `None` phase that is still "fresh".* **Applied:** that
+   phase gets the budget; T13 case.
+5. *`present_draw`/`reserved_current` miss A3 or are unsafe.* **Applied** all three: fixed
+   ignores `paused`; unavailable uses setting or assumed current and ignores `paused`; no
+   car → 0 in the phase-guard draw. T7/T14 cases.
+6. *Signature tables in `.claude/rules/` contradict §1 and the structure-auditor.*
+   **Applied:** tables stay in STRUCTURE.md; the rules-file row is dropped.
+7. *`PlanRequest` min/max unspecified.* **Applied** (guide 8.6).
+8. *Scenario 12 under max-min fairness unstated.* **Applied:** 15 A / 10 A, in T6 and Risk (i).
+9. *Expected finish off by 1000.* **Applied.**
+10. *Session on a fixed charger rejected (widens A1).* **Applied:** accepted, ignored for
+    control.
+11. *T1 and T8 promise the unbuildable.* **Applied** both rewordings.
+12. *Smaller items.* **Applied:** 8.2/8.6 order, phase iteration order, `abs()` freshness
+    for measurements and prices (replacing the old Risk g), `time.isoformat()` round trip,
+    ISO `deadline` in event params, ints accepted for float fields, A1's "limits" named.
+    **Rebutted** the dependency-pin concern: `pip index versions` in this environment lists
+    hypothesis 6.170.5 and tzdata 2026.5, so both pins resolve.
+
+Coverage re-checked after these changes: every criterion still has a Public API entry and a
+test intent (the new `PLAN_COMPLETED` code is A2/A6), and nothing was added without one.
 
 ---
 
