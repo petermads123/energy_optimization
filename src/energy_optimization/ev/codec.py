@@ -539,8 +539,9 @@ def memory_from_dict(data: object) -> Memory | None:
         data: A dict as produced by `memory_to_dict`; anything else is accepted too.
 
     Returns:
-        The memory, or None when `data` is not a valid memory of any kind: missing
-        keys, unknown keys, wrong types, naive times, duplicate ids.
+        The memory, or None when `data` is not a valid memory of any kind: no
+        `saved_at`, unknown keys, wrong types, naive times, duplicate ids. Optional
+        parts (`chargers`, `level` and the rest) may be left out.
     """
     try:
         return _memory_from(data, "memory")

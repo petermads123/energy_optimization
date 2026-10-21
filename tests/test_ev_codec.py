@@ -16,11 +16,14 @@ from energy_optimization.ev import (
     Charger,
     ChargerDecision,
     ChargerKind,
+    ChargerMemory,
     ChargerState,
     ConfigError,
     Decision,
     Event,
     EventKind,
+    GuardLevel,
+    Memory,
     Phase,
     PhaseAmps,
     PhaseCurrents,
@@ -29,6 +32,7 @@ from energy_optimization.ev import (
     PriceSeries,
     Reason,
     ReasonCode,
+    Reduction,
     Session,
     Settings,
     Snapshot,
@@ -37,6 +41,8 @@ from energy_optimization.ev import (
     decide,
     decision_from_dict,
     decision_to_dict,
+    memory_from_dict,
+    memory_to_dict,
     snapshot_from_dict,
     snapshot_to_dict,
 )
@@ -962,7 +968,439 @@ def test_decision_from_dict_of_an_empty_decision() -> None:
     assert decision_round_trip(empty) == empty
 
 
+# --- Round 2: memory (T2) ------------------------------------------------------------
+
+PLUS2 = timezone(timedelta(hours=2))
+MINUS530 = timezone(timedelta(hours=-5, minutes=-30))
+
+
+def rich_memory(level: GuardLevel | None = GuardLevel.GREEN) -> Memory:
+    """A memory with every field set, written in assorted offsets."""
+    full = ChargerMemory(
+        "carport",
+        session_start=NOW - timedelta(hours=1),
+        car_connected=True,
+        session_key="07:00:00|10.0|None|False|None|",
+        running=True,
+        switched_at=(NOW - timedelta(minutes=20)).astimezone(PLUS2),
+        stopped_for_capacity=True,
+        selected=True,
+        regulated_cap=8,
+        under_use_since=(NOW - timedelta(minutes=5)).astimezone(MINUS530),
+        full_use_since=NOW - timedelta(minutes=2),
+        under_use_stop_at=NOW - timedelta(minutes=40),
+        last_target=6.5,
+        last_action_at=NOW - timedelta(seconds=40),
+        decreased_at=NOW - timedelta(seconds=45),
+    )
+    return Memory(
+        saved_at=NOW,
+        chargers=(full, ChargerMemory("pump")),
+        level=level,
+        green_since=NOW - timedelta(minutes=3),
+        emergency_at=(NOW - timedelta(hours=2)).astimezone(PLUS2),
+    )
+
+
+def memory_round_trip(memory: Memory) -> Memory | None:
+    data = json.loads(json.dumps(memory_to_dict(memory), allow_nan=False))
+    return memory_from_dict(data)
+
+
+@pytest.mark.parametrize("level", [None, *GuardLevel])
+def test_memory_round_trips_through_json(level: GuardLevel | None) -> None:
+    memory = rich_memory(level)
+
+    assert memory_round_trip(memory) == memory
+
+
+def test_memory_without_history_round_trips() -> None:
+    memory = Memory(saved_at=NOW)
+
+    assert memory_round_trip(memory) == memory
+
+
+def test_memory_round_trip_keeps_instants_across_the_fall_back_fold() -> None:
+    first = datetime(2026, 10, 25, 2, 30, tzinfo=CPH)
+    second = first.replace(fold=1)
+    memory = Memory(
+        saved_at=second,
+        chargers=(ChargerMemory("a", switched_at=first, last_action_at=second),),
+        green_since=second,
+    )
+
+    restored = memory_round_trip(memory)
+
+    assert restored is not None
+    assert restored.saved_at.astimezone(UTC) == second.astimezone(UTC)
+    assert restored.green_since is not None
+    assert restored.green_since.astimezone(UTC) == second.astimezone(UTC)
+    entry = restored.chargers[0]
+    assert entry.switched_at is not None
+    assert entry.last_action_at is not None
+    assert entry.switched_at.astimezone(UTC) == first.astimezone(UTC)
+    assert entry.last_action_at.astimezone(UTC) == second.astimezone(UTC)
+    assert entry.switched_at.astimezone(UTC) != entry.last_action_at.astimezone(UTC)
+
+
+def test_memory_to_dict_holds_only_plain_json_types() -> None:
+    data = memory_to_dict(rich_memory())
+
+    assert json.loads(json.dumps(data, allow_nan=False)) == data
+    assert isinstance(data["chargers"], list)
+    assert data["level"] == "green"
+    assert str(data["saved_at"]).endswith("+00:00")
+
+
+def test_memory_to_dict_writes_none_as_null() -> None:
+    data = memory_to_dict(Memory(saved_at=NOW))
+
+    assert data["level"] is None
+    assert data["green_since"] is None
+    assert data["chargers"] == []
+
+
+def encoded_memory() -> dict[str, Any]:
+    return json.loads(json.dumps(memory_to_dict(rich_memory())))
+
+
+def test_memory_from_dict_accepts_its_own_output() -> None:
+    assert memory_from_dict(encoded_memory()) == rich_memory()
+
+
+@pytest.mark.parametrize(
+    "junk", [None, [], "x", 0, False, True, {}, 3.5, [encoded_memory()]]
+)
+def test_memory_from_dict_returns_none_for_things_that_are_not_a_memory(
+    junk: object,
+) -> None:
+    assert memory_from_dict(junk) is None
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (["saved_at"], DELETE),
+        (["saved_at"], "2026-10-21T20:00:00"),
+        (["saved_at"], "not a date"),
+        (["saved_at"], 12),
+        (["saved_at"], None),
+        (["extra"], 1),
+        (["chargers"], "x"),
+        (["chargers"], [None]),
+        (["chargers"], None),
+        (["chargers"], {"carport": 1}),
+        (["chargers", 0, "regulated_cap"], -1),
+        (["chargers", 0, "regulated_cap"], 6.5),
+        (["chargers", 0, "regulated_cap"], 10**400),
+        (["chargers", 0, "regulated_cap"], True),
+        (["chargers", 0, "last_target"], "6"),
+        (["chargers", 0, "last_target"], float("nan")),
+        (["chargers", 0, "last_target"], -1),
+        (["chargers", 0, "charger_id"], " "),
+        (["chargers", 0, "charger_id"], DELETE),
+        (["chargers", 0, "charger_id"], 7),
+        (["chargers", 0, "bogus"], 1),
+        (["chargers", 0, "switched_at"], "2026-10-21T20:00:00"),
+        (["chargers", 0, "running"], 1),
+        (["chargers", 0, "session_key"], None),
+        (["level"], "purple"),
+        (["level"], "GREEN"),
+        (["level"], 3),
+        (["green_since"], "yesterday"),
+        (["emergency_at"], 5),
+    ],
+    ids=lambda v: str(v)[:30],
+)
+def test_memory_from_dict_never_raises_and_returns_none_for_malformed_input(
+    path: list[str | int], value: object
+) -> None:
+    assert memory_from_dict(edit(encoded_memory(), path, value)) is None
+
+
+def test_memory_from_dict_returns_none_for_duplicate_charger_ids() -> None:
+    data = encoded_memory()
+    data["chargers"].append(copy.deepcopy(data["chargers"][0]))
+
+    assert memory_from_dict(data) is None
+
+
+def test_memory_from_dict_returns_none_for_a_non_string_key() -> None:
+    data: dict[Any, Any] = encoded_memory()
+    data[1] = "x"
+
+    assert memory_from_dict(data) is None
+
+
+def test_memory_from_dict_is_lenient_about_omitted_optional_parts() -> None:
+    minimal = memory_from_dict({"saved_at": "2026-10-21T20:00:00Z"})
+    entry = memory_from_dict(
+        {"saved_at": "2026-10-21T20:00:00Z", "chargers": [{"charger_id": "a"}]}
+    )
+
+    assert minimal == Memory(saved_at=NOW + timedelta(hours=2))
+    assert entry == Memory(
+        saved_at=NOW + timedelta(hours=2), chargers=(ChargerMemory("a"),)
+    )
+
+
+def test_memory_from_dict_does_not_mutate_its_input() -> None:
+    data = encoded_memory()
+    before = copy.deepcopy(data)
+
+    memory_from_dict(data)
+
+    assert data == before
+
+
+def test_memory_from_dict_survives_deep_nesting() -> None:
+    deep: object = []
+    for _ in range(100_000):
+        deep = [deep]
+
+    assert memory_from_dict({"saved_at": deep}) is None
+
+
+# --- Round 2: memory inside snapshot dicts (T2, T3) ------------------------------------
+
+
+def test_snapshot_round_trips_with_a_memory() -> None:
+    snapshot = replace(base_snapshot(), memory=rich_memory())
+
+    data = json.loads(json.dumps(snapshot_to_dict(snapshot)))
+
+    assert snapshot_from_dict(data) == snapshot
+
+
+@pytest.mark.parametrize("variant", ["absent", "null"])
+def test_snapshot_from_dict_takes_a_missing_or_null_memory_as_none(
+    variant: str,
+) -> None:
+    data = encoded()
+    if variant == "absent":
+        del data["memory"]
+
+    result = snapshot_from_dict(data)
+
+    assert result.memory is None
+    assert reset_reason(result) == "missing"
+
+
+@pytest.mark.parametrize(
+    "junk", [{}, False, 0, "", "garbage", [], {"saved_at": "nope"}]
+)
+def test_snapshot_from_dict_turns_malformed_memory_into_an_invalid_restart(
+    junk: object,
+) -> None:
+    result = snapshot_from_dict(edit(encoded(), ["memory"], junk))
+
+    assert result.memory is not None
+    assert reset_reason(result) == "invalid"
+
+
+def test_the_invalid_memory_marker_survives_a_snapshot_round_trip() -> None:
+    first = snapshot_from_dict(edit(encoded(), ["memory"], "garbage"))
+
+    again = snapshot_from_dict(json.loads(json.dumps(snapshot_to_dict(first))))
+
+    assert reset_reason(first) == "invalid"
+    assert reset_reason(again) == "invalid"
+    assert again == first
+
+
+def test_a_malformed_memory_does_not_hide_a_bad_charger_field() -> None:
+    data = edit(encoded(), ["memory"], "garbage")
+    data = edit(data, ["chargers", 0, "max_current"], "sixteen")
+
+    assert error_of(lambda: snapshot_from_dict(data)).field == "chargers[0].max_current"
+
+
+def test_a_decision_memory_feeds_the_next_snapshot_without_a_reset() -> None:
+    first = decide(base_snapshot())
+    assert first.memory is not None
+    later = NOW + timedelta(minutes=1)
+    second = replace(
+        base_snapshot(),
+        now=later,
+        phase_currents=PhaseCurrents(later, 10.0, None, 3.5),
+    )
+    data = snapshot_to_dict(second)
+    data["memory"] = json.loads(json.dumps(memory_to_dict(first.memory)))
+
+    result = decide(snapshot_from_dict(data))
+
+    assert EventKind.MEMORY_RESET not in [event.kind for event in result.events]
+
+
+def reset_reason(snapshot: Snapshot) -> str | None:
+    """The `MEMORY_RESET` reason `decide` reports for a snapshot, None for none."""
+    for event in decide(snapshot).events:
+        if event.kind is EventKind.MEMORY_RESET:
+            return str(event.params["reason"])
+    return None
+
+
+# --- Round 2: memory, guard level and next check in decision dicts (T2) -----------------
+
+
+def rich_decision(
+    level: GuardLevel | None = GuardLevel.YELLOW,
+    next_check: datetime | None = NOW + timedelta(minutes=5),
+) -> Decision:
+    return replace(
+        full_decision(),
+        memory=rich_memory(),
+        guard_level=level,
+        next_check=next_check,
+    )
+
+
+@pytest.mark.parametrize("level", [None, *GuardLevel])
+def test_decision_round_trips_with_every_guard_level(level: GuardLevel | None) -> None:
+    decision = rich_decision(level)
+
+    assert decision_round_trip(decision) == decision
+
+
+def test_decision_round_trips_a_next_check_across_the_fall_back_fold() -> None:
+    moment = datetime(2026, 10, 25, 2, 30, tzinfo=CPH, fold=1)
+
+    restored = decision_round_trip(rich_decision(next_check=moment))
+
+    assert restored.next_check is not None
+    assert restored.next_check.astimezone(UTC) == moment.astimezone(UTC)
+    assert restored.next_check.utcoffset() == timedelta(hours=1)
+
+
+def test_decision_round_trips_without_a_next_check() -> None:
+    decision = rich_decision(next_check=None)
+
+    assert decision_round_trip(decision).next_check is None
+
+
+def test_decision_from_dict_takes_omitted_round_two_fields_as_none() -> None:
+    data = encoded_decision()
+    for key in ("memory", "guard_level", "next_check"):
+        del data[key]
+
+    result = decision_from_dict(data)
+
+    assert result.memory is None
+    assert result.guard_level is None
+    assert result.next_check is None
+
+
+def encoded_rich_decision() -> dict[str, Any]:
+    return json.loads(json.dumps(decision_to_dict(rich_decision())))
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "field"),
+    [
+        (["memory", "saved_at"], "bad", "memory.saved_at"),
+        (["memory", "saved_at"], "2026-10-21T20:00:00", "memory.saved_at"),
+        (["memory", "saved_at"], DELETE, "memory.saved_at"),
+        (
+            ["memory", "chargers", 0, "regulated_cap"],
+            -1,
+            "memory.chargers[0].regulated_cap",
+        ),
+        (["memory", "chargers", 1, "charger_id"], " ", "memory.chargers[1].charger_id"),
+        (["memory", "chargers", 0, "foo"], 1, "memory.chargers[0].foo"),
+        (["memory", "level"], "purple", "memory.level"),
+        (["memory", "extra"], 1, "memory.extra"),
+        (["memory"], "x", "memory"),
+        (["guard_level"], "Green", "guard_level"),
+        (["guard_level"], 3, "guard_level"),
+        (["next_check"], "2026-10-21T20:00:00", "next_check"),
+        (["next_check"], 5, "next_check"),
+    ],
+    ids=lambda v: str(v),
+)
+def test_decision_from_dict_reads_the_round_two_fields_strictly(
+    path: list[str | int], value: object, field: str
+) -> None:
+    assert decision_field(edit(encoded_rich_decision(), path, value)) == field
+
+
+def test_decision_from_dict_rejects_duplicate_memory_charger_ids_with_a_path() -> None:
+    data = encoded_rich_decision()
+    data["memory"]["chargers"].append(copy.deepcopy(data["memory"]["chargers"][0]))
+
+    assert decision_field(data) == "memory.chargers"
+
+
+# --- Round 2: settings fields (T2) ---------------------------------------------------------
+
+
+def settings_data() -> dict[str, Any]:
+    return encoded()["settings"]
+
+
+def test_settings_dict_carries_every_round_two_field() -> None:
+    result = snapshot_from_dict(
+        edit(
+            edit(encoded(), ["settings", "reduction"], "halve"),
+            ["settings", "emergency_threshold"],
+            41.0,
+        )
+    ).settings
+
+    assert result.reduction is Reduction.HALVE
+    assert result.emergency_threshold == 41.0
+    assert result.min_pause == timedelta(minutes=15)
+    assert result.max_memory_age == timedelta(minutes=30)
+
+
+def test_settings_dict_takes_a_null_emergency_threshold_as_off() -> None:
+    result = snapshot_from_dict(
+        edit(encoded(), ["settings", "emergency_threshold"], None)
+    )
+
+    assert result.settings.emergency_threshold is None
+
+
+def test_settings_dict_accepts_a_zero_green_hold() -> None:
+    result = snapshot_from_dict(edit(encoded(), ["settings", "green_hold"], 0))
+
+    assert result.settings.green_hold == timedelta(0)
+
+
+def test_settings_dict_rounds_a_tiny_green_hold_to_zero() -> None:
+    result = snapshot_from_dict(edit(encoded(), ["settings", "green_hold"], 4e-7))
+
+    assert result.settings.green_hold == timedelta(0)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("ramp_period", 4e-7),
+        ("ramp_period", 0),
+        ("reduction", None),
+        ("reduction", "HALVE"),
+        ("reduction", 1),
+        ("ramp_step", 2.5),
+        ("ramp_step", 0),
+        ("emergency_threshold", 32.0),
+        ("emergency_threshold", "40"),
+        ("min_action_interval", -1),
+        ("under_use_margin", -0.5),
+        ("max_memory_age", 0),
+    ],
+)
+def test_settings_dict_rejects_bad_round_two_values_with_their_path(
+    key: str, value: object
+) -> None:
+    data = edit(encoded(), ["settings", key], value)
+
+    assert error_of(lambda: snapshot_from_dict(data)).field == f"settings.{key}"
+
+
 def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:
     showcase()
 
-    assert "round trip equal: True" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "round trip equal: True" in output
+    assert "memory round trip equal: True" in output
+    assert "malformed memory decodes to: None" in output
