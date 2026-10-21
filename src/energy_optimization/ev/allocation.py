@@ -175,12 +175,26 @@ def present_draw(charger: Charger, state: ChargerState, voltage: float) -> float
     return min(nominal, _measured_per_phase(state, len(charger.phases), voltage))
 
 
-def phase_capacity(snapshot: Snapshot, fresh: bool) -> dict[Phase, float]:
+def _settling_draw(charger: Charger, state: ChargerState, voltage: float) -> float:
+    """Return the draw of a charger still ramping down after a decrease."""
+    controllable = charger.kind is not ChargerKind.FIXED and state.available
+    if controllable and state.measured_power_w is not None:
+        return _measured_per_phase(state, len(charger.phases), voltage)
+    return present_draw(charger, state, voltage)
+
+
+def phase_capacity(
+    snapshot: Snapshot, fresh: bool, settling: frozenset[str] = frozenset()
+) -> dict[Phase, float]:
     """Return what all chargers together may use on each phase.
 
     Args:
         snapshot: The snapshot.
         fresh: Whether the phase measurements can be trusted.
+        settling: Ids of chargers that were sent a decrease a moment ago. Each
+            counts at its measured draw (when known) instead of the smaller of
+            setting and measured draw, so a car still ramping down is not mistaken
+            for other load.
 
     Returns:
         `min(budget, threshold - (measured - sum of present draws))` per phase when
@@ -198,7 +212,9 @@ def phase_capacity(snapshot: Snapshot, fresh: bool) -> dict[Phase, float]:
             capacity[phase] = settings.phase_budget
             continue
         draw = sum(
-            present_draw(charger, states[charger.id], settings.voltage)
+            (_settling_draw if charger.id in settling else present_draw)(
+                charger, states[charger.id], settings.voltage
+            )
             for charger in snapshot.chargers
             if phase in charger.phases
         )

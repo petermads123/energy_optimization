@@ -29,6 +29,22 @@ class ChargerKind(StrEnum):
     FIXED = "fixed"
 
 
+class Reduction(StrEnum):
+    """How an under-use cut is computed."""
+
+    TO_USE = "to_use"
+    HALVE = "halve"
+
+
+class GuardLevel(StrEnum):
+    """The phase guard's level."""
+
+    GREEN = "green"
+    YELLOW = "yellow"
+    RED = "red"
+    EMERGENCY = "emergency"
+
+
 class ConfigError(ValueError):
     """Invalid input, naming the offending field.
 
@@ -441,6 +457,25 @@ class Settings:
         default_energy_need_kwh: Need used when a session gives none.
         max_price_age: How old the price series may be.
         max_measurement_age: How old phase measurements may be.
+        emergency_threshold: Per-phase reading in A above which the guard is in
+            emergency; None for off. Must exceed `phase_threshold`.
+        emergency_calm: How long the phases must stay green before an emergency
+            releases.
+        yellow_margin: A below `phase_threshold` at which the guard turns yellow.
+        green_hold: How long the phases must have been green before any increase.
+        deadband: A of difference between setting and draw that is ignored.
+        ramp_step: A added per ramp period of full use after an under-use cut.
+        ramp_period: How long full use must last for one ramp step.
+        under_use_period: How long under-use must last before a charger is cut.
+        reduction: How an under-use cut is computed.
+        under_use_margin: A of headroom kept above the draw by a cut.
+        min_pause: Minimum time a charger stays stopped or running for capacity.
+        hysteresis: How much earlier a contender's deadline must be to displace a
+            selected charger.
+        resume_probe: How long a charger cut to 0 for under-use waits before it is
+            offered current again.
+        min_action_interval: Minimum time between increases sent to one charger.
+        max_memory_age: How old the memory may be before it is treated as missing.
     """
 
     phase_budget: float
@@ -453,6 +488,21 @@ class Settings:
     default_energy_need_kwh: float = 30.0
     max_price_age: timedelta = timedelta(minutes=60)
     max_measurement_age: timedelta = timedelta(seconds=60)
+    emergency_threshold: float | None = None
+    emergency_calm: timedelta = timedelta(minutes=5)
+    yellow_margin: float = 2.0
+    green_hold: timedelta = timedelta(seconds=60)
+    deadband: float = 2.0
+    ramp_step: int = 2
+    ramp_period: timedelta = timedelta(minutes=5)
+    under_use_period: timedelta = timedelta(minutes=15)
+    reduction: Reduction = Reduction.TO_USE
+    under_use_margin: float = 1.0
+    min_pause: timedelta = timedelta(minutes=15)
+    hysteresis: timedelta = timedelta(minutes=30)
+    resume_probe: timedelta = timedelta(minutes=60)
+    min_action_interval: timedelta = timedelta(seconds=30)
+    max_memory_age: timedelta = timedelta(minutes=30)
 
     def __post_init__(self) -> None:
         """Validate the settings."""
@@ -492,6 +542,165 @@ class Settings:
             age = getattr(self, name)
             if not isinstance(age, timedelta) or age <= timedelta(0):
                 raise _fail(name, f"must be a positive timedelta, got {age!r}")
+        self._check_over_time()
+
+    def _check_over_time(self) -> None:
+        """Validate the settings that govern behaviour over time."""
+        if self.emergency_threshold is not None:
+            emergency = _number("emergency_threshold", self.emergency_threshold)
+            if emergency <= self.phase_threshold:
+                raise _fail(
+                    "emergency_threshold",
+                    f"must be > phase_threshold ({self.phase_threshold}), "
+                    f"got {emergency}",
+                )
+            _set(self, "emergency_threshold", emergency)
+        for name in ("yellow_margin", "deadband", "under_use_margin"):
+            number = _number(name, getattr(self, name))
+            if number < 0:
+                raise _fail(name, f"must be ≥ 0, got {number}")
+            _set(self, name, number)
+        step = _whole("ramp_step", self.ramp_step)
+        if step < 1:
+            raise _fail("ramp_step", f"must be ≥ 1, got {step}")
+        _set(self, "ramp_step", step)
+        for name in ("emergency_calm", "green_hold", "min_pause", "hysteresis"):
+            span = getattr(self, name)
+            if not isinstance(span, timedelta) or span < timedelta(0):
+                raise _fail(name, f"must be a timedelta ≥ 0, got {span!r}")
+        span = self.min_action_interval
+        if not isinstance(span, timedelta) or span < timedelta(0):
+            raise _fail("min_action_interval", f"must be a timedelta ≥ 0, got {span!r}")
+        for name in ("ramp_period", "under_use_period", "resume_probe", "max_memory_age"):
+            span = getattr(self, name)
+            if not isinstance(span, timedelta) or span <= timedelta(0):
+                raise _fail(name, f"must be a positive timedelta, got {span!r}")
+        if not isinstance(self.reduction, Reduction):
+            raise _fail("reduction", f"unknown reduction {self.reduction!r}")
+
+
+@dataclass(frozen=True)
+class ChargerMemory:
+    """What one charger carries between calls.
+
+    Attributes:
+        charger_id: The charger it describes.
+        session_start: When the current session was first seen, aware.
+        car_connected: Whether the car was connected at the last call.
+        session_key: Fingerprint of the session fields whose change is a new session.
+        running: Whether the last decision left it charging.
+        switched_at: When it last changed between running and not running.
+        stopped_for_capacity: Whether the last stop was for lack of capacity.
+        selected: Whether it was selected in its tier at the last call.
+        regulated_cap: Cap in A set by under-use regulation, 0 for stopped.
+        under_use_since: Since when its draw has been under its setting.
+        full_use_since: Since when its draw has matched its setting.
+        under_use_stop_at: When it was cut to 0 for under-use.
+        last_target: The target of the last action sent to it, in A.
+        last_action_at: When the last action was sent to it.
+        decreased_at: When the last decrease was sent to it.
+    """
+
+    charger_id: str
+    session_start: datetime | None = None
+    car_connected: bool = False
+    session_key: str = ""
+    running: bool = False
+    switched_at: datetime | None = None
+    stopped_for_capacity: bool = False
+    selected: bool = False
+    regulated_cap: int | None = None
+    under_use_since: datetime | None = None
+    full_use_since: datetime | None = None
+    under_use_stop_at: datetime | None = None
+    last_target: float | None = None
+    last_action_at: datetime | None = None
+    decreased_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        """Validate the charger memory."""
+        _text("charger_id", self.charger_id)
+        ctx = f"charger {self.charger_id!r}: "
+        for name in ("car_connected", "running", "stopped_for_capacity", "selected"):
+            _bool(name, getattr(self, name), ctx)
+        if not isinstance(self.session_key, str):
+            raise _fail("session_key", f"must be a string, got {self.session_key!r}", ctx)
+        for name in (
+            "session_start",
+            "switched_at",
+            "under_use_since",
+            "full_use_since",
+            "under_use_stop_at",
+            "last_action_at",
+            "decreased_at",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                _aware(name, value, ctx)
+        if self.regulated_cap is not None:
+            cap = _whole("regulated_cap", self.regulated_cap, ctx)
+            if cap < 0:
+                raise _fail("regulated_cap", f"must be ≥ 0, got {cap}", ctx)
+            _set(self, "regulated_cap", cap)
+        if self.last_target is not None:
+            target = _number("last_target", self.last_target, ctx)
+            if target < 0:
+                raise _fail("last_target", f"must be ≥ 0, got {target}", ctx)
+            _set(self, "last_target", target)
+
+
+@dataclass(frozen=True)
+class Memory:
+    """Everything carried from one call to the next.
+
+    Attributes:
+        saved_at: The `now` of the call that produced it, aware.
+        chargers: Per-charger memory, ids unique.
+        level: The phase-guard level after that call, None when unknown.
+        green_since: Since when the phases have been continuously green.
+        emergency_at: When the emergency level was last entered.
+    """
+
+    saved_at: datetime
+    chargers: tuple[ChargerMemory, ...] = ()
+    level: GuardLevel | None = None
+    green_since: datetime | None = None
+    emergency_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        """Validate the memory."""
+        _aware("saved_at", self.saved_at)
+        if isinstance(self.chargers, str) or not isinstance(self.chargers, Iterable):
+            raise _fail("chargers", f"must be a sequence, got {self.chargers!r}")
+        entries = tuple(self.chargers)
+        seen: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, ChargerMemory):
+                raise _fail("chargers", f"must hold ChargerMemory, got {entry!r}")
+            if entry.charger_id in seen:
+                raise _fail("chargers", f"duplicate charger id {entry.charger_id!r}")
+            seen.add(entry.charger_id)
+        _set(self, "chargers", entries)
+        if self.level is not None and not isinstance(self.level, GuardLevel):
+            raise _fail("level", f"unknown guard level {self.level!r}")
+        for name in ("green_since", "emergency_at"):
+            value = getattr(self, name)
+            if value is not None:
+                _aware(name, value)
+
+    def charger(self, charger_id: str) -> ChargerMemory | None:
+        """Return one charger's memory.
+
+        Args:
+            charger_id: The charger to look up.
+
+        Returns:
+            Its entry, or None when there is none.
+        """
+        for entry in self.chargers:
+            if entry.charger_id == charger_id:
+                return entry
+        return None
 
 
 @dataclass(frozen=True)
@@ -506,6 +715,7 @@ class Snapshot:
         sessions: At most one session per charger.
         prices: The price series.
         phase_currents: Measured phase currents, None when missing.
+        memory: The previous decision's memory, None when there is none.
     """
 
     now: datetime
@@ -515,6 +725,7 @@ class Snapshot:
     sessions: tuple[Session, ...]
     prices: PriceSeries
     phase_currents: PhaseCurrents | None = None
+    memory: Memory | None = None
 
     def __post_init__(self) -> None:
         """Validate the snapshot and the links between its parts."""
@@ -530,6 +741,8 @@ class Snapshot:
                 "phase_currents",
                 f"must be PhaseCurrents or None, got {self.phase_currents!r}",
             )
+        if self.memory is not None and not isinstance(self.memory, Memory):
+            raise _fail("memory", f"must be Memory or None, got {self.memory!r}")
         chargers = self._items("chargers", Charger)
         states = self._items("states", ChargerState)
         sessions = self._items("sessions", Session)
@@ -606,6 +819,12 @@ def main() -> None:
         Session(charger_id="carport", ready_time=time(7, 0), energy_need_kwh=20.0),
     )
     prices = PriceSeries(intervals=(), updated_at=now)
+    memory = Memory(
+        saved_at=now - timedelta(minutes=5),
+        chargers=(ChargerMemory(charger_id="carport", car_connected=True),),
+        level=GuardLevel.GREEN,  # GREEN, YELLOW, RED, EMERGENCY
+        green_since=now - timedelta(hours=1),
+    )
 
     snapshot = Snapshot(
         now=now,
@@ -614,10 +833,12 @@ def main() -> None:
         states=states,
         sessions=sessions,
         prices=prices,
+        memory=memory,
     )
 
     print(f"snapshot has {len(snapshot.chargers)} chargers at {snapshot.now}")
     print(f"first charger: {snapshot.chargers[0]}")
+    print(f"memory of carport: {memory.charger('carport')}")
 
     # An invalid charger is rejected with the field named.
     min_current = 16
