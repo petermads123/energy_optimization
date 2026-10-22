@@ -1,6 +1,6 @@
 # Stateless core
 
-<!-- claude-plan step=3 status=active -->
+<!-- claude-plan step=4 status=active -->
 
 | Field | Value |
 |---|---|
@@ -15,7 +15,7 @@
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
-| 3 | Implement | `/implement` | in `/build` | pending |
+| 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | pending |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
@@ -295,6 +295,26 @@ Coverage unchanged: no public API added; every criterion still has a test intent
 > Written in step 3. Only deviations from the plan above, each with its reason. "Built as
 > planned" is a complete and good entry. On a fix round, also the reproduction test's red
 > run, pasted here before the fix was written — step 6 cites it.
+
+Built as planned. Record of the mechanical check (guide 1), `git diff origin/main --
+src/energy_optimization/ev/{model,quarters}.py` has no `+` line at all; the others have only
+round-1 forms of round-2 edits, none a round-1 bug fix:
+
+| File | `+` lines | Classification |
+|---|---|---|
+| `result.py` | `from .model import Phase` | round-1 import (round 2 widened it to `GuardLevel, Memory, Phase`) |
+| `allocation.py` | `phase_capacity(snapshot, fresh)` signature and docstring lines; `present_draw(...)` in the draw sum | round-1 form of the `settling` branch |
+| `__init__.py` | one module-docstring line | round-1 wording |
+| `codec.py` | `if key == "price_cap":`; the `_Reader` key tuple without `memory`, `guard_level`, `next_check` | round-1 form of the nullable-key and decoder-key edits |
+
+The only code added on top of the restore is the `_expected_finish` fix in `decide.py`
+(UTC arithmetic, `None` on `OverflowError`), as in guide 2. `guard.py`, `regulation.py`,
+`tests/test_ev_guard.py` and `tests/test_ev_regulation.py` removed. Gates after the restore:
+ruff, ruff format, mypy, pytest (1141 passed) and all seven `ev` showcases green.
+`STRUCTURE.md`: `ev/` and `tests/test_ev_*` sections replaced with `982a494`'s text, guard
+and regulation sections removed, expected-finish fix noted in the `decide.py` entry; the
+hooks, `.claude/` and plans sections kept as on `main`. `DEVELOPMENT.md`: round 2 notes
+section deleted, AppDaemon entry rewritten. No test-file additions yet (T2-T5 are step 5's).
 
 ---
 
