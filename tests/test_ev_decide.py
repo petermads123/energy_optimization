@@ -1,6 +1,9 @@
 """Tests for energy_optimization.ev.decide (T3, T5-T7, T9, T13-T18, T20): the core."""
 
 import copy
+import dataclasses
+import importlib.util
+import inspect
 import json
 import os
 import random
@@ -8,7 +11,7 @@ import subprocess
 import sys
 import time as clock
 from dataclasses import replace
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -39,12 +42,18 @@ from energy_optimization.ev import (
     Stage,
     Status,
     decide,
+    decision_from_dict,
     decision_to_dict,
     snapshot_from_dict,
     snapshot_to_dict,
 )
+from energy_optimization.ev.allocation import phase_capacity
 from energy_optimization.ev.decide import main as showcase
-from energy_optimization.ev.planning import energy_per_quarter_kwh
+from energy_optimization.ev.planning import (
+    PlanRequest,
+    energy_per_quarter_kwh,
+    plan_sessions,
+)
 
 NOW = datetime(2026, 10, 21, 20, 0, tzinfo=UTC)  # 22:00 CEST
 TZ = "Europe/Copenhagen"
@@ -2195,6 +2204,42 @@ def random_snapshot(rng: random.Random) -> Snapshot:
 TOLERANCE = 1e-6
 
 
+def assert_plans_fit(snapshot: Snapshot, result: Decision) -> None:
+    """No plan books more than a phase can hold, worked out from the decision alone.
+
+    What the fixed, unavailable and smart-charging-off chargers take is out of the room
+    the plans share; their final allocation is never above what the planner was told.
+    """
+    cfg = snapshot.settings
+    states = {s.charger_id: s for s in snapshot.states}
+    sessions = {s.charger_id: s for s in snapshot.sessions}
+    decisions = {c.charger_id: c for c in result.chargers}
+    unplanned = {
+        c.id
+        for c in snapshot.chargers
+        if c.kind is ChargerKind.FIXED
+        or not states[c.id].available
+        or (c.id in sessions and not sessions[c.id].smart_charging)
+    }
+    booked: dict[tuple[datetime, Phase], float] = {}
+    for c in snapshot.chargers:
+        planned = decisions[c.id].plan
+        if c.id in unplanned:
+            assert planned == ()
+        for quarter in planned:
+            for phase in c.phases:
+                # keyed in UTC: the wall times of the fall-back hour repeat
+                key = (quarter.start.astimezone(UTC), phase)
+                booked[key] = booked.get(key, 0.0) + quarter.current
+    for (_, phase), total in booked.items():
+        taken = sum(
+            decisions[c.id].allocation
+            for c in snapshot.chargers
+            if phase in c.phases and c.id in unplanned
+        )
+        assert total <= max(0.0, cfg.phase_budget - taken) + TOLERANCE
+
+
 def present_current(charger: Charger, state: ChargerState) -> float:
     if state.paused:
         return 0.0
@@ -2227,6 +2272,10 @@ def assert_invariants(snapshot: Snapshot, result: Decision) -> None:
         <= cfg.max_measurement_age.total_seconds()
         and all(pc.get(p) is not None for p in controllable_phases)
     )
+
+    assert_plans_fit(snapshot, result)
+    for decision in result.chargers:
+        assert (decision.reaches_target is None) == (decision.deadline is None)
 
     for c in snapshot.chargers:
         state, decision = states[c.id], decisions[c.id]
@@ -2361,6 +2410,399 @@ def test_generated_snapshots_survive_the_dict_round_trip_and_decide_the_same(
     restored = snapshot_from_dict(data)
 
     assert decision_to_dict(decide(restored)) == decision_to_dict(decide(snapshot))
+
+
+# --- T3: the expected finish of an unplanned session is worked out in UTC ---------
+
+
+def unplanned_snapshot(now: datetime, hours: float, **kwargs: object) -> Snapshot:
+    """One 16 A charger, stale prices (so no plan) and a need that takes `hours`."""
+    need = 3.68 * hours  # 230 V * 16 A = 3.68 kW
+    return snap(
+        [adj()],
+        sessions=[sess(need=need)],
+        prices=PriceSeries((), now - timedelta(hours=2)),
+        now=now,
+        **kwargs,  # type: ignore[arg-type]  # test passes through
+    )
+
+
+def finish_of(snapshot: Snapshot) -> ChargerDecision:
+    """Decide, and check the setup really is allocated, unplanned and unpriced."""
+    item = by_id(decide(snapshot))["a"]
+    assert item.allocation == 16.0
+    assert item.plan == ()
+    return item
+
+
+@pytest.mark.parametrize(
+    ("now", "hours", "expected"),
+    [
+        # the old wall-clock sum gives 03:30+01:00 (an hour late)
+        (datetime(2026, 10, 25, 1, 30, tzinfo=ZONE), 2, "2026-10-25T02:30:00+01:00"),
+        # 02:30 first pass, fold=0; the old sum gives 02:30+01:00 (an hour late)
+        (datetime(2026, 10, 25, 2, 30, tzinfo=ZONE), 1, "2026-10-25T02:30:00+01:00"),
+        # second pass, fold=1: wall-clock and UTC agree, so this only proves `fold`
+        (
+            datetime(2026, 10, 25, 2, 30, fold=1, tzinfo=ZONE),
+            1,
+            "2026-10-25T03:30:00+01:00",
+        ),
+        # spring forward: the old sum gives 03:30+02:00 (an hour early)
+        (datetime(2026, 3, 29, 1, 30, tzinfo=ZONE), 2, "2026-03-29T04:30:00+02:00"),
+        # inside the gap, read with the pre-transition offset (01:30Z)
+        (datetime(2026, 3, 29, 2, 30, tzinfo=ZONE), 2, "2026-03-29T05:30:00+02:00"),
+    ],
+)
+def test_an_unplanned_expected_finish_adds_the_hours_in_utc_across_dst(
+    now: datetime, hours: int, expected: str
+) -> None:
+    item = finish_of(unplanned_snapshot(now, hours))
+
+    # `isoformat`, never `==`: equal ZoneInfo datetimes compare by wall clock, `fold`
+    # ignored, so a result an hour off on the fall-back night would still be equal.
+    assert item.expected_finish is not None
+    assert item.expected_finish.isoformat() == expected
+    assert item.expected_finish.tzinfo == ZONE
+
+
+def test_the_unplanned_finish_off_a_wall_clock_now_matches_its_utc_instant() -> None:
+    now = datetime(2026, 10, 25, 2, 30, tzinfo=ZONE)  # fold=0, 00:30Z
+    assert now.astimezone(UTC) == datetime(2026, 10, 25, 0, 30, tzinfo=UTC)
+
+    item = finish_of(unplanned_snapshot(now, 1))
+
+    assert item.expected_finish is not None
+    assert item.expected_finish.astimezone(UTC) == datetime(
+        2026, 10, 25, 1, 30, tzinfo=UTC
+    )
+    assert item.expected_finish.utcoffset() == timedelta(hours=1)
+
+
+@pytest.mark.parametrize(
+    "now",
+    [
+        datetime(2026, 10, 24, 23, 30, tzinfo=UTC),
+        datetime(2026, 10, 25, 1, 30, tzinfo=ZONE),
+        datetime(2026, 10, 25, 4, 30, tzinfo=timezone(timedelta(hours=5))),
+    ],
+)
+def test_the_unplanned_finish_is_the_same_instant_whatever_zone_now_is_in(
+    now: datetime,
+) -> None:
+    item = finish_of(unplanned_snapshot(now, 2))
+
+    assert item.expected_finish is not None
+    assert item.expected_finish.isoformat() == "2026-10-25T02:30:00+01:00"
+    assert item.expected_finish.tzinfo == ZONE
+
+
+@pytest.mark.parametrize(
+    ("ready", "reaches", "deadline"),
+    [
+        # the first 02:30 (00:30Z) is before the 01:30Z finish
+        (time(2, 30), False, "2026-10-25T02:30:00+02:00"),
+        # 03:00 is 02:00Z, after the 01:30Z finish (the old sum finishes at 02:30Z)
+        (time(3, 0), True, "2026-10-25T03:00:00+01:00"),
+    ],
+)
+def test_reaches_target_compares_instants_across_the_fold(
+    ready: time, reaches: bool, deadline: str
+) -> None:
+    now = datetime(2026, 10, 25, 1, 30, tzinfo=ZONE)  # 23:30Z
+    snapshot = snap(
+        [adj()],
+        sessions=[sess(ready=ready, need=7.36)],
+        prices=PriceSeries((), now - timedelta(hours=2)),
+        now=now,
+    )
+
+    item = finish_of(snapshot)
+
+    assert item.deadline is not None
+    assert item.deadline.isoformat() == deadline
+    assert item.expected_finish is not None
+    assert item.expected_finish.isoformat() == "2026-10-25T02:30:00+01:00"
+    assert item.reaches_target is reaches
+
+
+TRICKLE_NOW = datetime(2026, 10, 22, 1, 30, tzinfo=ZONE)
+
+
+def trickle_snapshot(row: str) -> Snapshot:
+    """A snapshot whose allocation is so small no calendar holds the finish."""
+    stale = PriceSeries((), TRICKLE_NOW - timedelta(hours=2))
+    if row == "huge-need":
+        return snap(
+            [adj()],
+            sessions=[sess(need=1e9)],
+            prices=stale,
+            now=TRICKLE_NOW,
+        )
+    if row == "need-beyond-timedelta":
+        return snap(
+            [adj()],
+            sessions=[sess(need=1e14)],
+            prices=stale,
+            now=TRICKLE_NOW,
+        )
+    if row == "fixed-1e-300":
+        return snap(
+            [fixed("a", level=1e-300)],
+            [idle("a", setting=0.0, paused=False)],
+            [sess(need=30.0)],
+            stale,
+            now=TRICKLE_NOW,
+        )
+    if row == "fixed-subnormal":
+        return snap(
+            [fixed("a", level=5e-324)],
+            [idle("a", setting=0.0, paused=False)],
+            [sess(need=30.0)],
+            stale,
+            now=TRICKLE_NOW,
+        )
+    assert row == "unavailable"
+    return snap(
+        [adj()],
+        [idle("a", setting=1e-300, paused=False, available=False)],
+        [sess(need=30.0)],
+        stale,
+        now=TRICKLE_NOW,
+    )
+
+
+TRICKLE_ROWS = [
+    "huge-need",
+    "need-beyond-timedelta",
+    "fixed-1e-300",
+    "fixed-subnormal",
+    "unavailable",
+]
+
+
+@pytest.mark.parametrize("row", TRICKLE_ROWS)
+def test_a_trickle_of_current_gives_no_finish_instead_of_overflowing(row: str) -> None:
+    item = by_id(decide(trickle_snapshot(row)))["a"]
+
+    assert item.allocation > 0
+    assert item.plan == ()
+    assert item.expected_finish is None
+    assert item.reaches_target is False
+
+
+@pytest.mark.parametrize("measured", [1e-6, 1e-9])
+def test_a_reserved_charger_with_a_tiny_measured_draw_gives_no_finish(
+    measured: float,
+) -> None:
+    state = ChargerState(
+        "a", True, 0.0, False, measured_power_w=measured, available=False
+    )
+    snapshot = snap(
+        [adj()],
+        [state],
+        [sess(need=10.0)],
+        PriceSeries((), TRICKLE_NOW - timedelta(hours=2)),
+        now=TRICKLE_NOW,
+    )
+
+    item = by_id(decide(snapshot))["a"]
+
+    assert 0 < item.allocation < 1e-3
+    assert item.expected_finish is None
+    assert item.reaches_target is False
+
+
+@pytest.mark.parametrize("row", ["fixed-1e-300", "unavailable"])
+def test_a_trickle_decision_survives_the_codec_round_trip(row: str) -> None:
+    decision = decide(trickle_snapshot(row))
+
+    data = json.loads(json.dumps(decision_to_dict(decision), allow_nan=False))
+
+    assert data["chargers"][0]["expected_finish"] is None
+    assert decision_from_dict(data) == decision
+
+
+# --- A1: no memory between calls -------------------------------------------------
+
+
+def test_a_decision_does_not_depend_on_the_snapshots_decided_before_it() -> None:
+    first_snapshot = snap(
+        [adj()], [idle(paused=True)], [sess(need=5.0)], hourly([0.1] * 12)
+    )
+    other = snap(
+        [adj()],
+        [idle(setting=16.0, paused=False)],
+        [now_session(need=5.0)],
+        PriceSeries((), NOW - timedelta(hours=2)),
+    )
+
+    first = decide(first_snapshot)
+    decide(other)
+    decide(other)
+    again = decide(first_snapshot)
+
+    assert again == first
+    assert decision_to_dict(again) == decision_to_dict(first)
+
+
+# --- T1: the public surface is round 1's ----------------------------------------
+
+ROUND_1_ALL = {
+    "Action",
+    "ActionKind",
+    "Charger",
+    "ChargerDecision",
+    "ChargerKind",
+    "ChargerState",
+    "ConfigError",
+    "Decision",
+    "Event",
+    "EventKind",
+    "Phase",
+    "PhaseAmps",
+    "PhaseCurrents",
+    "PlannedQuarter",
+    "PriceInterval",
+    "PriceSeries",
+    "Reason",
+    "ReasonCode",
+    "Session",
+    "Settings",
+    "Snapshot",
+    "Stage",
+    "Status",
+    "decide",
+    "decision_from_dict",
+    "decision_to_dict",
+    "snapshot_from_dict",
+    "snapshot_to_dict",
+}
+
+
+def test_the_package_exports_exactly_round_ones_names() -> None:
+    import energy_optimization.ev as ev
+
+    assert set(ev.__all__) == ROUND_1_ALL
+    assert len(ev.__all__) == len(ROUND_1_ALL)
+
+
+@pytest.mark.parametrize("module", ["guard", "regulation"])
+def test_the_round_two_modules_are_gone(module: str) -> None:
+    import energy_optimization.ev as ev
+
+    assert importlib.util.find_spec(f"energy_optimization.ev.{module}") is None
+    assert not hasattr(ev, module)
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [
+        ("model", "Memory"),
+        ("model", "ChargerMemory"),
+        ("model", "GuardLevel"),
+        ("model", "Reduction"),
+        ("codec", "memory_to_dict"),
+        ("codec", "memory_from_dict"),
+        ("result", "GuardLevel"),
+        ("allocation", "settling"),
+    ],
+)
+def test_the_round_two_names_are_gone(module: str, name: str) -> None:
+    loaded = importlib.import_module(f"energy_optimization.ev.{module}")
+
+    assert not hasattr(loaded, name)
+
+
+@pytest.mark.parametrize(
+    ("cls", "fields"),
+    [
+        (
+            Snapshot,
+            (
+                "now",
+                "settings",
+                "chargers",
+                "states",
+                "sessions",
+                "prices",
+                "phase_currents",
+            ),
+        ),
+        (
+            Settings,
+            (
+                "phase_budget",
+                "phase_threshold",
+                "fallback_current",
+                "timezone",
+                "voltage",
+                "min_block_quarters",
+                "price_cap",
+                "default_energy_need_kwh",
+                "max_price_age",
+                "max_measurement_age",
+            ),
+        ),
+        (Decision, ("actions", "chargers", "available", "status", "events")),
+        (
+            PlanRequest,
+            (
+                "charger_id",
+                "phases",
+                "min_current",
+                "max_current",
+                "need_kwh",
+                "deadline",
+            ),
+        ),
+    ],
+)
+def test_the_dataclass_fields_are_round_ones(
+    cls: type, fields: tuple[str, ...]
+) -> None:
+    assert tuple(f.name for f in dataclasses.fields(cls)) == fields
+
+
+@pytest.mark.parametrize(
+    ("function", "names"),
+    [
+        (
+            plan_sessions,
+            [
+                "requests",
+                "now",
+                "prices",
+                "capacity",
+                "voltage",
+                "min_block_quarters",
+                "price_cap",
+                "timezone",
+            ],
+        ),
+        (phase_capacity, ["snapshot", "fresh"]),
+    ],
+)
+def test_the_planner_and_capacity_signatures_are_round_ones(
+    function: object, names: list[str]
+) -> None:
+    parameters = inspect.signature(function).parameters  # type: ignore[arg-type]  # parametrized callables
+
+    assert list(parameters) == names
+    assert all(p.default is inspect.Parameter.empty for p in parameters.values())
+
+
+@pytest.mark.parametrize("enum", [ReasonCode, EventKind, Status])
+def test_the_enums_carry_no_round_two_members(enum: type[Enum]) -> None:
+    names = {member.name for member in enum}
+
+    assert not names & {
+        "MINIMUM_PAUSE",
+        "UNDER_USE",
+        "EMERGENCY",
+        "MEMORY_RESET",
+        "PHASE_GUARD_INTERVENED",
+    }
 
 
 def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:
