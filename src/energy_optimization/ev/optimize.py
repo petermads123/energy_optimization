@@ -88,7 +88,8 @@ class Demand:
         phases: The phases it is counted on.
         tier: Which precedence stage it belongs to.
         min_current: Lowest non-zero current in A; equal to `max_current` means
-            all-or-nothing (on/off).
+            all-or-nothing (on/off) at exactly this current, in every tier, even when
+            `now_max_current` is higher.
         max_current: Highest current in A in quarters after the first. Below
             `min_current` means off in those quarters.
         now_max_current: Highest current in A in the first quarter (user limit,
@@ -97,7 +98,8 @@ class Demand:
         deadline: The moment the energy is needed by, aware, `PLANNED` only.
 
     Raises:
-        ValueError: If a field is invalid; the message starts with the field name.
+        ValueError: If a field is invalid (including a `tier` that is not a `Tier`);
+            the message starts with the field name.
     """
 
     charger_id: str
@@ -111,6 +113,8 @@ class Demand:
 
     def __post_init__(self) -> None:
         """Validate the fields."""
+        if not isinstance(self.tier, Tier):
+            raise _bad("tier", f"must be a Tier, got {self.tier!r}")
         if not self.phases:
             raise _bad("phases", "must not be empty")
         for name in ("min_current", "max_current", "now_max_current", "need_kwh"):
@@ -214,7 +218,10 @@ class _Problem:
         message = str(result.message)
         solution = result.x
         nodes = getattr(result, "mip_node_count", 0) or 0
-        stopped = status == 4 and (nodes >= NODE_LIMIT or "Solution limit" in message)
+        # HiGHS reports a node-budget stop as status 4 with the node count at the limit
+        # (checked against the real solver for limits 1 to 50); any other status 4 is
+        # a failure.
+        stopped = status == 4 and nodes >= NODE_LIMIT
         at_budget = status == 1 or stopped
         if solution is None:
             raise SolverError(status, message)
@@ -483,7 +490,10 @@ def _even_now(demands: Sequence[Demand], room: Mapping[Phase, float], run: _Run)
     Like `_fit_now` it looks at the first quarter's capacity alone, as a bound.
     """
     small = _Problem(run)
-    cols = [small.var(d.min_current, _hi(d, True), True) for d in demands]
+    cols = [
+        small.var(d.min_current, _hi(d, True), d.min_current < _hi(d, True))
+        for d in demands
+    ]
     even = small.var(0, max((_hi(d, True) for d in demands), default=0.0), True)
     for phase in Phase:
         terms = [
@@ -504,12 +514,19 @@ def _on_now_and_even(
     now_room: Mapping[Phase, float],
     run: _Run,
 ) -> None:
-    """Run the second part of P5 and P6: cars on now, then an even first quarter."""
+    """Run the second part of P5 and P6: cars on now, then an even first quarter.
+
+    The cars on now are as many as possible, then the better-ranked ones among them.
+    """
     possible = [n for n, c in enumerate(columns) if c.x and _hi(demands[n], True) > 0]
     fits = _fit_now([demands[n] for n in possible], now_room, run) if possible else 0
     problem.minimise(
         {columns[n].x[0]: -1.0 for n in possible}, integral=True, floor=-float(fits)
     )
+    # Among the same number of cars on now, the better-ranked ones are on: in ranking
+    # order, each car is on if that is still possible after those ranked above it.
+    for n in possible:
+        problem.minimise({columns[n].x[0]: -1.0}, integral=True, floor=-1.0)
     solved = problem.solution()
     on_now = [n for n, c in enumerate(columns) if c.x and solved[c.x[0]] > 0.5]
     for n, c in enumerate(columns):
@@ -521,7 +538,7 @@ def _on_now_and_even(
         even = problem.var(0, ceiling, True)
         for n in on_now:
             problem.row([(even, 1.0), (columns[n].i[0], -1.0)], -math.inf, 0.0)
-        reached = min(round(solved[columns[n].i[0]]) for n in on_now)
+        reached = min(math.floor(solved[columns[n].i[0]] + _EPS) for n in on_now)
         if reached >= ceiling:
             problem.hold({even: -1.0}, -float(ceiling), integral=True)
         else:
@@ -555,7 +572,8 @@ def _stage_plan(
         for t in range(count):
             top = _hi(d, t == 0)
             x = problem.var(0, 1 if top > 0 else 0, True)
-            i = problem.var(0, top, True)
+            # An on/off demand is fixed to `min_current * x`, which need not be whole.
+            i = problem.var(0, top, d.min_current < d.max_current)
             problem.row([(i, 1.0), (x, -d.min_current)], 0.0, math.inf)
             problem.row([(i, 1.0), (x, -top)], -math.inf, 0.0)
             xs.append(x)
@@ -628,21 +646,40 @@ def _stage_plan(
         # Only a priced first quarter is worth being on in; an unpriced one is used
         # only when the need forces it, and then latest first (P7).
         _on_now_and_even(problem, demands, columns, now_room, run)
-    # P7: earlier priced quarters first, unpriced quarters latest first, better-ranked
-    # cars earlier.
+    # P7: earlier priced quarters first, unpriced quarters latest first, and the
+    # better-ranked car in the earlier quarter of either kind. A product weight is
+    # minimised by pairing its large factors with its small ones: for priced quarters
+    # the better-ranked car carries the larger rank factor (count - n) and so gets the
+    # smaller (t + 1); for unpriced ones the worse-ranked car carries the larger rank
+    # factor (n + 1) and so gets the smaller (total - t), the later quarter.
+    count = len(demands)
     weight: dict[int, float] = {}
     for n, c in enumerate(columns):
         for t, i in enumerate(c.i):
             if price_at(t) is None:
                 weight[i] = float((total - t) * (n + 1))
             else:
-                weight[i] = float((t + 1) * (n + 1))
-    problem.minimise(weight, integral=True)
+                weight[i] = float((t + 1) * (count - n))
+    whole = all(
+        d.min_current < d.max_current or float(d.min_current).is_integer()
+        for d in demands
+    )
+    problem.minimise(weight, integral=whole)
     solved = problem.solution()
     return {
-        d.charger_id: [float(round(solved[i])) for i in c.i]
+        d.charger_id: [
+            _read(d, t == 0, solved[x], solved[i])
+            for t, (x, i) in enumerate(zip(c.x, c.i, strict=True))
+        ]
         for d, c in zip(demands, columns, strict=True)
     }
+
+
+def _read(demand: Demand, first: bool, on: float, current: float) -> float:
+    """Read a solved current: whole amps, or exactly the on/off current when it is on."""
+    if demand.min_current < demand.max_current:
+        return float(round(current))
+    return _hi(demand, first) if on > 0.5 else 0.0
 
 
 def _current(demand: Demand, first: bool, value: float) -> float:
@@ -681,8 +718,10 @@ def optimize(
             quarter is unpriced.
         capacity: What the chargers may use per phase in the quarters after the first,
             before the `SMART_OFF` demands, which keep their first-quarter current
-            there. Negative values count as 0.
-        now_capacity: What they may use per phase in the first quarter.
+            there (so they are held to the smaller of `capacity` and `now_capacity`).
+            Negative values and absent phases count as 0.
+        now_capacity: What they may use per phase in the first quarter; negative
+            values and absent phases count as 0.
         voltage: Phase voltage in V.
         min_block_quarters: Minimum length of a run of quarters; shorter runs are
             avoided.
@@ -693,8 +732,14 @@ def optimize(
         The first-quarter current of every demand, a plan for every `PLANNED` demand
         and whether every level was solved to proven optimality.
 
+    With no demands it returns `Outcome({}, {}, True)` at once, before any of the
+    checks below.
+
     Raises:
-        SolverError: If HiGHS reports an error or finds no solution.
+        SolverError: If HiGHS reports an error or finds no solution in any level solve
+            (carrying its status and message), or if rounding leaves a current outside
+            its limits or a phase over its capacity (carrying status 0, the solver's
+            "optimal", with a message naming the charger or phase).
         ValueError: If `now` is naive or a charger id is repeated.
         ZoneInfoNotFoundError: If `timezone` is not a known zone.
     """
@@ -713,7 +758,15 @@ def optimize(
     allocation: dict[str, float] = {}
 
     for tier in (Tier.SMART_OFF, Tier.CHARGE_NOW):
-        stage = _stage_now(by_tier[tier], room, run)
+        # A smart-off charger keeps its first-quarter current in the later quarters, so
+        # it is held to the smaller of the two rooms.
+        stage = _stage_now(
+            by_tier[tier],
+            {p: min(room[p], later[p]) for p in Phase}
+            if tier is Tier.SMART_OFF
+            else room,
+            run,
+        )
         allocation.update(stage)
         for d in by_tier[tier]:
             _take(room, d, stage[d.charger_id])

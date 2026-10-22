@@ -529,6 +529,10 @@ def decide(snapshot: Snapshot) -> Decision:
         The ordered actions (every decrease and pause before every increase), a
         decision with reason per charger in snapshot order, the amps still
         available per phase, the overall status and the events.
+
+    Raises:
+        SolverError: If the optimiser fails (see `optimize.optimize`); no partial or
+            fallback decision is returned.
     """
     settings = snapshot.settings
     now = snapshot.now

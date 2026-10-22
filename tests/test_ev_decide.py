@@ -10,12 +10,15 @@ import random
 import subprocess
 import sys
 import time as clock
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta, timezone
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -39,6 +42,7 @@ from energy_optimization.ev import (
     Session,
     Settings,
     Snapshot,
+    SolverError,
     Stage,
     Status,
     decide,
@@ -47,6 +51,7 @@ from energy_optimization.ev import (
     snapshot_from_dict,
     snapshot_to_dict,
 )
+from energy_optimization.ev import optimize as optimize_module
 from energy_optimization.ev.allocation import phase_capacity
 from energy_optimization.ev.decide import main as showcase
 from energy_optimization.ev.optimize import Demand, optimize
@@ -3046,3 +3051,564 @@ def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> No
     showcase()
 
     assert "without measurements" in capsys.readouterr().out
+
+
+# --- step 5 (round 2): the planner through decide -----------------------------------
+
+
+def test_decide_plans_an_on_off_charger_with_a_fractional_current() -> None:
+    need = 2 * energy_per_quarter_kwh(7.5, 1, 230.0)
+
+    result = decide(
+        snap(
+            [pump("pump", assumed=7.5)],
+            sessions=[sess("pump", ready=time(23, 0), need=need)],
+            prices=hourly([1.0, 2.0]),
+        )
+    )
+
+    item = by_id(result)["pump"]
+    assert (item.allocation, item.priority) == (7.5, 2)
+    assert item.reason.code is ReasonCode.IN_PLAN
+    assert [(q.start.astimezone(UTC), q.current) for q in item.plan] == [
+        (NOW, 7.5),
+        (NOW + QUARTER, 7.5),
+    ]
+    assert EventKind.TARGET_UNREACHABLE not in kinds(result)
+    assert item.reaches_target is True
+
+
+def test_decide_a_long_fractional_on_off_need_is_planned_in_full() -> None:
+    result = decide(
+        snap(
+            [pump("pump", assumed=7.5)],
+            sessions=[sess("pump", need=5.0)],
+            prices=hourly([0.1] * 12),
+        )
+    )
+
+    item = by_id(result)["pump"]
+    assert item.plan != ()
+    assert all(q.current == 7.5 for q in item.plan)
+    assert item.reaches_target is True
+    assert item.reason.code is not ReasonCode.WAITING_FOR_CAPACITY
+    assert EventKind.TARGET_UNREACHABLE not in kinds(result)
+
+
+def test_decide_fallback_caps_only_the_first_planned_quarter() -> None:
+    result = decide(
+        snap(
+            [adj()],
+            sessions=[sess(ready=time(23, 0), need=2 * E16)],
+            prices=hourly([1.0, 2.0]),
+            currents=None,
+        )
+    )
+
+    item = by_id(result)["a"]
+    assert [q.current for q in item.plan] == [6.0, 16.0, 10.0]
+    assert (item.allocation, item.priority) == (6.0, 2)
+    assert item.reason.code is ReasonCode.IN_PLAN
+    assert item.reason.params["capped_by"] == "fallback"
+    assert result.status is Status.PHASE_DATA_STALE
+
+
+def test_decide_a_ready_time_inside_the_current_quarter_plans_that_quarter() -> None:
+    now = NOW + timedelta(minutes=5)
+
+    result = decide(
+        snap(
+            [adj()],
+            sessions=[sess(ready=time(22, 10), need=10.0)],
+            prices=hourly([1.0]),
+            now=now,
+        )
+    )
+
+    item = by_id(result)["a"]
+    assert (item.allocation, item.priority) == (16.0, 2)
+    assert [(q.start.astimezone(UTC), q.current) for q in item.plan] == [(NOW, 16.0)]
+    unreachable = [e for e in result.events if e.kind is EventKind.TARGET_UNREACHABLE]
+    assert unreachable[0].params["reachable_kwh"] == pytest.approx(E16)
+
+
+def test_decide_an_unpriced_current_quarter_waits_for_the_priced_hour() -> None:
+    prices = hourly([1.0], start=NOW + timedelta(hours=1), updated_at=NOW)
+
+    result = decide(
+        snap([adj()], sessions=[sess(ready=time(0, 0), need=2 * E16)], prices=prices)
+    )
+
+    item = by_id(result)["a"]
+    assert (item.allocation, item.priority) == (0.0, 4)
+    assert item.reason.code is ReasonCode.PLANNED_LATER
+    assert [(q.start, q.current) for q in item.plan] == [
+        (NOW.astimezone(ZONE) + timedelta(hours=1), 16.0),
+        (NOW.astimezone(ZONE) + timedelta(hours=1, minutes=15), 16.0),
+    ]
+    assert all(q.price == 1.0 for q in item.plan)
+
+
+def test_decide_a_fresh_but_empty_price_series_plans_the_latest_quarter() -> None:
+    result = decide(
+        snap(
+            [adj()],
+            sessions=[sess(ready=time(23, 0), need=E16)],
+            prices=PriceSeries((), NOW),
+        )
+    )
+
+    item = by_id(result)["a"]
+    assert (item.allocation, item.reason.code) == (0.0, ReasonCode.PLANNED_LATER)
+    assert [(q.start.astimezone(UTC), q.price, q.current) for q in item.plan] == [
+        (NOW + 3 * QUARTER, None, 16.0)
+    ]
+    assert result.status is Status.NORMAL
+    assert kinds(result) == []
+
+
+@pytest.mark.parametrize(("price", "event"), [(1.0, False), (1.01, True)])
+def test_decide_the_price_cap_event_starts_strictly_above_the_cap(
+    price: float, event: bool
+) -> None:
+    result = decide(
+        snap(
+            [adj()],
+            sessions=[sess(ready=time(22, 30), need=2 * E16)],
+            prices=hourly([price]),
+            price_cap=1.0,
+        )
+    )
+
+    assert by_id(result)["a"].allocation == 16.0
+    assert (EventKind.PRICE_CAP_EXCEEDED in kinds(result)) is event
+
+
+def test_decide_a_tiny_need_is_planned_in_the_ready_time_quarter() -> None:
+    # Pinned, not endorsed: with a minimum block of 2 a need below one minimum-current
+    # quarter is planned in the last quarter, which the model's levels rank above
+    # "earlier first". Listed for step 8.
+    result = decide(
+        snap(
+            [adj()],
+            sessions=[sess(ready=time(23, 0), need=0.001)],
+            prices=hourly([1.0]),
+        )
+    )
+
+    item = by_id(result)["a"]
+    assert (item.allocation, item.reason.code) == (0.0, ReasonCode.PLANNED_LATER)
+    assert [(q.start.astimezone(UTC), q.current) for q in item.plan] == [
+        (NOW + 3 * QUARTER, 6.0)
+    ]
+    assert item.expected_finish is not None
+    assert item.expected_finish.isoformat() == "2026-10-21T23:00:00+02:00"
+
+
+def test_decide_a_tiny_need_runs_now_when_the_minimum_block_is_one() -> None:
+    result = decide(
+        snap(
+            [adj()],
+            sessions=[sess(ready=time(23, 0), need=0.001)],
+            prices=hourly([1.0]),
+            min_block_quarters=1,
+        )
+    )
+
+    item = by_id(result)["a"]
+    assert (item.allocation, item.priority) == (6.0, 2)
+    assert [q.start.astimezone(UTC) for q in item.plan] == [NOW]
+
+
+def test_decide_a_planned_car_ranked_first_charges_first_on_equal_prices() -> None:
+    need = 10 * 0.0575
+    result = decide(
+        snap(
+            [adj("a"), adj("b")],
+            sessions=[
+                sess("a", ready=time(22, 45), need=need),
+                sess("b", ready=time(22, 45), need=need),
+            ],
+            prices=hourly([2.0, 1.0]),
+            budget=10.0,
+            threshold=60.0,
+            min_block_quarters=1,
+        )
+    )
+
+    first, second = by_id(result)["a"], by_id(result)["b"]
+    assert first.plan[0].start < second.plan[0].start
+
+
+def test_decide_a_planned_car_run_below_its_max_by_the_plan_is_normal() -> None:
+    result = decide(
+        snap(
+            [adj()],
+            sessions=[sess(ready=time(23, 0), need=E16 + 11 * 0.0575)],
+            prices=hourly([1.0]),
+            budget=25.0,
+            min_block_quarters=1,
+        )
+    )
+
+    item = by_id(result)["a"]
+    assert sorted((q.current for q in item.plan), reverse=True) == [16.0, 11.0]
+    assert "capped_by" not in item.reason.params
+    assert result.status is Status.NORMAL
+
+
+def test_decide_a_ready_time_inside_a_quarter_credits_the_whole_quarter() -> None:
+    # Pinned, not endorsed (listed for step 8): the quarter containing a mid-quarter
+    # ready time is planned and credited in full, so the plan is "reachable" while the
+    # expected finish (the end of that quarter) lies after the ready time.
+    result = decide(
+        snap(
+            [adj()],
+            sessions=[sess(ready=time(22, 10), need=E16)],
+            prices=hourly([1.0]),
+        )
+    )
+
+    item = by_id(result)["a"]
+    assert [q.start.astimezone(UTC) for q in item.plan] == [NOW]
+    assert EventKind.TARGET_UNREACHABLE not in kinds(result)
+    assert item.expected_finish is not None
+    assert item.expected_finish.astimezone(UTC) == NOW + QUARTER
+    assert item.reaches_target is False
+
+
+# --- step 5 (round 2): the solver's failure and node-budget paths (T6, T7) ---------
+
+
+def _stub_milp(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    message: str,
+    solution: object,
+    nodes: int,
+) -> None:
+    def stub(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            status=status, message=message, x=solution, mip_node_count=nodes
+        )
+
+    monkeypatch.setattr(optimize_module, "milp", stub)
+
+
+def _wrap_milp(
+    monkeypatch: pytest.MonkeyPatch,
+    rewrite: Callable[[int, SimpleNamespace], SimpleNamespace | None],
+) -> list[dict[str, object]]:
+    """Wrap the real `milp`; `rewrite(call number, real result)` may replace a result."""
+    real = optimize_module.milp
+    calls: list[dict[str, object]] = []
+
+    def wrapped(*args: object, **kwargs: object) -> SimpleNamespace:
+        # milp pops the keys it consumes from `options`, so record a copy first
+        calls.append(
+            {k: dict(v) if isinstance(v, dict) else v for k, v in kwargs.items()}
+        )
+        result = real(*args, **kwargs)
+        replaced = rewrite(len(calls), result)
+        return result if replaced is None else replaced
+
+    monkeypatch.setattr(optimize_module, "milp", wrapped)
+    return calls
+
+
+def _planned_snapshot() -> Snapshot:
+    return snap([adj("a")], sessions=[sess("a")], prices=hourly([0.1] * 12))
+
+
+@pytest.mark.parametrize(
+    ("status", "solution", "nodes", "message"),
+    [
+        (2, None, 0, "Problem is infeasible."),
+        (2, np.array([1.0]), 0, "Problem is infeasible."),
+        (3, None, 0, "The problem is unbounded."),
+        (4, np.array([1.0]), optimize_module.NODE_LIMIT - 1, "numerical difficulties"),
+        (4, None, optimize_module.NODE_LIMIT, "stopped without a point"),
+        (1, None, 0, "iteration limit reached"),
+    ],
+    ids=[
+        "infeasible",
+        "infeasible-with-a-point",
+        "unbounded",
+        "four-below-the-node-limit",
+        "four-without-a-point",
+        "one-without-a-point",
+    ],
+)
+def test_decide_raises_solver_error_for_every_failure_status(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    solution: object,
+    nodes: int,
+    message: str,
+) -> None:
+    _stub_milp(monkeypatch, status, message, solution, nodes)
+
+    with pytest.raises(SolverError) as caught:
+        decide(snap([adj("a")], sessions=[now_session("a")]))
+
+    assert caught.value.status == status
+    assert caught.value.message == message
+    assert str(caught.value) == f"HiGHS status {status}: {message}"
+
+
+def test_a_status_four_below_the_node_limit_raises_whatever_its_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = "The HiGHS status code was not recognized. (HiGHS Status 16: Solution limit reached)"
+    _stub_milp(monkeypatch, 4, message, np.array([1.0]), optimize_module.NODE_LIMIT - 1)
+
+    with pytest.raises(SolverError) as caught:
+        decide(snap([adj("a")], sessions=[now_session("a")]))
+
+    assert caught.value.status == 4
+
+
+def test_decide_raises_when_a_later_level_stops_without_a_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def rewrite(call: int, _result: SimpleNamespace) -> SimpleNamespace | None:
+        if call == 1:
+            return None
+        return SimpleNamespace(
+            status=4,
+            message="Solution limit reached",
+            x=None,
+            mip_node_count=optimize_module.NODE_LIMIT,
+        )
+
+    calls = _wrap_milp(monkeypatch, rewrite)
+
+    with pytest.raises(SolverError) as caught:
+        decide(_planned_snapshot())
+
+    assert caught.value.status == 4
+    assert len(calls) >= 2
+
+
+NODE_LIMIT_MESSAGE = "The HiGHS status code was not recognized. (HiGHS Status 16: Solution limit reached)"
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (4, NODE_LIMIT_MESSAGE),
+        (4, "a message without the usual words"),
+        (1, "Iteration or time limit reached"),
+    ],
+    ids=["real-message", "other-message", "status-one"],
+)
+def test_a_node_budget_stop_with_a_point_adds_the_not_proven_event_last(
+    monkeypatch: pytest.MonkeyPatch, status: int, message: str
+) -> None:
+    snapshot = snap(
+        [adj("a")], sessions=[sess("a")], prices=hourly([0.1] * 12), currents=None
+    )
+    baseline = decide(snapshot)
+
+    def rewrite(_call: int, result: SimpleNamespace) -> SimpleNamespace:
+        return SimpleNamespace(
+            status=status,
+            message=message,
+            x=result.x,
+            mip_node_count=optimize_module.NODE_LIMIT,
+        )
+
+    _wrap_milp(monkeypatch, rewrite)
+    stopped = decide(snapshot)
+
+    assert EventKind.PHASE_DATA_STALE in kinds(baseline)
+    assert stopped.chargers == baseline.chargers
+    assert stopped.actions == baseline.actions
+    assert stopped.status == baseline.status
+    assert stopped.available == baseline.available
+    assert len(stopped.events) == len(baseline.events) + 1
+    assert stopped.events[:-1] == baseline.events
+    last = stopped.events[-1]
+    assert last.kind is EventKind.PLAN_NOT_PROVEN_OPTIMAL
+    assert last.charger_id is None
+
+
+def test_a_not_proven_decision_round_trips_through_the_codec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def rewrite(_call: int, result: SimpleNamespace) -> SimpleNamespace:
+        return SimpleNamespace(
+            status=4,
+            message=NODE_LIMIT_MESSAGE,
+            x=result.x,
+            mip_node_count=optimize_module.NODE_LIMIT,
+        )
+
+    _wrap_milp(monkeypatch, rewrite)
+    decision = decide(_planned_snapshot())
+
+    data = json.loads(json.dumps(decision_to_dict(decision), allow_nan=False))
+
+    assert data["events"][-1]["kind"] == "plan_not_proven_optimal"
+    assert set(data) == {"actions", "chargers", "available", "status", "events"}
+    assert decision_from_dict(data) == decision
+
+
+def test_a_real_node_budget_stop_returns_a_plan_within_every_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With a budget of one node a level that needs branching stops at the budget. HiGHS
+    # then returns the point it has (not proven) or none (SolverError, status 4); both
+    # happen across these instances, and no decision ever breaks a limit.
+    monkeypatch.setattr(optimize_module, "NODE_LIMIT", 1)
+    not_proven = 0
+    raised = 0
+    for seed in range(1, 7):
+        snapshot = benchmark_snapshot(seed, 2, 16.0)
+        try:
+            result = decide(snapshot)
+        except SolverError as error:
+            assert error.status == 4
+            raised += 1
+            continue
+        assert_invariants(snapshot, result)
+        not_proven += EventKind.PLAN_NOT_PROVEN_OPTIMAL in kinds(result)
+    assert not_proven >= 1
+    assert raised >= 1
+
+
+def test_decide_never_passes_a_time_limit_and_runs_single_threaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _wrap_milp(monkeypatch, lambda _call, _result: None)
+
+    decide(benchmark_snapshot(1, 3, 35.0))
+
+    assert calls
+    for call in calls:
+        options = call["options"]
+        assert isinstance(options, dict)
+        assert "time_limit" not in options
+        assert options["node_limit"] == optimize_module.NODE_LIMIT
+        assert options["threads"] == 1
+        assert options["mip_rel_gap"] == 0.0
+
+
+def _permutation_snapshot(order: random.Random | None) -> Snapshot:
+    need = 6.0
+    chargers = [adj("a"), adj("b"), adj("c"), adj("d")]
+    sessions = [
+        sess("a", ready=time(23, 30), need=need),
+        sess("b", ready=time(23, 30), need=need),
+        now_session("c", need=need),
+        sess("d", need=0.0),
+    ]
+    states = [idle(c.id) for c in chargers]
+    if order is not None:
+        order.shuffle(chargers)
+        order.shuffle(sessions)
+        order.shuffle(states)
+    return snap(
+        chargers, states, sessions, hourly([0.3, 0.1, 0.2]), budget=25.0, threshold=60.0
+    )
+
+
+def _canonical(decision: Decision) -> tuple[object, ...]:
+    return (
+        sorted(by_id(decision).items()),
+        decision.actions,
+        decision.status,
+        decision.available,
+        sorted(decision.events, key=lambda e: (e.kind, e.charger_id or "")),
+    )
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_decide_is_equal_when_chargers_states_and_sessions_are_permuted(
+    seed: int,
+) -> None:
+    expected = decide(_permutation_snapshot(None))
+
+    permuted = decide(_permutation_snapshot(random.Random(seed)))
+
+    assert _canonical(permuted) == _canonical(expected)
+    assert {c.charger_id for c in permuted.chargers} == {"a", "b", "c", "d"}
+
+
+# --- step 5 (round 2): tiers and stale prices through decide (T4, T5) ----------------
+
+
+def test_a_spare_car_behind_a_planned_car_waits_for_higher_priority() -> None:
+    result = decide(
+        snap(
+            [adj("a"), adj("b")],
+            sessions=[
+                sess("a", ready=time(23, 0), need=E16),
+                sess("b", need=0.0),
+            ],
+            prices=hourly([1.0, 2.0]),
+            budget=16.0,
+            threshold=60.0,
+            min_block_quarters=1,
+        )
+    )
+
+    first, second = by_id(result)["a"], by_id(result)["b"]
+    assert (first.priority, first.allocation) == (2, 16.0)
+    assert (second.priority, second.allocation) == (3, 0.0)
+    assert second.reason.code is ReasonCode.WAITING_FOR_HIGHER_PRIORITY
+
+
+def test_a_spare_car_gets_current_when_the_planned_car_is_planned_later() -> None:
+    result = decide(
+        snap(
+            [adj("a"), adj("b")],
+            sessions=[
+                sess("a", ready=time(23, 30), need=E16),
+                sess("b", need=0.0),
+            ],
+            prices=hourly([2.0, 1.0]),
+            budget=16.0,
+            threshold=60.0,
+            min_block_quarters=1,
+        )
+    )
+
+    first, second = by_id(result)["a"], by_id(result)["b"]
+    assert (first.priority, first.allocation) == (4, 0.0)
+    assert first.reason.code is ReasonCode.PLANNED_LATER
+    assert (second.priority, second.allocation) == (3, 16.0)
+
+
+def test_a_spare_car_behind_a_reserved_charger_waits_for_capacity() -> None:
+    result = decide(
+        snap(
+            [fixed("f", level=16.0), adj("b")],
+            [idle("f", setting=16.0, paused=False), idle("b")],
+            [sess("b", need=0.0)],
+            budget=16.0,
+            threshold=60.0,
+        )
+    )
+
+    item = by_id(result)["b"]
+    assert item.allocation == 0.0
+    assert item.reason.code is ReasonCode.WAITING_FOR_CAPACITY
+
+
+def test_stale_prices_share_spare_capacity_evenly_with_no_plans() -> None:
+    result = decide(
+        snap(
+            [adj("a"), adj("b")],
+            sessions=[sess("a", need=10.0), sess("b", need=10.0)],
+            prices=PriceSeries((), NOW - timedelta(hours=2)),
+            budget=16.0,
+            threshold=60.0,
+        )
+    )
+
+    assert allocations(result) == {"a": 8.0, "b": 8.0}
+    assert [c.priority for c in result.chargers] == [3, 3]
+    assert all(c.plan == () for c in result.chargers)
+    assert result.status is Status.PRICES_STALE
+    assert kinds(result) == [EventKind.PRICES_STALE]
