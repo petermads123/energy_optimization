@@ -1,6 +1,6 @@
 # Stateless core
 
-<!-- claude-plan step=5 status=active -->
+<!-- claude-plan step=6 status=active -->
 
 | Field | Value |
 |---|---|
@@ -17,8 +17,8 @@
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | done |
-| 5 | Test | `/test` | in `/build` | in progress |
-| 6 | Concept check | `/concept-check` | in `/build` | pending |
+| 5 | Test | `/test` | in `/build` | done |
+| 6 | Concept check | `/concept-check` | in `/build` | pending (re-run after the A3 send-back) |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
 | 9 | Pull request | `/create-pr` | with the user | pending |
@@ -351,8 +351,8 @@ section deleted, AppDaemon entry rewritten. No test-file additions yet (T2-T5 ar
 | Intent | Test names | Result |
 |---|---|---|
 | T1 | `test_the_package_exports_exactly_round_ones_names`, `test_the_round_two_modules_are_gone`, `test_the_round_two_names_are_gone`, `test_the_dataclass_fields_are_round_ones`, `test_the_planner_and_capacity_signatures_are_round_ones`, `test_the_enums_carry_no_round_two_members` (all in `test_ev_decide.py`; the enum member sets are also pinned by the restored `test_ev_result.py`) | green |
-| T2 | the restored round-1 suite, unchanged expectations; `git diff 982a494 origin/main` on the other test files shows only memory-specific showcase assertions and memory/guard tests, nothing memory-free to port | green (1219 passed after the A6 round) |
-| T3 (and A6) | `test_a_planned_finish_adds_its_quarter_in_utc_on_the_fall_back_night` (2 rows, red before the fix), `test_an_unplanned_expected_finish_adds_the_hours_in_utc_across_dst` (5 rows), `test_the_unplanned_finish_off_a_wall_clock_now_matches_its_utc_instant`, `test_the_unplanned_finish_is_the_same_instant_whatever_zone_now_is_in` (3), `test_reaches_target_compares_instants_across_the_fold` (2), `test_a_trickle_of_current_gives_no_finish_instead_of_overflowing` (5), `test_a_reserved_charger_with_a_tiny_measured_draw_gives_no_finish` (2), `test_a_trickle_decision_survives_the_codec_round_trip` (2) | green; 17 of 212 tests in the file fail on a scratch copy of `982a494`, all of them these |
+| T2 | the restored round-1 suite, unchanged expectations; `git diff 982a494 origin/main` on the other test files shows only memory-specific showcase assertions and memory/guard tests, nothing memory-free to port | green (1221 passed after the A3 send-back round) |
+| T3 (and A6) | `test_a_planned_finish_adds_its_quarter_in_utc_on_the_fall_back_night` (2 rows, red before the fix), `test_a_planned_finish_at_the_spring_forward_gap_is_rendered_as_the_real_local_time` (1, added at the step-6 send-back), `test_an_unplanned_expected_finish_adds_the_hours_in_utc_across_dst` (6 rows, the sixth added at the step-6 send-back), `test_the_unplanned_finish_off_a_wall_clock_now_matches_its_utc_instant`, `test_the_unplanned_finish_is_the_same_instant_whatever_zone_now_is_in` (3), `test_reaches_target_compares_instants_across_the_fold` (2), `test_a_trickle_of_current_gives_no_finish_instead_of_overflowing` (5), `test_a_reserved_charger_with_a_tiny_measured_draw_gives_no_finish` (2), `test_a_trickle_decision_survives_the_codec_round_trip` (2) | green; 21 of 216 tests in the file fail on a scratch copy of `982a494`, all of them these (19 of 214 before the send-back, as step 6 counted, plus the 2 new rows) |
 | T4 | `test_snapshot_from_dict_rejects_memory_naming_the_field` (3), `test_snapshot_from_dict_rejects_each_round_2_setting` (16 rows, 15 keys), `test_snapshot_from_dict_names_the_top_level_key_before_a_nested_one`, `test_snapshot_from_dict_names_an_unknown_key_before_a_missing_one`, `test_decision_from_dict_rejects_round_2_keys` (6), `test_snapshot_to_dict_has_exactly_round_1_keys`, `test_decision_to_dict_has_exactly_round_1_keys`, `test_a_real_decisions_keys_are_round_1_too` (all in `test_ev_codec.py`) | green |
 | T5 | `assert_plans_fit` in the `decide` invariant oracle (UTC-keyed), plus the `reaches_target is None` iff `deadline is None` invariant; `test_plan_never_books_more_than_a_phase_holds_on_mixed_phases` in `test_ev_planning.py`; `test_plan_rejects_a_naive_deadline`, `test_plan_rejects_an_unknown_timezone`, `test_plan_with_no_requests_never_looks_at_a_naive_now` | green |
 | T6 | the restored determinism-across-hash-seeds and AST-scan tests, plus `test_a_decision_does_not_depend_on_the_snapshots_decided_before_it` (interleaved snapshots) | green |
@@ -382,6 +382,32 @@ non-`None` `expected_finish` has `expected_finish.astimezone(UTC) > plan[0].star
 The generated-snapshot property did not fail on the old code (hypothesis does not reach the
 fold with a plan ending there), so D1/D2 are what pin the defect; the invariant guards the
 rest.
+
+**Step-6 send-back (A3 pin gap), 2026-10-22.** Two rows added so every difference shape in
+the differential is pinned; production code untouched:
+
+- `test_a_planned_finish_at_the_spring_forward_gap_is_rendered_as_the_real_local_time`:
+  `now` 2026-03-28T22:00Z, 32 quarters at 0.30 with 00:30Z and 00:45Z at 0.01, need 1.84 kWh;
+  plan ends at the 01:00Z transition, expected finish `2026-03-29T03:00:00+02:00` via
+  `isoformat()` (old: the nonexistent `02:00:00+01:00`).
+- `test_an_unplanned_expected_finish_adds_the_hours_in_utc_across_dst`, new row
+  `now=2026-03-29T01:30 Europe/Copenhagen`, 0.5 h: finish is the transition,
+  `2026-03-29T03:00:00+02:00` (same instant as the old sum, which renders the nonexistent
+  `02:00:00+01:00`). The `hours` parameter is now typed `float`.
+
+Red on `982a494` (the repo's current `tests/test_ev_decide.py` against `982a494`'s `src`, scratch copy `redrun`):
+
+```
+FAILED tests/test_ev_decide.py::test_an_unplanned_expected_finish_adds_the_hours_in_utc_across_dst[now5-0.5-2026-03-29T03:00:00+02:00]
+E  AssertionError: assert '2026-03-29T02:00:00+01:00' == '2026-03-29T03:00:00+02:00'
+FAILED tests/test_ev_decide.py::test_a_planned_finish_at_the_spring_forward_gap_is_rendered_as_the_real_local_time
+E  AssertionError: assert '2026-03-29T02:00:00+01:00' == '2026-03-29T03:00:00+02:00'
+2 failed, 214 deselected        (whole file on 982a494: 21 failed, 195 passed)
+```
+
+Green on the current tree: `7 passed, 209 deselected` for the same `-k` selection (both new
+rows included); whole suite `1221 passed`, ruff, ruff format, mypy clean. The two earlier
+differential rows marked "not pinned" in section 6 are now pinned by these two tests.
 
 **A6 sweep** of `src/energy_optimization/ev/*.py` (every arithmetic, comparison, sort key
 and dict key on a datetime):

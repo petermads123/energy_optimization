@@ -2456,10 +2456,13 @@ def finish_of(snapshot: Snapshot) -> ChargerDecision:
         (datetime(2026, 3, 29, 1, 30, tzinfo=ZONE), 2, "2026-03-29T04:30:00+02:00"),
         # inside the gap, read with the pre-transition offset (01:30Z)
         (datetime(2026, 3, 29, 2, 30, tzinfo=ZONE), 2, "2026-03-29T05:30:00+02:00"),
+        # the finish is the transition itself (01:00Z); the same instant as the old
+        # wall-clock sum, which renders it as the nonexistent 02:00+01:00
+        (datetime(2026, 3, 29, 1, 30, tzinfo=ZONE), 0.5, "2026-03-29T03:00:00+02:00"),
     ],
 )
 def test_an_unplanned_expected_finish_adds_the_hours_in_utc_across_dst(
-    now: datetime, hours: int, expected: str
+    now: datetime, hours: float, expected: str
 ) -> None:
     item = finish_of(unplanned_snapshot(now, hours))
 
@@ -2581,6 +2584,42 @@ def test_a_planned_finish_adds_its_quarter_in_utc_on_the_fall_back_night(
     assert item.expected_finish.astimezone(UTC).isoformat() == finish_utc
     assert item.expected_finish.isoformat() == finish_local
     assert item.expected_finish.astimezone(UTC) > item.plan[0].start.astimezone(UTC)
+    assert item.reaches_target is True
+
+
+def test_a_planned_finish_at_the_spring_forward_gap_is_rendered_as_the_real_local_time() -> (
+    None
+):
+    now = datetime(2026, 3, 28, 22, 0, tzinfo=UTC)
+    cheap = (
+        datetime(2026, 3, 29, 0, 30, tzinfo=UTC),
+        datetime(2026, 3, 29, 0, 45, tzinfo=UTC),
+    )
+    intervals = tuple(
+        PriceInterval(
+            now + QUARTER * i,
+            now + QUARTER * (i + 1),
+            0.01 if (now + QUARTER * i) in cheap else 0.30,
+        )
+        for i in range(32)
+    )
+    snapshot = snap(
+        [adj()],
+        sessions=[sess(need=1.84)],
+        prices=PriceSeries(intervals, now),
+        now=now,
+    )
+
+    item = decide(snapshot).chargers[0]
+
+    assert [q.start.astimezone(UTC) for q in item.plan] == list(cheap)
+    # the plan ends at the 01:00Z transition; 02:00+01:00 does not exist that night
+    assert item.expected_finish is not None
+    assert (
+        item.expected_finish.astimezone(UTC).isoformat() == "2026-03-29T01:00:00+00:00"
+    )
+    assert item.expected_finish.isoformat() == "2026-03-29T03:00:00+02:00"
+    assert item.expected_finish.tzinfo == ZONE
     assert item.reaches_target is True
 
 
