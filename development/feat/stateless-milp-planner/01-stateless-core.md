@@ -85,7 +85,8 @@ Nothing outside the package and its docs.
   dependencies (round 1's stdlib-only rule is amended); the greedy code is removed with no
   fallback; on failure `decide` raises a `SolverError` and the caller handles it in HA;
   determinism via a node budget and a single thread; the 100 ms target becomes a stated
-  solve budget. Its criteria are confirmed at its own step 1.
+  solve budget; the solver works in UTC throughout and converts every input to it (A6's
+  rule, stated by the user at this round's step-5 halt). Its criteria are confirmed at its own step 1.
 - Commands in flight, waiting between commands, and any other timing — the caller's.
 - The example AppDaemon app.
 - Any new behaviour.
@@ -96,9 +97,10 @@ Nothing outside the package and its docs.
 |---|---|
 | A1 | **Is stateless.** `decide` depends only on its snapshot; the public types and signatures are exactly `feat/ev-charging-core` round 1's (section 2 of `01-decision-core.md`, in its original round-1 form), and no memory type, round-2 setting or round-2 enum member remains. |
 | A2 | **Removes round 2 cleanly.** `guard.py`, `regulation.py` and their tests are deleted; the round-2 parameters on `phase_capacity` (`settling`), `plan_sessions` (`first`) and `PlanRequest` (`skip_current`) are gone; `STRUCTURE.md` and the `ev` exports match the code. |
-| A3 | **Behaves like round 1.** A differential against `feat/ev-charging-core` round 1's `decide` (commit `982a494`) over generated snapshots gives equal decisions, except where a round-2 bug fix in shared code applies — each such difference listed with the test that pins it. |
+| A3 | **Behaves like round 1.** A differential against `feat/ev-charging-core` round 1's `decide` (commit `982a494`) over generated snapshots gives equal decisions, except where a round-2 bug fix in shared code applies, or where A6 corrects time arithmetic round 1 did on a zone-aware datetime — each such difference listed with the test that pins it. |
 | A4 | **Keeps every round-1 guarantee.** `feat/ev-charging-core` round 1's criteria A1–A10 all hold; the round-1 suite passes with its warm-memory helper removed and no expected value changed. |
 | A5 | **Has a round-1-shaped codec.** Snapshot and decision dicts carry exactly round 1's keys; a dict with `memory` or a round-2 setting is rejected with a `ConfigError` naming that field. |
+| A6 | **Does its time arithmetic in UTC.** Every aware datetime the core receives is converted to UTC before it is added to, subtracted from or compared; no arithmetic is done on a datetime carrying a `ZoneInfo`. Output datetimes are still presented in the settings timezone, as in round 1. Proven across both 2026 Copenhagen DST nights, including an expected finish from a plan ending in or at the repeated hour (added at the step-5 halt, 2026-10-22). |
 
 ### Open questions
 
@@ -481,3 +483,11 @@ Question for the user: widen A3 to also allow this one-line fix,
 `(quarter.start.astimezone(UTC) + QUARTER).astimezone(ctx.zone)`, with the two reproduction
 cases added as tests (red on the current code, green after), or leave it as it is and note
 it in `DEVELOPMENT.md` for a later `/fix`?
+
+**Answer (user, 2026-10-22):** "yes, in general the solver should use UTC, and convert any
+input to this". Section 1 amended: A3 now also allows the A6 corrections, and a new A6
+requires all time arithmetic in UTC with every aware input converted first (outputs still in
+the settings timezone). Round 2's out-of-scope entry carries the same rule into the solver.
+Step 5 resumes: apply the planned-branch fix, add D1/D2 as tests red before and green after,
+restore the skipped `expected_finish > plan[0].start` invariant, and sweep the package for
+any other arithmetic or comparison on a zone-aware datetime.
