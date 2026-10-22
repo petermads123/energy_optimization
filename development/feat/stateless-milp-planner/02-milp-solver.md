@@ -16,7 +16,7 @@
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
-| 3 | Implement | `/implement` | in `/build` | in progress (halted at guide item 8) |
+| 3 | Implement | `/implement` | in `/build` | in progress (halted again at guide item 8, tight-budget tier) |
 | 4 | Verify | `/verify` | in `/build` | pending |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
@@ -612,6 +612,41 @@ P1 0.7 s, P3 2.0 s, P4 2.2 s, P5 4.4 s, P5b 1.8 s, P6 2.4 s, P7 5.2 s. Risk 1's 
 spent: skipping empty levels (item 3 above), the aggregated block constraint (item 2), and a
 lower `NODE_LIMIT` (above).
 
+**Re-run after the A5 amendment (guide item 8, second run).** Benchmark as in `bench.py`
+(10, 7 or 3 adjustable 6 to 16 A chargers on mixed phases, 40-hour hourly series with an
+unpriced tail, `min_block_quarters = 4`, `price_cap = 0.45`, 5 fixed seeds 1 to 5; 4 cores,
+HiGHS on one thread; whole `decide` call). Two budgets: 32 A per phase (the one the first halt
+measured) and 20 A per phase ("tight budget" in the plan's worst case).
+
+| Budget, NODE_LIMIT | 3 chargers (10 s) | 7 chargers (60 s) | 10 chargers (120 s) |
+|---|---|---|---|
+| 32 A, 4000 | 0.61 0.20 0.47 0.89 1.51 s | 5.07 9.92 3.96 5.15 8.27 s | 10.3 6.7 18.9 19.7 16.4 s |
+| 32 A, 64000 (10 only, 8 seeds) | | | 10.2 5.8 20.0 18.6 16.8 12.5 12.9 19.7 s, worst 20.0 s |
+| 32 A, 1024000 (10 only, 8 seeds) | | | 10.4 6.3 20.9 20.0 16.2 12.0 11.9 21.0 s, worst 21.0 s |
+| 20 A, 4000 | | | seed 1 108.3 s, seed 2 32.3 s, seed 3 **151.3 s** (SolverError before the fix below) |
+| 20 A, 2000 | 1.11 0.26 0.96 3.94 1.98 s | 66.1 25.5 **>100** 8.6 32.9 s | 88.6 31.3 106.9 37.8 32.9 s |
+| 20 A, 1000 | | 62.5 23.6 **176.1** 9.1 22.2 s | 74.0 26.8 84.7 36.3 26.3 s |
+
+At 32 A every tier passes with a wide margin at any node limit (the node budget never binds:
+every solve is proven at the root or within a few nodes). At 20 A it does bind, and
+`NODE_LIMIT = 1000`, the smallest multiple the rule allows, is still too slow for the
+7-charger tier: seed 1 takes 62.5 s and seed 3 176.1 s against 60 s. The 10-charger tier
+passes at 1000 (worst 84.7 s) and at 2000 (worst 106.9 s) but fails at 4000. So under the
+plan's rule `NODE_LIMIT` would be 2000 for the 10-charger tier and no value for the 7-charger
+tier at 20 A. `NODE_LIMIT` is left at 1000 in the code, provisional. The 3-charger tier passes
+everywhere. At 26 A the 7-charger seeds 1 and 3 take 13.5 s and 4.7 s.
+
+**Deviation 7: a node-limit stop with no point of its own is not an error.** At 20 A, HiGHS
+sometimes stops at the node budget in a later level without any solution at all
+(`status 4`, `x = None`, `mip_node_count = None`, message "Solution limit reached"), which
+raised `SolverError`. The last solution already satisfies every row held so far, so the
+level now keeps it: `_Problem.minimise` holds the level at that solution's objective, marks
+the run not proven (the `PLAN_NOT_PROVEN_OPTIMAL` event) and goes on. The first solve of a
+run, which has no earlier solution, still raises `SolverError` (A6). `status 4` is read as a
+node-budget stop when `mip_node_count >= NODE_LIMIT` or the message says "Solution limit".
+This is a reading of A5 ("a solve stopped by the node budget returns its best plan") against
+A6 ("finds no solution") that the concept does not spell out; flagged for step 6.
+
 ## 4. Verification log
 
 > Written in step 4: the static half. Command output, not a summary of it.
@@ -750,3 +785,26 @@ step 3 at item 7.
 7 and 8, T6 and Risk 1 follow (Risk 1's halt now applies to a tier bound). The model and the
 lexicographic order stay as built. `/build` resumes step 3 at guide item 7, after re-running
 the benchmark at 3, 7 and 10 chargers to fix `NODE_LIMIT`.
+
+### Step 3, second run, 2026-10-22
+
+Halted at guide item 8 under Risk 1, now for a tier: with the tight budget of the plan's worst
+case (20 A per phase on all three phases, 7 chargers) `decide` takes 62.5 s on seed 1 and
+176.1 s on seed 3 against the 60 s bound, at the smallest allowed `NODE_LIMIT` (1000); larger
+limits are slower (66 s, over 100 s at 2000). The 3-charger tier (worst 3.9 s) and the
+10-charger tier (worst 84.7 s at 1000) pass, and at 32 A, the budget the first halt measured
+and the user's bounds were set from, all three tiers pass by a wide margin (1.5 s, 9.9 s,
+21 s at any node limit). The cost at 20 A is the same as before: root work of seven exact
+planning solves, now with the budget cutting some of them off. The wall-clock limit that would
+bound it is forbidden by A5.
+
+Question for the user: which budget defines "tight" in A5's worst case?
+
+1. **32 A per phase** (the benchmark the bounds were chosen from). All tiers pass with any
+   `NODE_LIMIT`; the build would set it to 1000 and note that tighter budgets than this are
+   not covered by the bound.
+2. **20 A per phase, with the 7-charger bound raised** to about 180 s (176.1 s measured).
+3. **20 A, with a stricter model for many chargers** (a new plan: drop the exact order for the
+   last planning levels, as option 3 of the first halt).
+
+What exists is committed. Tests (item 7), `STRUCTURE.md` and `README.md` (item 9) are not done.

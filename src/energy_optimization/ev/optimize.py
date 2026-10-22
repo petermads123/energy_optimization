@@ -30,7 +30,7 @@ from .planning import SessionPlan, energy_per_quarter_kwh
 from .quarters import floor_to_quarter, quarter_starts
 from .result import PlannedQuarter
 
-NODE_LIMIT = 4000
+NODE_LIMIT = 1000
 """Branch-and-bound nodes allowed per level solve."""
 
 _TOLERANCE = 1e-6
@@ -145,6 +145,10 @@ class _Run:
     message: str = ""
 
 
+class _NoIncumbentError(Exception):
+    """The node budget ended before HiGHS found a point; the last solution stands."""
+
+
 class _Problem:
     """A growing mixed-integer program that is minimised level by level."""
 
@@ -213,11 +217,17 @@ class _Problem:
         status = int(result.status)
         message = str(result.message)
         solution = result.x
+        nodes = getattr(result, "mip_node_count", 0) or 0
+        stopped = status == 4 and (nodes >= NODE_LIMIT or "Solution limit" in message)
+        at_budget = status == 1 or stopped
         if solution is None:
+            if at_budget and self.x is not None:
+                # The budget ran out before HiGHS found a point of its own, but the
+                # last solution satisfies every row held so far: it is the best known.
+                self._run.proven = False
+                raise _NoIncumbentError
             raise SolverError(status, message)
         if status != 0:
-            nodes = getattr(result, "mip_node_count", 0)
-            at_budget = status == 1 or (status == 4 and nodes >= NODE_LIMIT)
             if not at_budget:
                 raise SolverError(status, message)
             self._run.proven = False
@@ -248,6 +258,7 @@ class _Problem:
         *,
         integral: bool = False,
         floor: float | None = None,
+        known: float | None = None,
     ) -> bool:
         """Minimise one level, then hold it at its optimum.
 
@@ -256,6 +267,8 @@ class _Problem:
             integral: Whether the objective can only take whole values.
             floor: A lower bound on the objective. When the last solution already
                 reaches it, the level is held without a solve.
+            known: The objective of the last solution, when it cannot be read from it
+                (columns added since). Used if the node budget ends without a point.
 
         Returns:
             False when the level has no non-zero coefficient and was skipped.
@@ -271,7 +284,14 @@ class _Problem:
             if known <= floor + _EPS:
                 self.hold(objective, known, integral)
                 return True
-        solution = self._solve(vector)
+        try:
+            solution = self._solve(vector)
+        except _NoIncumbentError:
+            assert self.x is not None
+            if known is None:
+                known = float(vector[: len(self.x)] @ self.x[: len(vector)])
+            self.hold(objective, known, integral)
+            return True
         self.hold(objective, float(vector @ solution), integral)
         return True
 
@@ -575,7 +595,8 @@ def _stage_plan(
         if _short_runs(problem.solution(), columns, min_block_quarters) == 0:
             problem.hold(penalty, 0.0, integral=True)
         else:
-            problem.minimise(penalty, integral=True)
+            shorts = _short_runs(problem.solution(), columns, min_block_quarters)
+            problem.minimise(penalty, integral=True, known=float(shorts))
     # P5: lowest price; then as many cars as possible on now.
     problem.minimise(
         {
