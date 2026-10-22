@@ -26,6 +26,9 @@ dev = [
   "pytest>=9.1,<10",
   "ruff>=0.16,<0.17",
   "mypy>=2.3,<3",
+  "hypothesis>=6.170,<7",
+  # tzdata gives zoneinfo its timezone database on Windows.
+  "tzdata>=2026.5",
 ]
 
 [tool.setuptools.packages.find]
