@@ -1,6 +1,6 @@
 # MILP solver
 
-<!-- claude-plan step=7 status=active -->
+<!-- claude-plan step=8 status=active -->
 
 
 | Field | Value |
@@ -20,7 +20,7 @@
 | 4 | Verify | `/verify` | in `/build` | done (re-run after the second step-6 halt) |
 | 5 | Test | `/test` | in `/build` | done (re-run after the second step-6 halt) |
 | 6 | Concept check | `/concept-check` | in `/build` | done (third run: A1 to A8 met) |
-| 7 | Ship | `/ship` | in `/build` | pending |
+| 7 | Ship | `/ship` | in `/build` | done |
 | 8 | Recommend | `/recommend` | with the user | pending |
 | 9 | Pull request | `/create-pr` | with the user | pending |
 | 10 | Review | `/watch-pr` | on the pull request | pending |
@@ -1488,8 +1488,47 @@ Drift found, and what was done about it:
 
 | Field | Value |
 |---|---|
-| Commits | |
-| Pushed to | |
+| Commits | 5a2e408..HEAD, 34 commits before this one (listed below), plus the closing `Ship: MILP solver` commit |
+| Pushed to | `origin/feat/stateless-milp-planner` |
+
+Whole-tree gates at ship: `ruff check .` clean, `ruff format --check .` 57 files formatted, `mypy` no issues in 26 source files, `pytest` 1525 passed in 150 s; all eight `python -m energy_optimization.ev.<module>` showcases exit 0 with no HiGHS console output (only the expected re-export `RuntimeWarning`). Review of the diff: no scratch files, no stray prints (only showcase `print`s), no WIP or TODO text in `src/`, `STRUCTURE.md` or docs, one active plan marker. Every step 3 to 6 left commits naming the round file.
+
+Round commits:
+
+- 5bf6973 Concept: MILP solver
+- 6cbdb34 Plan: MILP solver
+- 89ba173 Plan: MILP solver, reviewed and accepted
+- b38c800 WIP step 3: numpy and scipy runtime dependencies
+- e762601 WIP step 3: optimize.py, the lexicographic MILP
+- 666abd3 WIP step 3: decide.py wired to the optimiser, greedy planning and sharing removed
+- 560dea6 WIP step 3: halt at the A5 benchmark, optimiser tuned, notes and Halted section
+- dd4b0aa Halt answered at step 3: A5 bound tiered by charger count
+- beefefb WIP step 3: node-budget stop keeps the last solution, tiered benchmark, halt at tight budget
+- 94a7a2e Halt answered at step 3: worst-case budgets per charger count; later-level stop raises
+- 150234f WIP step 3: revert catch-and-hold, benchmark grid, NODE_LIMIT, tests, STRUCTURE.md
+- bfa1f94 WIP step 4: verify MILP solver round
+- 5b64ce3 WIP step 5: fix fractional on/off plans, P7 direction, smart-off capacity, tier check; decide-level tests
+- 92b4a00 Test: MILP solver
+- 7a8a99c WIP step 6: concept check halts on A3, presolve defect found
+- 79d1586 WIP step 6: record the green suite
+- a07e9f8 Halt answered at step 6: full even split for the planned tier; presolve back on
+- a2966d7 WIP step 3: reproductions for P5/P6 evenness and presolve, red
+- 22538f9 WIP step 3: full progressive fill for the planned tier, presolve on
+- e53aee4 Step 3: full even split for the planned tier, presolve on, grid re-timed
+- d125a99 WIP step 4: re-run verify after the step-6 halt
+- ff02e5f WIP step 4: correct the pytest count note
+- d7c8e77 WIP step 5: kWh-held unpriced first quarter, exact price-tick hold, rounded fill tests
+- c706f80 WIP step 5: whole-amp minimum on adjustable demands, probe and noise tests, decide-level fill tests
+- 43a8817 Test: MILP solver re-run, planned tier fill, kWh and exact price hold
+- dd5f3cf WIP step 6: second concept check halts on A3 remainder and A6 spurious infeasible
+- 53f8be2 Halt answered at step 6 (second run): share remainder 1 A to lowest; retry with presolve toggled
+- 5808d8a WIP step 3: reproductions, red (share remainder, presolve retry)
+- 9eeef20 WIP step 3: share remainder one amp at a time, presolve retry
+- 624a74e WIP step 3: record deviations 23 and 24, #78 cause, re-timed grid
+- fed13f7 WIP step 4: verify round 2 after the second step-6 halt
+- 8706ba1 WIP step 5: retry, one-amp remainder and tolerance tests; retry docs aligned
+- 26351d2 Test: MILP solver, round 2, third step-5 run (retry, one-amp remainder, tolerance)
+- 70ca309 Concept check: MILP solver, round 2, third run (A1 to A8 met)
 
 ---
 
