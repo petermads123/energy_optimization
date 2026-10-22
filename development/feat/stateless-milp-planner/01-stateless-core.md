@@ -1,6 +1,6 @@
 # Stateless core
 
-<!-- claude-plan step=2 status=active -->
+<!-- claude-plan step=3 status=active -->
 
 | Field | Value |
 |---|---|
@@ -14,7 +14,7 @@
 | # | Step | Skill | Runs | Status |
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
-| 2 | Plan | `/plan` | with the user | pending |
+| 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | pending |
 | 4 | Verify | `/verify` | in `/build` | pending |
 | 5 | Test | `/test` | in `/build` | pending |
@@ -200,6 +200,13 @@ Removed, each with A1/A2 behind it:
    `git rm` `src/energy_optimization/ev/guard.py`, `src/energy_optimization/ev/regulation.py`,
    `tests/test_ev_guard.py`, `tests/test_ev_regulation.py` (the checkout does not delete
    files that did not exist at `982a494`).
+   **Mechanical check, recorded in section 3:** `git diff origin/main --
+   src/energy_optimization/ev/{model,result,allocation,quarters,__init__}.py` must contain
+   only `-` lines (round-2 additions removed). Any `+` line is a round-2 edit to round-1
+   code: classify it in section 3 as a round-1 fix to port (A3 allows listed fixes) or as
+   round-2 behaviour. For `codec.py` the only expected `+` lines are the `price_cap`
+   nullable branch (round 1's form) and the memory/settings decoders; anything else is
+   classified the same way.
 2. Re-apply the fix in `decide.py`'s `_expected_finish`, unplanned branch: compute in UTC
    (`ctx.now.astimezone(UTC) + timedelta(hours=hours)`, then `.astimezone(ctx.zone)`) and
    return `None` on `OverflowError`, with a one-line comment, exactly as on `main`.
@@ -211,21 +218,31 @@ Removed, each with A1/A2 behind it:
    keep everything else in the file (hooks, `.claude/`, plans) as on `main`. Mention the
    expected-finish fix in the `decide.py` entry and any ported tests in their test-file
    entries.
-5. `DEVELOPMENT.md` is step 8's to clean; leave it.
+5. `DEVELOPMENT.md` (section 1 lists it as changed): delete the whole
+   "`feat/ev-charging-core` round 2 notes" section — every bullet is about a mechanism this
+   round removes — and rewrite the last two sentences of "Example AppDaemon app and HA usage
+   guide": the core is stateless, so the app calls it on its own schedule and owns timing,
+   waiting between commands, regulation to the setpoint and anti-flapping.
 
 ### Test intents
 
 | # | Must prove | Covers |
 |---|---|---|
 | T1 | The public surface equals round 1's: `ev.__all__` is exactly round 1's set; `guard` and `regulation` are not importable from `energy_optimization.ev`; `Snapshot`, `Settings`, `Decision`, `PlanRequest` have exactly round 1's fields; `plan_sessions` and `phase_capacity` have round 1's parameters; the enum member sets are round 1's (the restored `tests/test_ev_result.py` already pins those) | A1, A2 |
-| T2 | The restored round-1 suite passes with no expected value changed — the only edits to restored test files are additions | A4 |
-| T3 | Expected finish without a plan: correct across both 2026 Copenhagen DST nights (the finish instant is `now + need/(V·A·n)` in UTC), and `None` — not an exception — for a trickle of current that no calendar can hold | A3 |
-| T4 | `snapshot_from_dict` rejects a `memory` key, a top-level `guard_level`/`next_check` in a decision dict, and each of the 15 round-2 settings keys, with a `ConfigError` whose field is the dotted path (`memory`, `settings.min_pause`, …) | A5 |
+| T2 | The restored round-1 suite passes with no expected value changed — the only edits to restored test files are additions. Step 5 also checks `git diff 982a494 origin/main -- tests/test_ev_{model,result,quarters,planning,allocation,codec}.py` for round-2 strengthenings of round-1 tests that need no memory (e.g. the stronger showcase assertions) and ports those that still apply, as additions | A4 |
+| T3 | **New tests** (none exists on `main`): expected finish without a plan, with `now` built as `datetime(..., tzinfo=ZoneInfo("Europe/Copenhagen"))` either side of both 2026 transitions and stale prices so the allocation is the finish source — expected `(now.astimezone(UTC) + timedelta(hours=need·1000/(V·A·n))).astimezone(zone)`; and `None`, not an exception, for a trickle no calendar can hold (a huge `energy_need_kwh`, or a reserved charger with a tiny measured draw). Both must be red on `982a494` (shown in step 6's probe) | A3 |
+| T4 | `snapshot_from_dict` rejects `memory` (including `"memory": null`) with field `memory`, and each of the 15 round-2 settings keys with `settings.<name>`; `decision_from_dict` rejects `memory`, `guard_level` and `next_check` with that key as the field; and the key sets of `snapshot_to_dict(...)`, its `settings` and `decision_to_dict(...)` equal literal round-1 sets | A5 |
 | T5 | The round-1 `hypothesis` invariants still hold, now also checking (ported from round 2, memory-free) that no plan books more than a phase holds in any quarter | A4 |
 | T6 | Determinism and the standard-library-only AST scan still pass (round 1's T18) | A1, A4 |
 
-The differential against `982a494`'s `decide` (A3) is step 6's probe, run from a scratch
-copy outside the repo, not a test: the old code cannot live in the tree.
+Two differentials are step 6's probes, run from scratch copies outside the repo, not tests:
+(1) the restored `decide` against `982a494`'s — equal except the expected-finish fix
+(where `982a494` raises `OverflowError` and the new code returns `None`, that is the
+listed difference, not a crashed probe); (2) the restored `decide` against `origin/main`'s,
+run where round 2's rules do nothing (blank warm memory, no emergency threshold, readings
+below `phase_threshold − yellow_margin` or stale, no charger memory entries) — every
+difference other than round-2 output fields is classified, which is what catches a round-1
+fix the survey missed.
 
 **Coverage check.** A1 → removed-API table, T1, T6. A2 → modules table, T1. A3 → the fix,
 T3, step 6 differential. A4 → T2, T5, T6. A5 → restored codec, T4. Nothing is added to the
@@ -236,17 +253,40 @@ public API, so nothing lacks a criterion.
 1. **The restore picks up a round-1 test that round 2 had corrected.** If a restored test
    fails on the restored code, the code at `982a494` was green, so the failure is in the
    one re-applied fix or the environment: fix that, do not edit the restored expectation. If
-   a restored expectation conflicts with the fix itself (expected finish), the test changes
-   to the fixed value and is named in section 3.
+   a restored expectation conflicts with the fix itself (expected finish), the build halts
+   and asks; it does not edit the restored expectation (A4). Unlikely: the round-1 no-plan
+   finish tests use a UTC `now` away from DST.
 2. **`STRUCTURE.md` drift.** The stop gate's file check catches a deleted module still
    listed; the `structure-auditor` before steps 4 and 6 catches the rest.
-3. **Round 2 fixed something in shared code that this survey missed.** The step-6
-   differential shows it as an unexplained difference. If the difference is a round-1
+3. **Round 2 fixed something in shared code that this survey missed.** Step 3's
+   mechanical diff check and step 6's second differential (against `origin/main`) show it. If the difference is a round-1
    defect round 2 fixed, port that fix too and list it (A3 allows listed fixes); if it is
    round-2 behaviour, the restore is right as it is.
 4. **The pinned old plan table.** `01-decision-core.md`'s Public API table shows round-2
    signatures (updated at the last branch's step 9). Step 4 compares against `982a494`'s
    code, not that table, and does not edit the old plan file.
+
+### Critique
+
+The `plan-critic` read section 1, then this section, round 2's records and the code on
+`main` (it had no shell, so it checked the survey against round 2's own step-5 findings,
+its T14 differential and the reflog); verdict "accept with changes". All six applied:
+
+1. *Risk 3's net can't catch a missed fix — the step-6 differential only compares round 1
+   with round 1.* **Applied:** a mechanical `-`-lines-only diff check at guide 1, and a
+   second differential against `origin/main` where round 2's rules do nothing.
+2. *`DEVELOPMENT.md` drifts from section 1.* **Applied:** guide 5 deletes the round-2
+   notes and rewrites the AppDaemon entry.
+3. *Risk 1's fallback (edit the expectation) amends A4.* **Applied:** halt instead.
+4. *T3 can't fail on `982a494` unless `now` is ZoneInfo-aware; no such regression tests
+   exist to port.* **Applied:** T3 now specifies new tests with a Copenhagen `now` and stale
+   prices, red on `982a494`.
+5. *T4 misplaces the decision keys, misses `memory: null` and A5's first half.*
+   **Applied.**
+6. *Round 2's stronger showcase assertions would be lost.* **Applied:** T2 ports memory-free
+   strengthenings.
+
+Coverage unchanged: no public API added; every criterion still has a test intent.
 
 ---
 
