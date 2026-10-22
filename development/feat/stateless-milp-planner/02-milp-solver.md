@@ -1,6 +1,6 @@
 # MILP solver
 
-<!-- claude-plan step=6 status=active -->
+<!-- claude-plan step=7 status=active -->
 
 
 | Field | Value |
@@ -19,7 +19,7 @@
 | 3 | Implement | `/implement` | in `/build` | done (re-run after the second step-6 halt) |
 | 4 | Verify | `/verify` | in `/build` | done (re-run after the second step-6 halt) |
 | 5 | Test | `/test` | in `/build` | done (re-run after the second step-6 halt) |
-| 6 | Concept check | `/concept-check` | in `/build` | pending (re-run) |
+| 6 | Concept check | `/concept-check` | in `/build` | done (third run: A1 to A8 met) |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
 | 9 | Pull request | `/create-pr` | with the user | pending |
@@ -1370,126 +1370,113 @@ Edge cases considered and deliberately skipped, with reasons:
 > Written in step 6, against section 1 — not against section 2. The question is whether
 > the thing built is the thing agreed, not whether it matches the plan.
 
-**Second run (after the step-6 halt of 2026-10-22). Result: A3 and A6 are unmet again and
-the build halts (see Halted, "Step 6, second run").** A1, A2, A4, A5 and A7 are met.
+**Third run (after the second step-6 halt of 2026-10-22 and the answers recorded under
+Halted). Result: A1 to A8 are all met; nothing is sent back and nothing halts.** The two
+criteria that halted the second run, A3 (the remainder) and A6 (the retry), are met in
+full; the evidence is below. Section 1 was not changed by this run.
 
-Method. Round 1 of this branch (`2646e7c`) was extracted with `git archive` into the session
-scratchpad and run beside the working tree over the same two sets as the first run (checked
-byte-equal to the first run's files): 600 snapshots from the suite's `random_snapshot` and
-500 planned-heavy ones. Two new independent probes: (1) a brute force written for the
-audit (`leximin.py`) over 6,000 generated instances of 2 to 3 planned cars x 2 to 4
-quarters (mixed phases, equal and unequal prices, an unpriced first quarter, a cap, blocks,
-on/off cars, limits) that evaluates the levels above the even split from scratch in integer
-units, takes the plans tied on all of them and asks whether the first quarter returned by
-`optimize` is the most even of the tied plans (sorted allocation vector, at equal total);
-it was checked to bite by running it on the pre-fix code (`79d1586`): 9 mismatches in 300
-instances where the current code has 0 in 300; (2) a direct differential of the
-quarter-0 stage against round 1's `share` on 3,000 generated claim sets (1 to 8 A minimums,
-mixed phases, charge-now tier).
+Method. Everything was re-run from scratch on the tree as step 5 left it (`26351d2`),
+with the probes of the second run (`c6/r2/`) re-used on wider ranges and a copy of round
+1 of this branch (`2646e7c`, extracted with `git archive`; `allocation.py`, `decide.py` and
+`planning.py` verified byte-equal to it) run beside it. Gates first: `ruff check .` and
+`ruff format --check .` clean, `mypy` `Success: no issues found in 26 source files`,
+`pytest` `1525 passed in 152.45s`.
 
 | # | Criterion | Met | Evidence |
 |---|---|---|---|
-| A1 | Plans and allocates within every limit | yes | `test_optimize_never_breaks_a_limit` and `test_the_invariants_hold_for_generated_snapshots` pass (suite: 1377 passed in 138 s). Independent script (no module helpers) over the 600 + 499 decisions that returned: 0 violations of 0-or-min..max, whole amps, on/off exactness, the per-phase budget less reservations, `available`, the window `[now quarter, deadline)`, allocation equal to the plan's first quarter and every later quarter within the budget. The same limits hold in all 6,000 brute-force instances (the brute force enumerates only feasible plans, and the returned plan was always one of them). |
-| A2 | Optimal for the stated precedence | yes, one limit noted | The 6,000-instance brute force: the returned plan has the lexicographically optimal tuple (shortfall, unpriced, above cap, short runs, price, forced unpriced first-quarter energy, cars on now, each car in ranking order) in every instance that returned: 0 `LEVELS NOT OPTIMAL` (2 instances raised, see A6). `test_optimize_matches_a_brute_force_enumeration_level_by_level` and the T3 scenarios pass. In the 429 differing decisions of the differential no old plan that is feasible in the new model beats the new plan on any level (`tuples.py`). Limit (deviation 19): the exact price hold covers whole-amp problems only; with a fractional on/off current anywhere in the planned set it falls back to a 1e-6 EUR tolerance, and a one-tick price gap is again traded away (probe `tick.py`: 14 A cheap quarter available, `a` gets 6 A now, the correct answer, when alone, and 9 A when a 7.5 A on/off demand is in the problem). The error is at most the hold tolerance, 1e-6 EUR. |
-| A3 | Serves the tiers in order on the leftover; quarter 0 split as evenly as cost allows | **partially: tier order yes, evenness unmet** | Tier order and leftover: `test_a_lower_tier_never_takes_current_a_higher_tier_could_use`, the six-pair optimize test, and in the differential 61 spare-tier gains with no higher tier losing current. The two cases of the first halt are fixed and re-run: 30 A, A limited to 8 A, B and C 6 to 16 A, equal prices: 8 / 11 / 11 (`probe3.py`); two forced cars with the first quarter unpriced: 8 / 8, the same as priced (`probe_unpriced.py`, `probe2.py` through `decide`). **But the split is still not as even as cost allows when the amps left over are fewer than the cars at the lowest level.** The fill (P6 `_fill_now`, and S2/S3 in the quarter-0 tiers) stops when no car can rise together with the others and hands the rest to the best-ranked car, which may already be above the others. Reproduced three ways. (a) Direct: three 6 to 16 A cars on 20 A in any tier (smart-off, charge-now, planned at equal prices, spare) give 8 / 6 / 6 (pinned by `test_optimize_planned_cars_that_cannot_all_rise_share_the_remainder_in_ranking_order`); (2, 1, 1) minimums on 5 A give 3 / 1 / 1. Round 1's `share` (raise the lowest, ties in ranking order) gave 7 / 7 / 6 and 2 / 2 / 1 on the same inputs. (b) Differential against `share`: of 3,000 generated claim sets, 2,969 are identical and 29 are strictly less even at an equal total (e.g. 7 / 7 / 6 becomes 8 / 6 / 6; 3 / 3 / 2 becomes 4 / 2 / 2; 5 / 5 / 5 / 4 becomes 7 / 4 / 4 / 4). (c) Planned tier, independent brute force: of 6,000 instances 5 return a first quarter that a more even split at equal total and equal cost on every level above would beat (seeds 647, 3118, 4103 and two more; 647 is 3 / 1 / 1 against a tied 2 / 1 / 2 on one 5 A phase with minimums 2, 1, 1), and 16,000 instances in a wider run give 22. The generated snapshots (A8) do not reach it because they rarely put three cars at the same level with a smaller remainder. |
-| A4 | Keeps the stale-price rule | yes | `test_stale_prices_share_spare_capacity_evenly_with_no_plans`, `test_stale_prices_make_a_smart_session_priority_three`, `test_stale_prices_never_mark_a_session_starved` pass; 0 plans in any `prices_stale` decision of the two sets; `decide.py:581` passes `prices={}` for a stale series. |
-| A5 | Deterministic and bounded | yes on the promised grid | Whole `decide`, 4 cores, seeds 1 to 5, `benchmark_snapshot`: 3 chargers @ 35 A `[0.59, 0.18, 0.55, 0.37, 0.94]` s (tier 10 s); 7 @ 70 A `[3.91, 5.41, 2.50, 2.36, 1.90]` (tier 60 s); 10 @ 70 A `[6.81, 6.00, 10.83, 2.50, 47.16]` (tier 120 s). No `PLAN_NOT_PROVEN_OPTIMAL` in any run (the node budget does not bind on the grid). Determinism: 8 decisions hashed under `PYTHONHASHSEED` 0, 1 and 12345 give one SHA-256 (`d7c0c632...b3fd5`); two repeated calls equal. Options in `optimize.py:221-226`: `node_limit = NODE_LIMIT = 8000`, `mip_rel_gap = 0.0`, `presolve = True`, `threads = 1`; no `time_limit` anywhere in `src/` (grep) and two tests spy the `milp` call. A stop at the node budget with a point gives the event (stubbed and real tests). |
-| A6 | Raises instead of guessing | **no: HiGHS still reports infeasible for feasible models** | As worded (a HiGHS failure raises `SolverError` naming the status, no partial decision) it holds: `test_decide_raises_solver_error_for_every_failure_status` and the T7 tests. But the first run's defect (a status 2 on a model that is feasible, which the concept's shortfall slack rules out) is not gone; `presolve = True` moved it. (1) 2 of 6,000 tiny brute-force instances (seeds 1931 and 5662; 3 cars, 2 to 4 quarters) raise `HiGHS status 2: infeasible` in level P2; for 1931 the previous solution satisfies every row (max violation 0.0) and the identical model solves with `presolve = False` (status 0) and fails with `presolve = True` (`trace1931.py`). Neither setting is safe, which is what a retry would have to cover. (2) Planned-heavy set #78 (4 chargers, 16 A) raises `HiGHS status 4` (node budget, no point) in the ranking level of P5 after 14 s; the same snapshot returns at `e53aee4` (step 3's final, 31 s) and raises at `d7c8e77` (step 5's first change, 22 s), so step 5's exact price hold or kWh level introduced it. A6 allows the raise as worded, but it is a regression on a set the first run used as its yardstick. The first run's #40, #111 and #246 now pass; the random set (600) has 0 errors. |
-| A7 | Removes the greedy planner and declares its dependencies | yes | `PlanRequest`, `plan_sessions`, `Claim`, `share` absent from the package and `__all__`; imports across `src/` are the standard library, `numpy`, `scipy.optimize`, `scipy.sparse` and the package; `pyproject.toml` `dependencies = ["numpy>=2.2,<3", "scipy>=1.15,<2"]`; tests `test_the_round_two_names_are_gone`, `test_the_package_imports_only_the_standard_library_numpy_scipy_and_itself`, `test_the_package_uses_numpy_and_scipy_and_pyproject_declares_them` pass; `STRUCTURE.md` reconciled (below). |
-| A8 | Changes nothing else | yes on the generated snapshots; the quarter-0 remainder is recorded under A3 | `model.py`, `quarters.py` and `codec.py` are byte-identical to `2646e7c` (`git diff --stat`); the top-level and per-charger decision keys equal round 1's in all 1,099 decisions; `result.py` only gains `PLAN_NOT_PROVEN_OPTIMAL`. Differential below. |
+| A1 | Plans and allocates within every limit | yes | `test_optimize_never_breaks_a_limit`, `test_optimize_limits_hold_to_the_solver_tolerance_and_the_documented_slack` and `test_the_invariants_hold_for_generated_snapshots` pass in the 1525. Independent script `inv2.py` (no module helpers: 0 or min..max, whole amps, on/off exactness, per-phase budget less reservations, `available`, window `[now quarter, deadline)`, allocation equal to the plan's first quarter, later quarters within budget, round-1 key sets): 0 violations in the 600 `random_snapshot` decisions, the 500 planned-heavy ones and 1,200 further `random_snapshot` ones (seeds 600 to 1799; 2,300 decisions). The 20,000 brute-force instances below enumerate only feasible plans and the returned plan was always one of them. |
+| A2 | Optimal for the stated precedence | yes, one limit noted | `leximin_lv.py` (the returned plan's level tuple against an exhaustive enumeration, then the evenness of its first quarter), seeds 0 to 16,000: 0 `LEVELS NOT OPTIMAL`, 0 mismatches, 0 errors (the second run found 22 mismatches in the same range). `test_optimize_matches_a_brute_force_enumeration_level_by_level` and the T3 scenarios pass. In the differential below no old plan that is feasible in the new model beats the new plan on any level (`classify.py`: "old better" empty). Limit, unchanged since the second run and recorded at deviation 19: the exact price hold covers whole-amp problems only, so with a fractional on/off current anywhere in the planned set a one-tick price gap is held to the 1e-6 EUR tolerance. |
+| A3 | Serves the tiers in order on the leftover; quarter 0 as evenly as cost allows | yes | **Tier order:** `test_a_lower_tier_never_takes_current_a_higher_tier_could_use`, the six-pair optimize test, and 61 spare-tier gains in the differential with no higher tier losing current. **Evenness, quarter-0 tiers:** `sharediff2.py`, round 1's `share` (the `2646e7c` tree) against `optimize` on 10,000 generated claim sets (2 to 4 claims, 1 to 8 A minimums, maximums at, 2, 5 or 8 above, five phase shapes, 4 to 30 A per phase) in each of `SMART_OFF`, `CHARGE_NOW` and `SPARE`: **0 differences in each** (it was 29 in 3,000 for `CHARGE_NOW` at the second run). **Evenness, planned tier:** `leximin.py` over seeds 0 to 20,000 (2 to 3 cars x 2 to 4 quarters, mixed phases, equal and unequal prices, an unpriced first quarter, a cap, blocks, on/off cars, limits; it evaluates every level above the split from scratch and asks whether the returned first quarter is the leximin-best of the tied plans at the same total): **0 mismatches and 0 errors** (5 in 6,000 and 22 in 16,000 at the second run); `leximin_lv.py` seeds 0 to 16,000: also 0. Through `decide` (three 6 to 16 A cars on 20 A, every can-run tier: smart-off, charge-now, planned, spare): 7 / 7 / 6 in all four. The first halt's cases hold (8 / 11 / 11, and 8 / 8 for two cars forced into an unpriced first quarter: `test_optimize_three_planned_cars_fill_the_first_quarter_evenly_up_to_each_limit`, `test_optimize_two_planned_cars_forced_into_an_unpriced_first_quarter_share_it`). The remainder is pinned by `test_optimize_the_leftover_goes_one_amp_at_a_time_to_the_lowest_in_every_tier` (16 cases), `..._the_quarter_zero_tiers_equal_round_ones_share_on_generated_claims`, `..._the_planned_tier_equals_round_ones_share_on_generated_claims` and the other remainder tests of step 5's third table. |
+| A4 | Keeps the stale-price rule | yes | `test_stale_prices_share_spare_capacity_evenly_with_no_plans`, `test_stale_prices_make_a_smart_session_priority_three`, `test_stale_prices_never_mark_a_session_starved` pass; 0 plans in any `prices_stale` decision of the sets (33 in the 600, 65 in the further 1,200: `inv2.py` "stale-price plans 0"); `decide.py` passes `prices={}` for a stale series. |
+| A5 | Deterministic and bounded | yes on the promised grid | Whole `decide`, 4 cores, nothing else running, `NODE_LIMIT = 8000`, `benchmark_snapshot`, seeds 1 to 8 on the named cells and 1 to 5 on the rest, seconds, worst of the seeds against the tier: 1 chargers @ 35 A 0.12 (10 s); 2 @ 35 A 0.28 (10); **3 @ 35 A 1.09 (10)**; 2 @ 50 A 0.32 (10); 3 @ 50 A 0.40 (10); 5 @ 50 A 2.94 (60); 3 @ 70 A 0.39 (10); 5 @ 70 A 1.30 (60); **7 @ 70 A 7.48 (60)**; **10 @ 70 A 44.30 (120; seed 5, the others 1.75 to 31.9)**. No `PLAN_NOT_PROVEN_OPTIMAL` anywhere. Step 5's forced-retry timings (every first attempt reported as a status 4 without a point after paying for its solve, so every solve runs twice; not in the suite), reproduced: 3 @ 35 A worst 2.41, 7 @ 70 A worst 16.21, 10 @ 70 A worst **86.53** (seed 5; step 5 measured 2.44, 17.28 and 89.94), first and retry call counts equal in every run, no `SolverError`: every tier still holds with every solve doubled, and a real retry repeats only the solve that failed. Determinism: 48 decisions (benchmark snapshots at 3, 5 and 7 chargers and the first 40 planned-heavy snapshots) hashed under `PYTHONHASHSEED` 0, 1 and 12345 give one SHA-256 (`6e13d0e3...172c4`); `test_optimize_a_retried_run_issues_the_same_solver_calls_every_run` and `test_optimize_the_fill_issues_the_same_solver_calls_every_run` pin the call sequence. `optimize.py` calls `milp` in one place (`_Problem._milp`) with `node_limit = NODE_LIMIT = 8000`, `mip_rel_gap = 0.0`, `presolve`, `threads = 1`; no `time_limit` anywhere in `src/` (grep) and two spy tests assert it. A stop at the node budget with a point gives the event (3 of the 500 planned-heavy snapshots did, every limit kept; stubbed and real tests). |
+| A6 | Raises instead of guessing, with the retry | yes | **Raise:** `test_decide_raises_solver_error_for_every_failure_status`, `test_optimize_a_failed_retry_raises_with_the_retrys_status_and_message` (5), `test_decide_reports_the_retrys_failure_not_the_first_attempts` (3), `test_decide_raises_when_a_later_level_stops_without_a_point`, `test_optimize_a_probe_failure_raises_solver_error`. **Retry:** `_Problem._solve` calls HiGHS with `presolve = True`; when the result is status 2 or has no `x` it calls once more, same model, same node budget, `presolve = False`, and judges only that result (`optimize.py:208-250`); a result with a point and any other status is judged as it is. Tests: `..._tiny_instances_highs_calls_infeasible_are_solved_by_the_retry[1931]` and `[5662]` (the second run's two failures), the four first-failure kinds, `..._a_budget_stop_with_a_point_is_not_retried`, `..._the_retry_changes_nothing_but_presolve_and_never_adds_a_time_limit`. **Spurious infeasible, 0 `SolverError`:** the tiny set (the brute-force instances above, seeds 0 to 20,000, `leximin.py`, which prints every exception): **0** (2 in 6,000 at the second run: seeds 1931 and 5662 are inside the range and solved); the planned-heavy set (500): **0** (#78 returns, 26.3 s, 4 chargers at 16 A, off the A5 grid, 3 snapshots end not proven); the random set (600): **0**, and 1,200 further random snapshots: **0**. The second run's #78 `status 4` (the ranking level of P5 stopping at the node budget with presolve on) is the retry's case; its cause is recorded in section 3. |
+| A7 | Removes the greedy planner and declares its dependencies | yes | `PlanRequest`, `plan_sessions`, `Claim`, `share` absent from the package and `__all__`; every import across `src/` is the standard library, `numpy`, `scipy.optimize`, `scipy.sparse` or the package (grep of `^import`/`^from`); `pyproject.toml` `dependencies = ["numpy>=2.2,<3", "scipy>=1.15,<2"]`; `test_the_round_two_names_are_gone`, `test_the_package_imports_only_the_standard_library_numpy_scipy_and_itself`, `test_the_package_uses_numpy_and_scipy_and_pyproject_declares_them` pass; `STRUCTURE.md` reconciled (below). |
+| A8 | Changes nothing else | yes | `model.py`, `quarters.py` and `codec.py` byte-identical to `2646e7c` (`git diff`); `result.py` only gains `PLAN_NOT_PROVEN_OPTIMAL`; the top-level and per-charger decision keys equal round 1's in all 2,300 decisions (`inv2.py`). Differential below: every difference is optimality, leftover or even split, each pinned. |
 
-**The A8 differential (round 1 `2646e7c` against the working tree).**
+**The A8 differential (round 1 `2646e7c` against the working tree).** The two sets of the
+earlier runs (checked byte-equal): 600 snapshots from the suite's `random_snapshot` (seeds
+`7919 k + 13`) and 500 planned-heavy ones (seeds `104729 k + 7`, 2 to 4 adjustable
+chargers on shared phases). Errors old / new: 0 / 0 in both (the second run had #78 as an
+error; it now returns).
 
 | Set | Snapshots | Identical | Differ | Fit no kind | Errors old / new |
 |---|---|---|---|---|---|
-| `random_snapshot`, seeds `7919 k + 13` | 600 | 527 | 73 | 0 | 0 / 0 |
-| planned-heavy, seeds `104729 k + 7` | 500 | 143 | 356 | 0 | 0 / 1 (#78, A6) |
+| `random_snapshot` | 600 | 527 | 73 | 0 | 0 / 0 |
+| planned-heavy | 500 | 143 | 357 | 0 | 0 / 0 |
 
-`classify.py` assigns every difference its kinds from the decisions alone (a plan change is
-re-scored on the model's levels and the old plan is tested for feasibility in the new model;
-a first-quarter change is compared by evenness; a lower-tier gain or a reason, status or
-event change without a plan change is leftover). Counts, with the two sets together; one
-difference can carry two kinds:
+`classify.py` assigns every difference its kind from the decisions alone (a plan change is
+re-scored on the model's levels and the old plan is tested for feasibility in the new
+model; a first-quarter change is compared by evenness; a lower-tier gain or a reason,
+status or event change without a plan change is leftover). Counts with the two sets
+together; the second run's, which these equal except the one snapshot #78, in brackets:
 
 | Kind | Count and what was seen | Pinning test |
 |---|---|---|
-| Optimality | 81 old plans the new model forbids (first quarter above the fallback or user limit or the room left by guard, charge-now or smart-off; overfill beyond one quarter at the top current), 260 strictly better levels, 3 equal levels broken by ranking or earlier-first, and the consequences (priority 2 and 4 swapping, `IN_PLAN` and `PLANNED_LATER`, expected finish, `reaches_target`, events, status). In none does the old plan beat the new one on a level. | `test_a_planned_charger_without_room_now_is_planned_later_and_a_starved_one_waits`, `test_charge_now_takes_the_first_quarter_and_the_plan_starts_after_it`, `test_smart_off_allocations_shrink_the_capacity_planned_for_smart_sessions`, `test_reserved_chargers_shrink_the_capacity_planned_for_smart_sessions`, `test_decide_a_planned_car_ranked_first_charges_first_on_equal_prices`, `test_optimize_gives_the_better_ranked_car_the_earlier_cheap_quarter` |
-| Leftover | 61 spare-tier cars gaining current, 11 planned cars gaining what a charge-now car leaves with an unchanged plan, 48 changes of reason code, status or events with no allocation change. | `test_a_lower_tier_gets_what_a_higher_tier_leaves`, `test_a_lower_tier_never_takes_current_a_higher_tier_could_use`, `test_smart_charging_off_is_served_before_smart_chargers`, `test_a_spare_car_behind_a_planned_car_waits_for_higher_priority`; the status-only consequence has no dedicated test (step 8 note) |
-| Even split | 1 decision classified on its own (16 / 0 becomes 8 / 8); most planned-tier first-quarter changes also carry an optimality change and are counted there. None is less even than round 1. | `test_two_unreachable_planned_cars_split_a_shared_phase_evenly_now`, `test_optimize_two_planned_cars_at_equal_prices_run_now_evenly`, `test_optimize_three_planned_cars_fill_the_first_quarter_evenly_up_to_each_limit` |
+| Optimality | 81 [81] old plans the new model forbids (first quarter above the fallback or user limit or the room left by guard, charge-now or smart-off; overfill beyond one quarter at the top current), 261 [260] strictly better levels, 3 [3] equal levels broken by ranking or earlier-first, and their consequences (priority 2 and 4 swapping, `IN_PLAN` and `PLANNED_LATER`, expected finish, `reaches_target`, events, status). In none does the old plan beat the new one on a level. | `test_a_planned_charger_without_room_now_is_planned_later_and_a_starved_one_waits`, `test_charge_now_takes_the_first_quarter_and_the_plan_starts_after_it`, `test_smart_off_allocations_shrink_the_capacity_planned_for_smart_sessions`, `test_reserved_chargers_shrink_the_capacity_planned_for_smart_sessions`, `test_decide_a_planned_car_ranked_first_charges_first_on_equal_prices`, `test_optimize_gives_the_better_ranked_car_the_earlier_cheap_quarter` |
+| Leftover | 61 [61] spare-tier cars gaining current, 11 [11] planned cars gaining what a charge-now car leaves with an unchanged plan, 48 [48] changes of reason code, status or events with no allocation change. | `test_a_lower_tier_gets_what_a_higher_tier_leaves`, `test_a_lower_tier_never_takes_current_a_higher_tier_could_use`, `test_smart_charging_off_is_served_before_smart_chargers`, `test_a_spare_car_behind_a_planned_car_waits_for_higher_priority`; the status-only consequence still has no dedicated test (step 8 note) |
+| Even split | 1 [1] decision classified on its own (16 / 0 becomes 8 / 8); most planned-tier first-quarter changes also carry an optimality change and are counted there. **None is less even than round 1** (the second run's open item: the quarter-0 remainder, now equal to `share` in 30,000 claim sets). | `test_two_unreachable_planned_cars_split_a_shared_phase_evenly_now`, `test_optimize_two_planned_cars_at_equal_prices_run_now_evenly`, `test_optimize_three_planned_cars_fill_the_first_quarter_evenly_up_to_each_limit`, and for the remainder `test_optimize_the_leftover_goes_one_amp_at_a_time_to_the_lowest_in_every_tier` |
 
-No difference fitted no kind. Not in these sets, and found by the direct `share`
-differential only: the quarter-0 stages are less even than round 1 in about 1 % of claim
-sets (A3 row). That difference is "a different split within a tier", but in the direction
-the concept does not allow, and no test pins it as intended.
+No difference fitted no kind, and the direct `share` differential, which found the second
+run's drift, is now clean.
 
-**Deviations 16 to 22 (section 3) against section 1.** Deviations 1 to 15 stand as in the
-first run (5 and 9 were superseded by 17 and 16).
+**Deviations 23 to 25 (section 3) against section 1.** Deviations 1 to 22 stand as in the
+second run's verdicts (5 and 9 superseded by 17 and 16; 16's exit by 23).
 
 | # | Verdict |
 |---|---|
-| 16 P5/P6 as amended; fill exit | **fail**: the full progressive fill and the unpriced case answer the first halt (8 / 11 / 11 and 8 / 8 reproduce). The addition that ends the loop when no car saturates ("the remainder goes in ranking order, as S3 does") is what leaves 8 / 6 / 6 where 7 / 7 / 6 is free; it narrows A3's "as evenly as cost allows" and, since S3 is round 1's `share` described wrongly, also the quarter-0 tiers. |
-| 17 `presolve = True` | **fail as a fix**: removes the first run's three errors, but HiGHS still reports infeasible on feasible models (A6 row); the option moved the problem. |
-| 18 forced unpriced first quarter in kWh | pass: A2 says unpriced quarters are used only when needed; kWh is the unit that statement is about, amps would let a three-phase car put three times the energy there. It changes no criterion's promise; it makes A2 literal. `test_optimize_an_unpriced_first_quarter_holds_the_forced_energy_not_the_forced_amps` red then green. The level sits between price and even split, so an unpriced first quarter is the later of A2's preferences and the even split still shares what the need forces. |
-| 19 exact price hold | pass with a stated limit: it makes A2's price level exact for whole-amp problems with prices on a 1e-7 or coarser grid (all market prices), and keeps the earlier tolerance behaviour elsewhere. It changes no promise; the fallback is wider than the step-5 text suggests, because `whole` is taken over every planned demand, so one fractional on/off pump beside an adjustable car switches the exact hold off for both (A2 row). Worth a line in section 8, not a halt. |
-| 20 `Demand` refuses a fractional minimum that can run adjustably | pass: A1 requires whole amps; `Charger.min_current` is an int, so only an on/off or always-off demand reaches `decide` with a fractional minimum, and the final rule lets both through. |
-| 21 integrality noise in the fill | pass: a robustness fix with a red test, no promise changed. |
-| 22 probes | pass: no code change; a failing probe raises, one stopped at the node budget makes `proven` False. |
+| 23 leftover one amp at a time to the lowest, ties in ranking order, in every tier | pass: it is the user's answer at the second step-6 halt and makes A3's "as evenly as cost allows" literal; A3 is unchanged. Evidence is the A3 row: 0 differences from round 1's `share` in 10,000 claim sets per quarter-0 tier, 0 mismatches in 20,000 planned-tier brute-force instances. The two pins that asserted 8 / 6 / 6 were changed to 7 / 7 / 6, not weakened. |
+| 24 one retry with presolve toggled | pass: it is the user's answer and A6 as amended. The scope the code retries (status 2 with or without a point, and any result with no point: status 0, 3 or 4 without `x`) is A6's "reports infeasible, or stops without a point" read as "no usable point"; a result with a point is never retried, so a node-budget stop is still reported as not proven, not hidden. Deterministic (two fixed calls), no time limit. A5 cost, forced on every solve: 86.5 s for 10 chargers of 120 s. |
+| 25 `_fill_now` keeps a higher value | pass: no behaviour change, no criterion touched. |
 
 **Out of scope.** Nothing from the exclusion list was built (no other loads, no greedy
-fallback, no threads, no warm start). Connections: `decide.py` calls `optimize` once and
-reads allocations and plans back. Showcases: all eight modules exit 0 and `optimize.main`
-is a worked example in the required form. Gates: `ruff check .`, `ruff format --check .` and
-`mypy` clean, `pytest` `1377 passed in 138.25s`.
+fallback, no threads, no warm start, no tuning past the grid). Connections: `decide.py`
+calls `optimize` once and reads allocations and plans back. Showcases: all eight modules
+exit 0; `optimize.main` is a worked example in the required form (named inputs, one call, a
+named result; the `Tier` members listed in a comment).
 
-**Structure.** The structure-auditor's five edits (report `r2-audit-before-6b.md`), each
-checked against the code:
+**Structure.** The structure-auditor's five edits (report `r2-audit-before-6c.md`), each
+checked against the file on disk, since step 5 had already updated it:
 
 | # | Edit | Decision |
 |---|---|---|
-| 1 | `Demand` row | applied, in the auditor's words (on/off in every tier, whole amps otherwise, maximum below minimum means off, validation of `tier` and `deadline`); the row already carried the fractional-minimum rule. |
-| 2 | `Outcome` row | applied (`proven` covers probes). |
-| 3 | `optimize.py` purpose paragraph | applied, with one change: "share the first quarter by progressive filling" now says in brackets that the remainder when no car can be saturated goes in ranking order, because that is what the code does today and the A3 finding concerns exactly that sentence. |
-| 4 | `tests/test_ev_optimize.py` entry | applied in part: step 5 had already added the fill, kWh, tick, noise and probe groups to the entry; added the accepted-case of the fractional minimum and the tick helper's grid detection, give-ups and the one-tick pin. The rest rebutted as already present. |
-| 5 | `tests/test_ev_decide.py` entry | applied in part: added the fractional on/off charger under a lower limit, a zero limit and the fallback cap, and the tier invariant not counting a charger the cap keeps off; the tied-at-a-user-limit, forced-unpriced, hash-seed and presolve groups were already present. "Sessions that can never be planned waiting for capacity" rebutted: the tests that carry it predate this round and are covered by "the tiers' waiting reason codes". |
+| 1 | `optimize.py` purpose paragraph (retry) | already on disk, in fuller words (status 2 with or without a point, any result with no point, the retry's result judged, a result with a point never retried); rebutted as done, wording kept. |
+| 2 | `optimize(...)` row | already on disk ("only after its one retry with presolve off fails too, carrying the retry's status and message; a status 3 or 4 below the limit with a point: at once"); rebutted as done. |
+| 3 | `Outcome` row (a retried solve's result counts) | applied: the sentence about a first attempt without a point followed by a proven retry leaving `proven` True was missing. |
+| 4 | `tests/test_ev_optimize.py` entry | already on disk (the retry group, the one-amp remainder group and the slack test are all named; "failing without a retry" for a status 4 below the limit); rebutted as done. |
+| 5 | `tests/test_ev_decide.py` entry | applied in part: the retry's failure being the one reported was on disk; added "and a status 4 below the node limit raising whatever its message". |
+
+Signatures were compared by the auditor and nothing differs.
 
 Drift found, and what was done about it:
 
-1. **A3, the remainder of the planned tier's fill and of S2/S3 (halt).** Same criterion as
-   the first halt, a different mechanism: then P6 was a single max-min and deviation 9
-   skipped it; now the fill ends one step early (deviation 16's exit) and the quarter-0
-   stages do the same (S2's freeze rule, then S3). A fix is not a guess at the code but it
-   changes pinned 8 / 6 / 6 tests and the plan's S2/S3 rows, and this is the second run:
-   halt, not a send-back.
-2. **A6, HiGHS reports infeasible on feasible models, now with `presolve = True`.** Same
-   defect as the first run's drift item 2. Halt for the same reason.
-3. **Notes for step 8, not defects:** (a) the overfill bound changes round 1's behaviour at
-   negative prices (12 charger plans in the first run's sets); (b) the brute force at 60
-   examples does not bite the minimum-block level; (c) the status consequence of the
+1. None against section 1. A3 and A6, unmet in the first two runs, are met on the same
+   probes that failed them, on wider ranges; nothing is sent back.
+2. **Notes for step 8, not defects** (carried from the second run unless marked): (a) the
+   overfill bound changes round 1's behaviour at negative prices; (b) the brute force at
+   60 examples does not bite the minimum-block level; (c) the status consequence of the
    leftover rule has no dedicated test; (d) HiGHS writes
    `HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();` lines to the
-   console during some solves; (e) deviation 19's fallback (A2 row).
+   console during some solves; (e) deviation 19's fallback (A2 row); (f) *new*: off the A5
+   grid a solve can be slow: planned-heavy #78 (4 chargers at 16 A) takes 26.3 s, 15 s of it
+   the failed first attempt that the retry then repeats with presolve off; no promise is
+   made there (A5), and no test spends the time.
 
 ### Earlier rounds still hold
 
-> Later rounds only. Re-check every acceptance criterion from every earlier round in this
-> folder: this round changed code they depend on, and their tests passing is necessary but
-> not sufficient — a criterion can be satisfied by tests that no longer describe what the
-> feature does.
-
 | Round | # | Criterion | Still met | Evidence |
 |---|---|---|---|---|
-| 1 (`01-stateless-core.md`) | A1 | Stateless | yes | `decide` takes only the snapshot; module-level values are constants; equal decisions on repeated calls and under three hash seeds (A5 row); `SolverError`, `PLAN_NOT_PROVEN_OPTIMAL` and `optimize` are this round's agreed additions, pinned beside round 1's names. |
-| 1 | A2 | Round 2 removed cleanly | yes | `ls ev/`: no `guard.py`, no `regulation.py`; grep finds no `settling`, `skip_current`, `next_check` or `memory` outside the codec's rejection. |
-| 1 | A3 | Behaves like round 1 | yes, in the amended form | Superseded by this round's A8: every difference in the sets is one of the three kinds; `quarters.py` untouched. |
-| 1 | A4 | Keeps every round-1 guarantee | see the next group | |
-| 1 | A5 | Round-1-shaped codec | yes | `codec.py` and `model.py` byte-identical to `2646e7c`; the same key sets in 1,099 decisions; the `memory` and round-2 setting rejections pass; a not-proven decision round-trips. |
-| 1 | A6 | UTC arithmetic | yes | `optimize.py` converts every input with `astimezone(UTC)` before use and presents `PlannedQuarter.start` in the zone last; `_expected_finish` unchanged; the DST finish tests and the fall-back test in `optimize` pass. |
+| 1 (`01-stateless-core.md`) | A1 | Stateless | yes | `decide` takes only the snapshot; the retry and the fill keep their state inside one `optimize` call (`_Problem`, `_Run`); equal decisions on repeated calls and under three hash seeds (A5 row); `SolverError`, `PLAN_NOT_PROVEN_OPTIMAL` and `optimize` are this round's agreed additions, pinned beside round 1's names (`test_the_package_exports_exactly_round_ones_names` and its siblings pass). |
+| 1 | A2 | Round 2 removed cleanly | yes | No `guard.py` or `regulation.py` under `src/ev/`; no `settling`, `skip_current`, `next_check` or `memory` outside the codec's rejection; `test_the_round_two_modules_are_gone` and `test_the_round_two_names_are_gone` pass. |
+| 1 | A3 | Behaves like round 1 | yes, in the amended form | Superseded by this round's A8: the differential above puts every difference into the three kinds; `quarters.py` byte-identical. |
+| 1 | A4 | Keeps every round-1 guarantee | yes | The ev-charging-core rows below. |
+| 1 | A5 | Round-1-shaped codec | yes | `codec.py` and `model.py` byte-identical to `2646e7c`; the same key sets in 2,300 decisions (`inv2.py`); the `memory` and round-2 setting rejections pass; a not-proven decision round-trips. |
+| 1 | A6 | UTC arithmetic | yes | `optimize.py` converts every input with `astimezone(UTC)`; `optimize.py` and the retry add no time arithmetic; the DST finish tests and the fall-back test in `optimize` pass. |
 | ev-charging-core 1 | A1 | Rejects invalid configuration | yes | `model.py` unchanged; its suite passes. |
-| ev-charging-core 1 | A2 (amended: tiers 1 to 4, ranking, 0 or min, user limit; the top-tier-only rule and equal split are now this round's A3) | partially | Classification, ranking, 0-or-min and the user limit hold in the invariant checks. Round 1's equal split ended with "the remainder 1 A at a time in ranking order" (7 / 7 / 6); the equal split now rides on A3 and gives 8 / 6 / 6 (A3 row), so this group is partial until A3 is. |
-| ev-charging-core 1 | A3 | Respects amp limits | yes | Budget, guard in the first quarter, reservations, on/off exactness: 0 violations in 1,099 decisions. |
+| ev-charging-core 1 | A2 (amended: tiers 1 to 4, ranking, 0 or min, user limit; the equal split now rides on this round's A3) | yes | Classification, ranking, 0-or-min and the user limit hold in the invariant checks (A1 row); the equal split with the remainder one amp at a time in ranking order is back: 7 / 7 / 6 for three 6 to 16 A cars on 20 A in every tier through `decide`, and equal to `share` in 30,000 generated claim sets. The second run's "partial" is closed. |
+| ev-charging-core 1 | A3 | Respects amp limits | yes | Budget, guard in the first quarter, reservations, on/off exactness: 0 violations in 2,300 decisions. |
 | ev-charging-core 1 | A4 (amended: now this round's A2) | Plans the cheapest quarters | yes | A2 row: 92 and 100 quarter days (`quarters.py` untouched), minimum block, cap only to meet the need with its event, reachable kWh, unpriced quarters latest first and flagged; limit noted under deviation 19. |
-| ev-charging-core 1 | A5 | Falls back under doubt | yes | `_set_limits` and `phase_capacity` unchanged; the fallback caps only the first planned quarter (test); stale prices give no plan. |
-| ev-charging-core 1 | A6 | Explainable, ordered output | yes | `_actions` unchanged (down before up); `actions` change only with allocations. |
+| ev-charging-core 1 | A5 | Falls back under doubt | yes | `phase_capacity` and the fallback cap unchanged; the fallback caps only the first planned quarter (test); stale prices give no plan (A4 row). |
+| ev-charging-core 1 | A6 | Explainable, ordered output | yes | `_actions` unchanged (down before up); `test_every_decrease_and_pause_comes_before_every_increase_and_resume` passes; keys equal round 1's. |
 | ev-charging-core 1 | A7 | Doc section 12 invariants | yes | Property test and the independent check, 0 violations. |
 | ev-charging-core 1 | A8 (amended: now this round's A7) | Deterministic; dependencies | yes | A7 and A5 rows. |
 | ev-charging-core 1 | A9 | Round-trips plain dicts | yes | `codec.py` unchanged; codec suite passes. |
