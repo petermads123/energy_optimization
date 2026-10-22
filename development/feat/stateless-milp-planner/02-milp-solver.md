@@ -1,6 +1,6 @@
 # MILP solver
 
-<!-- claude-plan step=6 status=active -->
+<!-- claude-plan step=3 status=active -->
 
 
 | Field | Value |
@@ -16,10 +16,10 @@
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
-| 3 | Implement | `/implement` | in `/build` | done |
+| 3 | Implement | `/implement` | in `/build` | in progress (sent back at step 6) |
 | 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | done |
-| 6 | Concept check | `/concept-check` | in `/build` | in progress (halted) |
+| 6 | Concept check | `/concept-check` | in `/build` | pending (re-run) |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
 | 9 | Pull request | `/create-pr` | with the user | pending |
@@ -320,8 +320,8 @@ size.
 | P2 | `Σ e_d·i_{d,t}` over unpriced `t` | Avoid unpriced quarters |
 | P3 | `Σ e_d·i_{d,t}` over `t` priced above `price_cap` | Use the cap only to meet the need |
 | P4 | `Σ w_{d,t}` | Avoid runs shorter than the minimum block |
-| P5 | `Σ π_t·e_d·i_{d,t}` over priced `t`; then, when quarter 0 is priced, maximise `Σ x_{d,0}`, then in ranking order each `x_{d,0}` (each car is on if that is still possible after those ranked above it), and fix `x_{·,0}` | Lowest price; among equally cheap plans, as many cars as possible on now, the better-ranked ones first (not when quarter 0 is unpriced, deviation 9; the ranking part is deviation 11) |
-| P6 | Maximise `z` (constraint 6), only when quarter 0 is priced | Even split among the planned cars on now: a single max-min, accepted at this tier because iterating it inside the big model is costly |
+| P5 | `Σ π_t·e_d·i_{d,t}` over priced `t`; then, **when quarter 0 is unpriced**, minimise `Σ_d i_{d,0}` and hold it (the latest-first rule fixes how much charging quarter 0 gets; amended at the step-6 halt); then maximise `Σ x_{d,0}`, then in ranking order each `x_{d,0}` (each car is on if that is still possible after those ranked above it), and fix `x_{·,0}` | Lowest price; among equally cheap plans, as many cars as possible on now, the better-ranked ones first (the ranking part is deviation 11). With quarter 0 unpriced its total is held first, so the cars the need forces into quarter 0 are switched on and share it, without pulling unpriced charging earlier (deviation 9 superseded at the step-6 halt) |
+| P6 | Progressive filling over the planned cars on now, as S2: repeatedly maximise an integer `f` with `i_{d,0} ≥ min(f, hi_{d,0})` for the unsaturated ones, holding every earlier result; after each round mark saturated every car at its `hi`, or whose `i_{d,0}` cannot exceed `f` with everything held; stop when all are saturated. Runs whether quarter 0 is priced or not | Even split among the planned cars on now, as far as cost allows (8/11/11 for caps 8, 16, 16 on 30 A at equal prices; 8/8 for two forced cars in an unpriced quarter 0). Amended at the step-6 halt from a single max-min |
 | P7 | `Σ τ_{d,t}·i_{d,t}`, with `τ = (t+1)·(n−r_d)` for priced `t` and `τ = (T−t)·(r_d+1)` for unpriced `t`; `r_d` is the position among the `PLANNED` demands and `n` their number | Earlier priced quarters first; unpriced quarters latest first, as in round 1; the better-ranked car gets the earlier quarter of either kind. `τ` is not separable, so swapping two cars between quarters changes it. A product is minimised by pairing its large factors with its small ones, so the rank factor is `n−r` (large for the better-ranked car) beside `t+1`, and `r+1` (large for the worse-ranked car) beside `T−t`. Corrected in step 5, deviation 10 |
 
 The full run is S1–S3 for `SMART_OFF`, S1–S3 for `CHARGE_NOW`, P1–P7, then S1–S3 for
@@ -1146,3 +1146,11 @@ re-timed either way.
 
 What exists is committed. On the answer `/build` resumes at step 3.
 
+**Answer (user, 2026-10-22):** "Full even split" — option 1. A3 stays as written. Section 2's
+P5 and P6 rows are amended: P6 becomes a full progressive fill over the planned cars on now,
+in every case; with quarter 0 unpriced, P5 first holds quarter 0's total at its minimum
+(latest-first) and then switches on and ranks the cars as when it is priced, so the cars the
+need forces into quarter 0 share it. Deviation 9 is superseded. The `presolve = False` defect
+(deviation 5) is fixed in the same pass: `presolve = True`, with the two infeasible snapshots
+(#40, #246 in step 6's scratch set) and #111 as regression tests. `/build` resumes at step 3
+with both changes; steps 5 and 6 then run again, and the A5 grid is re-timed.
