@@ -3,7 +3,9 @@
 A pure function `decide` turns one complete `Snapshot` of an installation (time,
 prices, chargers, sessions, measured phase currents, settings) into a `Decision`:
 ordered actions, a plan and a reason per charger, the available amps per phase, a
-status and events. The codec functions convert both to and from plain dicts.
+status and events. The codec functions convert both to and from plain dicts. The
+plan comes from a mixed-integer program (`optimize`); `SolverError` is raised when the
+solver fails.
 """
 
 from .codec import (
@@ -26,6 +28,7 @@ from .model import (
     Settings,
     Snapshot,
 )
+from .optimize import SolverError
 from .result import (
     Action,
     ActionKind,
@@ -63,6 +66,7 @@ __all__ = [
     "Session",
     "Settings",
     "Snapshot",
+    "SolverError",
     "Stage",
     "Status",
     "decide",

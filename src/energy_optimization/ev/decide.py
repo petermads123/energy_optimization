@@ -1,9 +1,11 @@
 """The EV charging decision core: one snapshot in, one decision out.
 
 `decide` recomputes everything on every call. It classifies each charger, assigns
-priority tiers, plans the cheapest quarters, shares the capacity of the shared grid
-connection among the chargers of the highest occupied tier and returns the actions
-that get there in a safe order, with a plain-language reason for each charger.
+priority tiers, hands the demands to the optimiser (`optimize`), which plans the
+cheapest quarters and shares the capacity of the shared grid connection tier by tier on
+what the tiers above leave, and returns the actions that get there in a safe order,
+with a plain-language reason for each charger. The optimiser raises `SolverError` when
+HiGHS fails; `decide` lets it through.
 """
 
 from dataclasses import dataclass, replace
@@ -11,13 +13,7 @@ from datetime import UTC, datetime, time, timedelta
 from enum import StrEnum
 from zoneinfo import ZoneInfo
 
-from .allocation import (
-    Claim,
-    measurements_fresh,
-    phase_capacity,
-    reserved_current,
-    share,
-)
+from .allocation import measurements_fresh, phase_capacity, reserved_current
 from .model import (
     Charger,
     ChargerKind,
@@ -30,12 +26,11 @@ from .model import (
     Settings,
     Snapshot,
 )
+from .optimize import Demand, Outcome, Tier, optimize
 from .planning import (
     NeedSource,
-    PlanRequest,
     SessionPlan,
     energy_per_quarter_kwh,
-    plan_sessions,
     remaining_need_kwh,
 )
 from .quarters import (
@@ -61,7 +56,6 @@ from .result import (
 )
 
 _EPS = 1e-9
-_TIERS = (1, 2, 3)
 
 
 class _Group(StrEnum):
@@ -191,14 +185,6 @@ def _set_limits(item: _Item, ctx: _Context) -> None:
         item.can_run = eff >= top
 
 
-def _claim(item: _Item) -> Claim:
-    """Build a sharing claim for a charger that can run."""
-    low = _low_current(item.charger)
-    if item.charger.kind is ChargerKind.ADJUSTABLE:
-        return Claim(item.charger.id, item.charger.phases, low, item.eff_max)
-    return Claim(item.charger.id, item.charger.phases, low, low)
-
-
 def _rank_key(item: _Item) -> tuple[datetime, float, str]:
     """Rank earliest deadline first, then largest remaining need, then id."""
     deadline = item.deadline or datetime.max.replace(tzinfo=UTC)
@@ -216,27 +202,80 @@ def _clip(cap: dict[Phase, float]) -> dict[Phase, float]:
     return {phase: max(0.0, value) for phase, value in cap.items()}
 
 
-def _plan_requests(items: list[_Item]) -> list[PlanRequest]:
-    """Build one plan request per session still to be planned."""
-    requests: list[PlanRequest] = []
-    for item in items:
-        if item.session is None or item.deadline is None:
-            continue
-        top = _top_current(item.charger)
-        limit = item.session.user_current_limit
-        if limit is not None:
-            top = min(top, float(limit))
-        requests.append(
-            PlanRequest(
-                item.charger.id,
-                item.charger.phases,
-                _low_current(item.charger),
-                top,
-                item.need or 0.0,
-                item.deadline,
-            )
+def _demand(item: _Item, tier: Tier) -> Demand:
+    """Build the optimiser's demand for a charger."""
+    top = _top_current(item.charger)
+    limit = item.session.user_current_limit if item.session else None
+    if limit is not None:
+        top = min(top, float(limit))
+    return Demand(
+        item.charger.id,
+        item.charger.phases,
+        tier,
+        _low_current(item.charger),
+        top,
+        item.eff_max,
+        item.need or 0.0 if tier is Tier.PLANNED else 0.0,
+        item.deadline if tier is Tier.PLANNED else None,
+    )
+
+
+def _demands(items: list[_Item]) -> list[Demand]:
+    """Build every demand in tier order, each tier in ranking order."""
+    tiers = (
+        (Tier.SMART_OFF, lambda i: i.group is _Group.SMART_OFF and i.can_run),
+        (
+            Tier.CHARGE_NOW,
+            lambda i: i.group is _Group.SMART and i.priority == 1 and i.can_run,
+        ),
+        (Tier.PLANNED, lambda i: i.group is _Group.SMART and i.priority is None),
+        (
+            Tier.SPARE,
+            lambda i: i.group is _Group.SMART and i.priority == 3 and i.can_run,
+        ),
+    )
+    demands: list[Demand] = []
+    for tier, belongs in tiers:
+        demands.extend(
+            _demand(i, tier) for i in sorted(filter(belongs, items), key=_rank_key)
         )
-    return requests
+    return demands
+
+
+def _room(items: list[_Item], cap: dict[Phase, float]) -> dict[Phase, float]:
+    """Return the first-quarter room left on each phase after every allocation."""
+    room = dict(cap)
+    for item in items:
+        if item.group in (_Group.SMART_OFF, _Group.SMART):
+            _subtract(room, item.charger.phases, item.allocation)
+    return room
+
+
+def _outranked(item: _Item, items: list[_Item]) -> bool:
+    """Say whether a higher-precedence charger on one of its phases got current."""
+    for other in items:
+        if other is item or other.allocation <= 0:
+            continue
+        if not item.charger.phases & other.charger.phases:
+            continue
+        if other.group is _Group.SMART_OFF:
+            return True
+        if (
+            other.group is _Group.SMART
+            and other.priority is not None
+            and item.priority is not None
+            and other.priority < item.priority
+        ):
+            return True
+    return False
+
+
+def _short(item: _Item, room: dict[Phase, float]) -> bool:
+    """Say whether a charger is below its maximum for want of room on a phase."""
+    if item.allocation >= item.eff_max - _EPS:
+        return False
+    need = max(1.0, _low_current(item.charger))
+    return any(room[phase] < need - _EPS for phase in item.charger.phases)
 
 
 def _present(item: _Item) -> float:
@@ -302,7 +341,9 @@ def _expected_finish(item: _Item, ctx: _Context) -> datetime | None:
     return None
 
 
-def _capped_by(item: _Item, ctx: _Context, raw: dict[Phase, float]) -> str | None:
+def _capped_by(
+    item: _Item, ctx: _Context, raw: dict[Phase, float], room: dict[Phase, float]
+) -> str | None:
     """Say what holds an allocated charger below its own maximum, if anything."""
     top = _top_current(item.charger)
     if item.group is _Group.RESERVED or item.allocation <= 0:
@@ -314,6 +355,8 @@ def _capped_by(item: _Item, ctx: _Context, raw: dict[Phase, float]) -> str | Non
         if ctx.fallback and (limit is None or limit >= item.eff_max):
             return "fallback"
         return "user_limit"
+    if not _short(item, room):
+        return None  # the plan runs it below its maximum on purpose
     budget = ctx.settings.phase_budget
     if any(raw[phase] < budget - _EPS for phase in item.charger.phases):
         return "phase"
@@ -359,7 +402,9 @@ def _sentence(item: _Item, code: ReasonCode, ctx: _Context) -> str:
     return text
 
 
-def _reason(item: _Item, ctx: _Context, raw: dict[Phase, float]) -> Reason:
+def _reason(
+    item: _Item, ctx: _Context, raw: dict[Phase, float], room: dict[Phase, float]
+) -> Reason:
     """Build a charger's reason: code, parameters and sentence."""
     code = item.final_code or item.code
     params: Params = {}
@@ -370,13 +415,13 @@ def _reason(item: _Item, ctx: _Context, raw: dict[Phase, float]) -> Reason:
         params["need_source"] = item.source.value
     if code is ReasonCode.READY_TIME_PASSED and item.session is not None:
         params["ready_time"] = item.session.ready_time.strftime("%H:%M")
-    capped = _capped_by(item, ctx, raw)
+    capped = _capped_by(item, ctx, raw, room)
     if capped is not None:
         params["capped_by"] = capped
     return Reason(code, _sentence(item, code, ctx), params)
 
 
-def _events(items: list[_Item], ctx: _Context) -> tuple[Event, ...]:
+def _events(items: list[_Item], ctx: _Context, outcome: Outcome) -> tuple[Event, ...]:
     """Collect the notification-worthy events of one call."""
     events: list[Event] = []
     cap = ctx.settings.price_cap
@@ -433,6 +478,14 @@ def _events(items: list[_Item], ctx: _Context) -> tuple[Event, ...]:
                 EventKind.PRICES_STALE, "The price series is stale, nothing is planned"
             )
         )
+    if not outcome.proven:
+        events.append(
+            Event(
+                EventKind.PLAN_NOT_PROVEN_OPTIMAL,
+                "The solver stopped at its node budget: the plan is the best found, "
+                "not proven optimal",
+            )
+        )
     return tuple(events)
 
 
@@ -441,6 +494,7 @@ def _status(
     items: list[_Item],
     active: list[_Item],
     raw: dict[Phase, float],
+    room: dict[Phase, float],
 ) -> Status:
     """Pick the overall status: the first that applies."""
     if ctx.fallback:
@@ -455,7 +509,7 @@ def _status(
         + [item for item in items if item.group is _Group.SMART_OFF and item.can_run]
         + [item for item in items if item.starved]
     )
-    short = [item for item in served if item.allocation < item.eff_max - _EPS]
+    short = [item for item in served if _short(item, room)]
     if not short:
         return Status.NORMAL
     budget = ctx.settings.phase_budget
@@ -516,32 +570,25 @@ def decide(snapshot: Snapshot) -> Decision:
     cap = _clip(cap)
     available = PhaseAmps(cap[Phase.L1], cap[Phase.L2], cap[Phase.L3])
 
-    off = sorted(
-        (i for i in items if i.group is _Group.SMART_OFF and i.can_run), key=_rank_key
-    )
-    shares = share([_claim(i) for i in off], cap)
-    for item in off:
-        item.allocation = shares[item.charger.id]
-        _subtract(cap, item.charger.phases, item.allocation)
-        _subtract(plan_cap, item.charger.phases, item.allocation)
-    cap = _clip(cap)
     plan_cap = _clip(plan_cap)
-
-    to_plan = [i for i in items if i.group is _Group.SMART and i.priority is None]
-    if to_plan:
-        plans = plan_sessions(
-            _plan_requests(to_plan),
-            now,
-            quarter_prices(snapshot.prices),
-            plan_cap,
-            settings.voltage,
-            settings.min_block_quarters,
-            settings.price_cap,
-            settings.timezone,
-        )
-        this_quarter = floor_to_quarter(now)
-        for item in to_plan:
-            item.plan = plans[item.charger.id]
+    outcome = optimize(
+        _demands(items),
+        now,
+        quarter_prices(snapshot.prices) if ctx.prices_ok else {},
+        plan_cap,
+        cap,
+        settings.voltage,
+        settings.min_block_quarters,
+        settings.price_cap,
+        settings.timezone,
+    )
+    for item in items:
+        if item.charger.id in outcome.allocations:
+            item.allocation = outcome.allocations[item.charger.id]
+    this_quarter = floor_to_quarter(now)
+    for item in items:
+        if item.group is _Group.SMART and item.priority is None:
+            item.plan = outcome.plans[item.charger.id]
             in_plan = any(
                 q.start.astimezone(UTC) == this_quarter for q in item.plan.quarters
             )
@@ -554,16 +601,9 @@ def decide(snapshot: Snapshot) -> Decision:
             item.starved = item.can_run and not item.plan.quarters
 
     smart = [i for i in items if i.group is _Group.SMART]
-    tier = next(
-        (t for t in _TIERS if any(i.priority == t and i.can_run for i in smart)), None
-    )
     active = sorted(
-        (i for i in smart if tier is not None and i.priority == tier and i.can_run),
-        key=_rank_key,
+        (i for i in smart if i.priority in (1, 2, 3) and i.can_run), key=_rank_key
     )
-    shares = share([_claim(i) for i in active], cap)
-    for item in active:
-        item.allocation = shares[item.charger.id]
     for item in smart:
         if not item.can_run:
             item.final_code = ReasonCode.BELOW_MINIMUM
@@ -571,20 +611,23 @@ def decide(snapshot: Snapshot) -> Decision:
             item.final_code = ReasonCode.WAITING_FOR_CAPACITY
         elif item.priority == 4:
             item.final_code = ReasonCode.PLANNED_LATER
-        elif item not in active:
-            item.final_code = ReasonCode.WAITING_FOR_HIGHER_PRIORITY
         elif item.allocation <= 0:
-            item.final_code = ReasonCode.WAITING_FOR_CAPACITY
+            item.final_code = (
+                ReasonCode.WAITING_FOR_HIGHER_PRIORITY
+                if _outranked(item, items)
+                else ReasonCode.WAITING_FOR_CAPACITY
+            )
     for item in items:
         if item.group is _Group.SMART_OFF and not item.can_run:
             item.final_code = ReasonCode.BELOW_MINIMUM
+    room = _room(items, cap)
 
     decisions = tuple(
         ChargerDecision(
             charger_id=item.charger.id,
             allocation=item.allocation,
             priority=item.priority,
-            reason=_reason(item, ctx, raw),
+            reason=_reason(item, ctx, raw, room),
             plan=item.plan.quarters if item.plan else (),
             remaining_need_kwh=item.need,
             deadline=(item.deadline.astimezone(ctx.zone) if item.deadline else None),
@@ -597,8 +640,8 @@ def decide(snapshot: Snapshot) -> Decision:
         actions=_actions(items),
         chargers=decisions,
         available=available,
-        status=_status(ctx, items, active, raw),
-        events=_events(items, ctx),
+        status=_status(ctx, items, active, raw, room),
+        events=_events(items, ctx, outcome),
     )
 
 
