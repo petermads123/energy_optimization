@@ -46,6 +46,10 @@ ALL = frozenset(Phase)
 CAP25 = {Phase.L1: 25.0, Phase.L2: 25.0, Phase.L3: 25.0}
 
 
+E1 = energy_per_quarter_kwh(1.0, 1, 230.0)  # 0.0575 kWh per amp-quarter on one phase
+E3 = energy_per_quarter_kwh(1.0, 3, 230.0)  # the same on three phases
+
+
 def claim(
     charger_id: str,
     low: float = 6,
@@ -1496,16 +1500,155 @@ def test_optimize_an_unpriced_first_quarter_is_not_filled_beyond_what_the_need_f
     assert outcome.allocations == {"a": 0.0}
 
 
-def test_optimize_planned_cars_that_cannot_all_rise_share_the_remainder_in_ranking_order() -> (
+def test_optimize_planned_cars_that_cannot_all_rise_share_the_remainder_one_amp_at_a_time() -> (
     None
 ):
-    # 20 A for three 6 to 16 A cars: all can sit at 6 A, none can all reach 7 A, and each
-    # alone could reach 8 A. The level stops there and the 2 A left goes to the first.
+    # 20 A for three 6 to 16 A cars: all can sit at 6 A and none can all reach 7 A. The 2 A
+    # left go one at a time to the lowest, ties in ranking order: 7 / 7 / 6, as `share`.
     cars = [planned(n, need=1.84) for n in "abc"]
 
     outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2), caps(20, 20, 20), caps(20, 20, 20))
 
-    assert outcome.allocations == {"a": 8.0, "b": 6.0, "c": 6.0}
+    assert outcome.allocations == {"a": 7.0, "b": 7.0, "c": 6.0}
+
+
+def _tier_group(tier: Tier, mins: list[int]) -> list[Demand]:
+    names = "abcd"[: len(mins)]
+    if tier is Tier.PLANNED:
+        return [planned(n, need=1.84, low=m) for n, m in zip(names, mins, strict=True)]
+    return [Demand(n, L1, tier, m, 16, 16) for n, m in zip(names, mins, strict=True)]
+
+
+@pytest.mark.parametrize("tier", list(Tier), ids=lambda t: t.name)
+@pytest.mark.parametrize(
+    ("mins", "room", "expected"),
+    [
+        ([6, 6, 6], 20, {"a": 7.0, "b": 7.0, "c": 6.0}),
+        ([2, 1, 1], 5, {"a": 2.0, "b": 2.0, "c": 1.0}),
+        ([6, 6, 6], 19, {"a": 7.0, "b": 6.0, "c": 6.0}),
+        ([1, 1, 1, 1], 7, {"a": 2.0, "b": 2.0, "c": 2.0, "d": 1.0}),
+    ],
+    ids=["three-6A-on-20A", "mins-2-1-1-on-5A", "one-spare-amp", "four-on-7A"],
+)
+def test_optimize_the_leftover_goes_one_amp_at_a_time_to_the_lowest_in_every_tier(
+    tier: Tier, mins: list[int], room: int, expected: dict[str, float]
+) -> None:
+    # Round 1's `share`: when no car can rise with the others, the amps left over go one
+    # at a time to the lowest car, ties in ranking order (7 / 7 / 6, never 8 / 6 / 6).
+    cars = _tier_group(tier, mins)
+    room_by_phase = caps(room, room, room)
+
+    outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2), room_by_phase, room_by_phase)
+
+    assert outcome.allocations == expected
+
+
+def _reference_share(
+    claims: list[tuple[str, frozenset[Phase], int, int]], room: dict[Phase, float]
+) -> dict[str, float]:
+    """Round 1's `share`, restated: ranking-order inclusion, then 1 A to the lowest."""
+    left = {phase: room[phase] for phase in Phase}
+    value = {name: 0.0 for name, *_ in claims}
+    included = []
+    for name, phases, low, high in claims:
+        if high >= low and all(low <= left[p] for p in phases):
+            value[name] = float(low)
+            included.append((name, phases, low, high))
+            for p in phases:
+                left[p] -= low
+    while True:
+        open_ = [
+            c
+            for c in included
+            if c[2] < c[3] and value[c[0]] < c[3] and all(left[p] >= 1 for p in c[1])
+        ]
+        if not open_:
+            return value
+        lowest = min(open_, key=lambda c: value[c[0]])
+        value[lowest[0]] += 1
+        for p in lowest[1]:
+            left[p] -= 1
+
+
+@pytest.mark.parametrize("tier", QUARTER_ZERO_TIERS, ids=lambda t: t.name)
+def test_optimize_the_quarter_zero_tiers_equal_round_ones_share_on_generated_claims(
+    tier: Tier,
+) -> None:
+    pool = [L1, L1, L2, frozenset({Phase.L1, Phase.L2}), ALL]
+    for seed in range(60):
+        rng = random.Random(seed)
+        claims = []
+        for n in range(rng.randint(2, 4)):
+            low = rng.randint(1, 8)
+            claims.append(
+                (f"c{n}", rng.choice(pool), low, low + rng.choice([0, 0, 2, 5, 8]))
+            )
+        room = {phase: float(rng.randint(4, 30)) for phase in Phase}
+        demands = [Demand(n, ph, tier, lo, hi, hi) for n, ph, lo, hi in claims]
+
+        outcome = run(demands, None, room, room)
+
+        assert outcome.allocations == _reference_share(claims, room), seed
+
+
+# Step 6's tiny-instance brute-force set: HiGHS called these feasible models infeasible
+# (seeds 1931 and 5662), with presolve off or on. Amps per car: (phases, low, high, now
+# high, need in amp-quarters); prices in cents, None for an unpriced quarter.
+_TINY_CASES = {
+    1931: dict(
+        cars=[
+            ("c0", "1", 1, 4, 4, 8),
+            ("c1", "1", 1, 4, 3, 8),
+            ("c2", "12", 2, 4, 4, 22),
+        ],
+        prices=[None, 10],
+        room_now=(9, 5),
+        room_later=(9, 4),
+    ),
+    5662: dict(
+        cars=[
+            ("c0", "12", 1, 4, 4, 22),
+            ("c1", "1", 2, 4, 2, 1),
+            ("c2", "12", 1, 3, 3, 11),
+        ],
+        prices=[10, 10],
+        room_now=(7, 3),
+        room_later=(5, 9),
+    ),
+}
+
+
+def _tiny(seed: int) -> Outcome:
+    case = _TINY_CASES[seed]
+    phases = {"1": L1, "2": L2, "12": frozenset({Phase.L1, Phase.L2})}
+    quarters = len(case["prices"])
+    cars = [
+        Demand(
+            name,
+            phases[ph],
+            Tier.PLANNED,
+            low,
+            high,
+            now_high,
+            need_kwh=need * E1,
+            deadline=q(quarters),
+        )
+        for name, ph, low, high, now_high, need in case["cars"]
+    ]
+    prices = priced(*(None if c is None else c / 100 for c in case["prices"]))
+    now_room = caps(*case["room_now"], 0)
+    later_room = caps(*case["room_later"], 0)
+    return run(cars, prices, later_room, now_room)
+
+
+@pytest.mark.parametrize("seed", [1931, 5662])
+def test_optimize_tiny_instances_highs_calls_infeasible_are_solved_by_the_retry(
+    seed: int,
+) -> None:
+    outcome = _tiny(seed)
+
+    assert set(outcome.allocations) == {"c0", "c1", "c2"}
+    assert all(plan.quarters for plan in outcome.plans.values())
 
 
 def test_optimize_planned_cars_on_mixed_phases_fill_evenly_by_phase() -> None:
@@ -1522,9 +1665,6 @@ def test_optimize_planned_cars_on_mixed_phases_fill_evenly_by_phase() -> None:
 
 
 # --- the planned tier's even first quarter: step 5 re-run (A3, A2, A5, A6) ----------------
-
-E1 = energy_per_quarter_kwh(1.0, 1, 230.0)  # 0.0575 kWh per amp-quarter on one phase
-E3 = energy_per_quarter_kwh(1.0, 3, 230.0)  # the same on three phases
 
 
 @pytest.mark.parametrize("reverse", [False, True], ids=["a first", "b first"])
@@ -1933,7 +2073,7 @@ def test_optimize_a_probe_stopped_at_the_node_budget_is_not_proven(
 
     assert False in seen
     assert outcome.proven is False
-    assert outcome.allocations == {"a": 8.0, "b": 6.0, "c": 6.0}
+    assert outcome.allocations == {"a": 7.0, "b": 7.0, "c": 6.0}
 
 
 def test_optimize_the_fill_issues_the_same_solver_calls_every_run(
