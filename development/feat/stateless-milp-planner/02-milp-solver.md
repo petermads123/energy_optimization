@@ -922,7 +922,7 @@ differential finding.
 fallback, no threads, no warm start). Connections: `decide.py` calls `optimize` once and
 reads allocations and plans back; `planning.py` and `allocation.py` only keep what is still
 used. Showcases: all eight modules exit 0; `optimize.main` reads as a worked example.
-`ruff check`, `ruff format --check` and `mypy` are clean. `STRUCTURE.md`: the
+`ruff check`, `ruff format --check` and `mypy` are clean, and `pytest` gives `1298 passed in 176.93s`. `STRUCTURE.md`: the
 structure-auditor's one suggestion is applied (the `test_ev_decide.py` entry now lists the
 step 5 tests, including that the mid-quarter ready time test is "pinned, not endorsed").
 
