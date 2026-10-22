@@ -1,6 +1,6 @@
 # MILP solver
 
-<!-- claude-plan step=4 status=active -->
+<!-- claude-plan step=5 status=active -->
 
 
 | Field | Value |
@@ -17,7 +17,7 @@
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done (re-run after the step-6 halt) |
-| 4 | Verify | `/verify` | in `/build` | pending (re-run) |
+| 4 | Verify | `/verify` | in `/build` | done (re-run after the step-6 halt) |
 | 5 | Test | `/test` | in `/build` | pending (re-run) |
 | 6 | Concept check | `/concept-check` | in `/build` | pending (re-run) |
 | 7 | Ship | `/ship` | in `/build` | pending |
@@ -862,6 +862,20 @@ and no value up to 1,024,000 changes a time on the grid.
 | Plan completeness | every signature in the Public API table exists as written: `SolverError(status, message)` with `str` form, `NODE_LIMIT = 8000`, `Tier`, `Demand` (fields, defaults, validation), `Outcome`, `optimize(...)`, `main`, `EventKind.PLAN_NOT_PROVEN_OPTIMAL`, `SolverError` in `ev.__all__`, dependencies in `pyproject.toml`; `PlanRequest`, `plan_sessions`, `Claim`, `share` removed. No Missing, no Unplanned; deviations 1 to 9 are recorded in section 3 (`NODE_LIMIT` value fixed by the benchmark, as planned) |
 | `STRUCTURE.md` | in sync. Auditor: no drift. Applied its note 1 (`optimize` row now lists `ZoneInfoNotFoundError`) and note 2 (stale first line of `allocation.py` reworded; `test_ev_optimize.py`'s docstring left for step 5, which fills the file) |
 | `python -m energy_optimization.ev.<module>` | model, result, quarters, planning, allocation, decide, codec, optimize all exit 0 and print readable output (the expected `RuntimeWarning` only). Showcase form checked; `optimize.main` gained a same-line-style comment listing the `Tier` members |
+
+### Re-run after the step-6 halt (step 3 fourth run)
+
+| Check | Result |
+|---|---|
+| `ruff check .` | `All checks passed!` |
+| `ruff format --check .` | `57 files already formatted` |
+| `mypy` | `Success: no issues found in 26 source files` |
+| `pytest` | `1305 passed in 161.55s` (1298 before: the five P5/P6 pins and two presolve reproductions, less the removed count of earlier tests, as recorded in section 3) |
+| Plan completeness | Public API table re-checked by introspection: `SolverError(status, message)`, `NODE_LIMIT = 8000`, `Tier`, `Demand` (fields, defaults), `Outcome`, `optimize(...)` (nine parameters as planned), `main`, `EventKind.PLAN_NOT_PROVEN_OPTIMAL`, `SolverError` in `ev.__all__`. The public names of `optimize.py` are exactly the planned ones; `PlanRequest`, `plan_sessions`, `Claim`, `share` still absent. No Missing, no Unplanned. |
+| P5/P6 against the amended rows | `_on_now_and_even` runs in every case: with an unpriced first quarter it minimises and holds the planned cars' total first-quarter current, then maximises cars on now, then each car in ranking order, fixes `x`; `_fill_now` is a full progressive fill (integer level `f`, saturate at `hi` or when the car cannot rise above `f`, probe solves, ranking-order remainder when no car saturates). Matches section 2's P5 and P6 rows, including the one addition recorded in deviation 16. `_even_now` is gone. |
+| Deviations 16 and 17 | Both recorded in section 3 (step-3 re-run subsection) with reason and evidence; deviations 5 and 9 carry "reversed" / "superseded" pointers. The Public API table is unchanged by both. `presolve` is `True` in `optimize.py` (line 209) and the spy test asserts `mip_rel_gap == 0.0` and `presolve is True`. |
+| `STRUCTURE.md` | Auditor report applied or rebutted: `optimize.py` entry, no change (agreed). Item 1 (`test_ev_optimize.py`): the first half (the planned tier's full progressive fill) was already written by step 3; applied the two parts it lacked, "a zero gap and presolve on" in the solver-spy clause, and the unpriced-not-filled and 8 / 8 / 8 mixed-phase pins. Item 2 (`test_ev_decide.py`): already present as "the two step-6 snapshots HiGHS called infeasible without presolve (explicit literals)"; rebutted as done, wording kept. `decide`'s own spy test checks only the node budget, threads and gap, as the auditor noted; no drift. |
+| Showcases | model, result, quarters, planning, allocation, optimize, decide, codec all exit 0 with readable output (the expected `RuntimeWarning` on `optimize` only). `optimize.main` unchanged and still in the required form. |
 
 ---
 

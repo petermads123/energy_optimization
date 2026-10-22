@@ -272,11 +272,12 @@ leftover for every pair; smart-off held to `capacity` in later quarters; `Demand
 validation naming each field (including `tier`), `Outcome`, `SolverError` and `NODE_LIMIT`;
 the `Raises:` branches, the empty-demands early return and negative or absent capacity; the
 rounding checks that raise with status 0; the solver call spied for no `time_limit`, one
-thread and the node budget; a node-budget stop with a point being not proven and a status 4
+thread, the node budget, a zero gap and presolve on; a node-budget stop with a point being not proven and a status 4
 below the limit failing; a `hypothesis` property that no limit is ever broken (T1) and one
 that the level-by-level tuple equals a brute-force enumeration (T2); and the planned tier's
 full progressive fill (8 / 11 / 11 on 30 A, 8 / 8 for two cars forced into an unpriced first
-quarter, the ranking remainder when no car can be saturated); and the `main`
+quarter, an unpriced first quarter not filled beyond what the need forces, the ranking
+remainder when no car can be saturated, 8 / 8 / 8 on mixed phases); and the `main`
 showcase.
 
 ### `tests/test_ev_allocation.py`
