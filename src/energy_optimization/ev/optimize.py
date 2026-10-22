@@ -185,8 +185,17 @@ class _Problem:
         """Pin a variable to a value."""
         self._lb[col] = self._ub[col] = float(value)
 
-    def _solve(self, objective: NDArray[np.float64]) -> NDArray[np.float64]:
-        """Solve once, update the run's proof status and return the solution."""
+    def _solve(
+        self, objective: NDArray[np.float64], keep: bool = True
+    ) -> NDArray[np.float64]:
+        """Solve once, update the run's proof status and return the solution.
+
+        Args:
+            objective: The objective vector to minimise.
+            keep: Whether the solution becomes the problem's last solution, the
+                witness that lets a later level be held without a solve. A probe that
+                is not followed by a hold must not keep it.
+        """
         count = len(self._lb)
         constraints = None
         if self._lo:
@@ -197,7 +206,7 @@ class _Problem:
         options = {
             "node_limit": NODE_LIMIT,
             "mip_rel_gap": 0.0,
-            "presolve": False,
+            "presolve": True,
             "threads": 1,
         }
         with warnings.catch_warnings():
@@ -232,8 +241,35 @@ class _Problem:
         self._run.status = status
         self._run.message = message
         found: NDArray[np.float64] = np.asarray(solution, dtype=float)
-        self.x = found
+        if keep:
+            self.x = found
         return found
+
+    def probe(self, objective: Mapping[int, float]) -> float:
+        """Minimise a level without holding it and without keeping the solution.
+
+        Args:
+            objective: Coefficient per column.
+
+        Returns:
+            The optimum with every row added so far.
+        """
+        vector = np.zeros(len(self._lb))
+        for col, value in objective.items():
+            vector[col] = value
+        return float(vector @ self._solve(vector, keep=False))
+
+    def set_known(self, col: int, value: float) -> None:
+        """Record the value of a column the last solution did not have yet.
+
+        Used for a variable that was just fixed by reasoning rather than by a solve, so
+        the last solution stays a valid point of the grown problem.
+        """
+        assert self.x is not None
+        grown = np.zeros(len(self._lb))
+        grown[: len(self.x)] = self.x
+        grown[col] = value
+        self.x = grown
 
     def hold(
         self, objective: Mapping[int, float], value: float, integral: bool
@@ -484,27 +520,58 @@ def _fit_now(demands: Sequence[Demand], room: Mapping[Phase, float], run: _Run) 
     return round(sum(small.solution()[c] for c in cols))
 
 
-def _even_now(demands: Sequence[Demand], room: Mapping[Phase, float], run: _Run) -> int:
-    """Return the highest current every given demand could have at once now.
+def _fill_now(
+    problem: _Problem,
+    demands: Sequence[Demand],
+    columns: Sequence[_Vars],
+    on_now: Sequence[int],
+) -> None:
+    """Share the first quarter evenly among the cars that are on now (level P6).
 
-    Like `_fit_now` it looks at the first quarter's capacity alone, as a bound.
+    Progressive filling as in the first-quarter tiers: repeatedly raise the lowest
+    first-quarter current of the cars not yet saturated as far as it goes, then
+    saturate every car that is at its maximum or cannot exceed that level, holding
+    everything found. When no car is saturated by a level (they could each exceed it,
+    just not all at once) the rest goes in ranking order.
     """
-    small = _Problem(run)
-    cols = [
-        small.var(d.min_current, _hi(d, True), d.min_current < _hi(d, True))
-        for d in demands
-    ]
-    even = small.var(0, max((_hi(d, True) for d in demands), default=0.0), True)
-    for phase in Phase:
-        terms = [
-            (c, 1.0) for c, d in zip(cols, demands, strict=True) if phase in d.phases
-        ]
-        if terms:
-            small.row(terms, -math.inf, room[phase])
-    for c in cols:
-        small.row([(even, 1.0), (c, -1.0)], -math.inf, 0.0)
-    small.minimise({even: -1.0}, integral=True)
-    return round(small.solution()[even])
+    top = {n: _hi(demands[n], True) for n in on_now}
+    value = {n: demands[n].min_current for n in on_now}
+    live = [n for n in on_now if top[n] > demands[n].min_current + _EPS]
+    while live:
+        ceiling = min(math.floor(top[n] + _EPS) for n in live)
+        level = problem.var(0, ceiling, True)
+        for n in live:
+            problem.row([(columns[n].i[0], 1.0), (level, -1.0)], 0.0, math.inf)
+        solved = problem.solution()
+        known = min(math.floor(solved[columns[n].i[0]] + _EPS) for n in live)
+        if known >= ceiling:
+            problem.fix(level, float(ceiling))
+            problem.set_known(level, float(ceiling))
+            reached = ceiling
+        else:
+            problem.minimise({level: -1.0}, integral=True)
+            reached = round(float(problem.solution()[level]))
+            problem.fix(level, float(reached))
+        for n in live:
+            value[n] = max(value[n], float(reached))
+        # A car is saturated at its maximum, or when it cannot be raised above the
+        # level with every other live car held at it.
+        held = problem.solution()
+        stuck = []
+        for n in live:
+            col = columns[n].i[0]
+            at_top = value[n] >= top[n] - _EPS
+            free = held[col] >= reached + 1 - _EPS
+            if not (at_top or free):
+                free = -problem.probe({col: -1.0}) >= reached + 1 - _EPS
+            if at_top or not free:
+                stuck.append(n)
+        if not stuck:
+            for n in live:
+                col = columns[n].i[0]
+                problem.minimise({col: -1.0}, integral=True, floor=-top[n])
+            return
+        live = [n for n in live if n not in stuck]
 
 
 def _on_now_and_even(
@@ -513,12 +580,20 @@ def _on_now_and_even(
     columns: Sequence[_Vars],
     now_room: Mapping[Phase, float],
     run: _Run,
+    priced_now: bool,
+    whole: bool,
 ) -> None:
     """Run the second part of P5 and P6: cars on now, then an even first quarter.
 
-    The cars on now are as many as possible, then the better-ranked ones among them.
+    With an unpriced first quarter its total current is minimised and held first, so
+    only what the need forces is charged there. The cars on now are then as many as
+    possible, the better-ranked ones among them, and they share the first quarter.
     """
     possible = [n for n, c in enumerate(columns) if c.x and _hi(demands[n], True) > 0]
+    if not priced_now:
+        problem.minimise(
+            {columns[n].i[0]: 1.0 for n in possible}, integral=whole, floor=0.0
+        )
     fits = _fit_now([demands[n] for n in possible], now_room, run) if possible else 0
     problem.minimise(
         {columns[n].x[0]: -1.0 for n in possible}, integral=True, floor=-float(fits)
@@ -532,17 +607,8 @@ def _on_now_and_even(
     for n, c in enumerate(columns):
         if c.x:
             problem.fix(c.x[0], 1.0 if n in on_now else 0.0)
-    # P6: an even split of the first quarter among the cars that are on now.
     if on_now:
-        ceiling = _even_now([demands[n] for n in on_now], now_room, run)
-        even = problem.var(0, ceiling, True)
-        for n in on_now:
-            problem.row([(even, 1.0), (columns[n].i[0], -1.0)], -math.inf, 0.0)
-        reached = min(math.floor(solved[columns[n].i[0]] + _EPS) for n in on_now)
-        if reached >= ceiling:
-            problem.hold({even: -1.0}, -float(ceiling), integral=True)
-        else:
-            problem.minimise({even: -1.0}, integral=True)
+        _fill_now(problem, demands, columns, on_now)
 
 
 def _stage_plan(
@@ -642,10 +708,15 @@ def _stage_plan(
             if (p := price_at(t)) is not None
         }
     )
-    if price_at(0) is not None:
-        # Only a priced first quarter is worth being on in; an unpriced one is used
-        # only when the need forces it, and then latest first (P7).
-        _on_now_and_even(problem, demands, columns, now_room, run)
+    # P5, second part, and P6. An unpriced first quarter keeps only what the need
+    # forces (its total is minimised and held); the cars on now share it as a priced one.
+    whole = all(
+        d.min_current != d.max_current or float(d.min_current).is_integer()
+        for d in demands
+    )
+    _on_now_and_even(
+        problem, demands, columns, now_room, run, price_at(0) is not None, whole
+    )
     # P7: earlier priced quarters first, unpriced quarters latest first, and the
     # better-ranked car in the earlier quarter of either kind. A product weight is
     # minimised by pairing its large factors with its small ones: for priced quarters
@@ -660,10 +731,6 @@ def _stage_plan(
                 weight[i] = float((total - t) * (n + 1))
             else:
                 weight[i] = float((t + 1) * (count - n))
-    whole = all(
-        d.min_current != d.max_current or float(d.min_current).is_integer()
-        for d in demands
-    )
     problem.minimise(weight, integral=whole)
     solved = problem.solution()
     return {

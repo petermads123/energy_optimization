@@ -1009,6 +1009,7 @@ def test_optimize_never_passes_a_time_limit_and_runs_single_threaded(
         assert options["threads"] == 1
         assert options["node_limit"] == NODE_LIMIT
         assert options["mip_rel_gap"] == 0.0
+        assert options["presolve"] is True
 
 
 @pytest.mark.parametrize(
@@ -1416,3 +1417,28 @@ def test_optimize_an_unpriced_first_quarter_is_not_filled_beyond_what_the_need_f
     outcome = run([planned("a", need=E16)], {})
 
     assert outcome.allocations == {"a": 0.0}
+
+
+def test_optimize_planned_cars_that_cannot_all_rise_share_the_remainder_in_ranking_order() -> (
+    None
+):
+    # 20 A for three 6 to 16 A cars: all can sit at 6 A, none can all reach 7 A, and each
+    # alone could reach 8 A. The level stops there and the 2 A left goes to the first.
+    cars = [planned(n, need=1.84) for n in "abc"]
+
+    outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2), caps(20, 20, 20), caps(20, 20, 20))
+
+    assert outcome.allocations == {"a": 8.0, "b": 6.0, "c": 6.0}
+
+
+def test_optimize_planned_cars_on_mixed_phases_fill_evenly_by_phase() -> None:
+    # A on L1+L2, B on L1, C on L2, 16 A per phase: 8 / 8 / 8, as the quarter-0 tiers.
+    cars = [
+        planned("a", need=1.84, phases=frozenset({Phase.L1, Phase.L2})),
+        planned("b", need=1.84),
+        planned("c", need=1.84, phases=L2),
+    ]
+
+    outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2))
+
+    assert outcome.allocations == {"a": 8.0, "b": 8.0, "c": 8.0}

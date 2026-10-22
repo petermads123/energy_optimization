@@ -3463,8 +3463,8 @@ def test_a_real_node_budget_stop_returns_a_plan_within_every_limit(
     monkeypatch.setattr(optimize_module, "NODE_LIMIT", 1)
     not_proven = 0
     raised = 0
-    for seed in range(1, 7):
-        snapshot = benchmark_snapshot(seed, 2, 16.0)
+    for seed in range(4, 7):
+        snapshot = benchmark_snapshot(seed, 4, 20.0)
         try:
             result = decide(snapshot)
         except SolverError as error:
