@@ -573,7 +573,7 @@ def _stage_plan(
             top = _hi(d, t == 0)
             x = problem.var(0, 1 if top > 0 else 0, True)
             # An on/off demand is fixed to `min_current * x`, which need not be whole.
-            i = problem.var(0, top, d.min_current < d.max_current)
+            i = problem.var(0, top, d.min_current != d.max_current)
             problem.row([(i, 1.0), (x, -d.min_current)], 0.0, math.inf)
             problem.row([(i, 1.0), (x, -top)], -math.inf, 0.0)
             xs.append(x)
@@ -661,7 +661,7 @@ def _stage_plan(
             else:
                 weight[i] = float((t + 1) * (count - n))
     whole = all(
-        d.min_current < d.max_current or float(d.min_current).is_integer()
+        d.min_current != d.max_current or float(d.min_current).is_integer()
         for d in demands
     )
     problem.minimise(weight, integral=whole)
@@ -677,7 +677,7 @@ def _stage_plan(
 
 def _read(demand: Demand, first: bool, on: float, current: float) -> float:
     """Read a solved current: whole amps, or exactly the on/off current when it is on."""
-    if demand.min_current < demand.max_current:
+    if demand.min_current != demand.max_current:
         return float(round(current))
     return _hi(demand, first) if on > 0.5 else 0.0
 

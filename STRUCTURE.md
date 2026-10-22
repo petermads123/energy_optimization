@@ -187,7 +187,7 @@ fallback: a solve that ends without a point raises `SolverError`.
 | `class Tier(IntEnum)`: `SMART_OFF = 0`, `CHARGE_NOW = 1`, `PLANNED = 2`, `SPARE = 3` | Which precedence stage a demand belongs to. |
 | `Demand(charger_id: str, phases: frozenset[Phase], tier: Tier, min_current: float, max_current: float, now_max_current: float, need_kwh: float = 0.0, deadline: datetime \| None = None)` | One charger asking for current, given in ranking order; validates itself with `ValueError` naming the field. |
 | `Outcome(allocations: dict[str, float], plans: dict[str, SessionPlan], proven: bool)` | Quarter-0 current of every demand, a plan per `PLANNED` demand, `proven` False when a solve stopped at the node budget with a point. |
-| `optimize(demands: Sequence[Demand], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], now_capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str) -> Outcome` | Solve the lexicographic model; `SolverError` on failure, `ValueError` for a naive `now` or a repeated charger id, `ZoneInfoNotFoundError` for an unknown `timezone`. |
+| `optimize(demands: Sequence[Demand], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], now_capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str) -> Outcome` | Solve the lexicographic model; `SolverError` on failure, `ValueError` for a naive `now` or a repeated charger id, `ZoneInfoNotFoundError` for an unknown `timezone`; empty `demands` returns before those checks; a limit broken by rounding raises `SolverError` with status 0. |
 | `main() -> None` | Showcase: a charge-now car, two planned cars and a spare-capacity car on one phase, then a phase with no room. |
 
 ### `src/energy_optimization/ev/decide.py`
@@ -259,11 +259,23 @@ with the planner.
 
 ### `tests/test_ev_optimize.py`
 
-Covers `src/energy_optimization/ev/optimize.py` (T4, round 1's `share` cases): the quarter-0
+Covers `src/energy_optimization/ev/optimize.py` (T1, T2, T4, T6, T7, T8): the quarter-0
 tiers reproduce round 1's `share` rule (zero-or-min in ranking order, max-min fairness on
 mixed phases, all-or-nothing claims including a fractional current, tolerance, empty and
-negative capacity, purity), driven through `optimize` with one `CHARGE_NOW` demand per
-claim.
+negative capacity, purity) and its named results in every quarter-0 tier; the planning
+stage on hand-checked plans (minimum blocks and a block longer than the window, a tiny need
+under a block, partly and fully unpriced horizons, negative prices overfilling by at most a
+quarter, the price cap at its boundary, a shortfall, first-quarter capacity, deadlines at or
+before now, the fall-back night in UTC, a 48-hour horizon, fractional on/off currents, the
+better-ranked car getting the earlier quarter and being on now first); the tiers on the
+leftover for every pair; smart-off held to `capacity` in later quarters; `Demand`
+validation naming each field (including `tier`), `Outcome`, `SolverError` and `NODE_LIMIT`;
+the `Raises:` branches, the empty-demands early return and negative or absent capacity; the
+rounding checks that raise with status 0; the solver call spied for no `time_limit`, one
+thread and the node budget; a node-budget stop with a point being not proven and a status 4
+below the limit failing; a `hypothesis` property that no limit is ever broken (T1) and one
+that the level-by-level tuple equals a brute-force enumeration (T2); and the `main`
+showcase.
 
 ### `tests/test_ev_allocation.py`
 
@@ -288,7 +300,7 @@ nights (including an unplanned finish landing exactly on the spring-forward tran
 a planned expected finish ending in or at the repeated hour of the fall-back night and at
 the spring-forward transition, `reaches_target` across the fold, a trickle of current (including a reserved
 charger's tiny measured draw) giving `None` and surviving the codec round trip, no state
-between interleaved snapshots, and the public surface equal to round 1's plus `SolverError`, `PLAN_NOT_PROVEN_OPTIMAL` and `optimize`'s names (exports, removed modules and names, dataclass fields, signatures, enum members); and the `main` showcase.
+between interleaved snapshots, the solver's failure statuses raising `SolverError` from `decide` (including a later level stopping without a point), node-budget stops (stubbed and real) adding `PLAN_NOT_PROVEN_OPTIMAL` last and round-tripping the codec, the solver call spied, decisions equal under permuted chargers, states and sessions, planned fractional on/off chargers, the fallback capping only the first planned quarter, unpriced and empty price series, the price-cap event boundary, the tiers' waiting reason codes and stale prices sharing evenly (T4-T7), and the public surface equal to round 1's plus `SolverError`, `PLAN_NOT_PROVEN_OPTIMAL` and `optimize`'s names (exports, removed modules and names, dataclass fields, signatures, enum members); and the `main` showcase.
 
 ### `tests/test_ev_codec.py`
 

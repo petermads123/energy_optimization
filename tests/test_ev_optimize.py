@@ -7,13 +7,36 @@ quarters, DST), the tiers, `Demand` validation, the solver-failure and node-budg
 paths, a brute-force check of the lexicographic tuple and a limits property.
 """
 
+import itertools
+import math
+import random
+from collections.abc import Callable
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from zoneinfo import ZoneInfoNotFoundError
 
+import numpy as np
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
+import energy_optimization.ev as ev
+from energy_optimization.ev import optimize as optimize_module
 from energy_optimization.ev.model import Phase
-from energy_optimization.ev.optimize import Demand, Outcome, Tier, optimize
+from energy_optimization.ev.optimize import (
+    NODE_LIMIT,
+    Demand,
+    Outcome,
+    SolverError,
+    Tier,
+    _current,
+    _verify,
+    optimize,
+)
+from energy_optimization.ev.optimize import main as showcase
 from energy_optimization.ev.planning import energy_per_quarter_kwh
+from energy_optimization.ev.quarters import floor_to_quarter, quarter_starts
 
 NOW = datetime(2026, 10, 21, 20, 0, tzinfo=UTC)
 L1 = frozenset({Phase.L1})
@@ -343,3 +366,1011 @@ def test_optimize_holds_smart_off_to_capacity_in_the_later_quarters() -> None:
 def test_demand_rejects_a_tier_that_is_not_a_tier() -> None:
     with pytest.raises(ValueError, match="^tier"):
         Demand("a", L1, 2, 6, 16, 16)  # type: ignore[arg-type]  # untyped callers
+
+
+# --- planning stage: hand-checked plans (T3) -------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("block", "expected"),
+    [
+        (1, {0: 16.0, 2: 16.0}),
+        (2, {0: 16.0, 1: 6.0, 2: 10.0}),
+    ],
+    ids=["no-minimum-block", "block-of-two"],
+)
+def test_optimize_a_minimum_block_trades_price_for_a_contiguous_run(
+    block: int, expected: dict[int, float]
+) -> None:
+    outcome = run([planned(need=2 * E16)], priced(1, 5, 1, 5), block=block)
+
+    assert shape(outcome) == {q(t): c for t, c in expected.items()}
+    assert outcome.allocations["a"] == 16.0
+
+
+@pytest.mark.parametrize(
+    ("block", "expected"),
+    [(2, [16.0, 16.0]), (8, [16.0, 10.0, 6.0])],
+    ids=["block-of-two", "block-longer-than-the-window"],
+)
+def test_optimize_a_block_longer_than_the_window_is_cut_short_by_the_deadline(
+    block: int, expected: list[float]
+) -> None:
+    outcome = run([planned(need=2 * E16, quarters=3)], priced(1, 1, 1), block=block)
+
+    assert [c for c in shape(outcome).values()] == expected
+
+
+@pytest.mark.parametrize(
+    ("block", "expected"),
+    [(1, {0: 6.0}), (2, {3: 6.0})],
+    ids=["block-of-one", "block-of-two"],
+)
+def test_optimize_a_tiny_need_goes_to_the_deadline_quarter_under_a_block(
+    block: int, expected: dict[int, float]
+) -> None:
+    # Pinned, not endorsed (step 8): P4 outranks "earlier first", and the run a deadline
+    # cuts short is free, so a need below one minimum-current quarter waits for the last.
+    outcome = run([planned(need=0.001)], priced(1, 1, 1, 1), block=block)
+
+    assert shape(outcome) == {q(t): c for t, c in expected.items()}
+    assert outcome.allocations["a"] == expected.get(0, 0.0)
+
+
+def test_optimize_a_partly_unpriced_horizon_uses_the_priced_quarters_first() -> None:
+    outcome = run([planned(need=3 * E16)], priced(1, 1, None, None))
+
+    assert shape(outcome) == {q(0): 16.0, q(1): 16.0, q(3): 16.0}
+    assert outcome.plans["a"].uses_unpriced is True
+    assert outcome.plans["a"].reachable is True
+
+
+def test_optimize_an_all_unpriced_horizon_charges_only_the_latest_quarter() -> None:
+    outcome = run([planned(need=E16)], {})
+
+    assert shape(outcome) == {q(3): 16.0}
+    assert outcome.allocations == {"a": 0.0}
+    assert outcome.plans["a"].uses_unpriced is True
+    assert outcome.plans["a"].quarters[0].price is None
+
+
+def test_optimize_unpriced_quarters_go_to_the_better_ranked_car_earlier() -> None:
+    need = 10 * 0.0575
+    a = planned("a", need=need, quarters=3, high=10)
+    b = planned("b", need=need, quarters=3, high=10)
+
+    outcome = run([a, b], {}, caps(10, 10, 10), caps(10, 10, 10))
+
+    assert shape(outcome, "a") == {q(1): 10.0}
+    assert shape(outcome, "b") == {q(2): 10.0}
+
+
+def test_optimize_equal_prices_put_the_better_ranked_car_on_now() -> None:
+    need = 10 * 0.0575
+    first = planned("z", need=need, quarters=3, high=10)
+    second = planned("a", need=need, quarters=3, high=10)
+
+    outcome = run([first, second], priced(1, 1, 1), caps(10, 10, 10), caps(10, 10, 10))
+
+    assert outcome.allocations == {"z": 10.0, "a": 0.0}
+    assert shape(outcome, "a") == {q(1): 10.0}
+
+
+def test_optimize_negative_prices_overfill_by_at_most_one_quarter() -> None:
+    outcome = run([planned(need=1.0)], priced(-0.1, -0.1, -0.1, -0.1))
+
+    plan = outcome.plans["a"]
+    assert [c for c in shape(outcome).values()] == [16.0, 11.0, 6.0]
+    assert plan.planned_kwh == pytest.approx(33 * 0.0575)
+    assert plan.planned_kwh <= 1.0 + E16
+    assert plan.reachable is True
+
+
+@pytest.mark.parametrize(("price", "exceeded"), [(0.5, False), (0.51, True)])
+def test_optimize_a_price_at_the_cap_is_not_above_it(
+    price: float, exceeded: bool
+) -> None:
+    outcome = run([planned(need=2 * E16, quarters=2)], priced(price, 0.1), cap=0.5)
+
+    assert shape(outcome) == {q(0): 16.0, q(1): 16.0}
+    assert outcome.plans["a"].price_cap_exceeded is exceeded
+
+
+def test_optimize_uses_the_cap_only_to_meet_the_need() -> None:
+    outcome = run([planned(need=E16, quarters=3)], priced(0.9, 0.2, 0.2), cap=0.5)
+
+    assert outcome.plans["a"].price_cap_exceeded is False
+    assert all(q_.price == 0.2 for q_ in outcome.plans["a"].quarters)
+
+
+def test_optimize_a_shortfall_is_reported_with_the_reachable_energy() -> None:
+    outcome = run([planned(need=10.0, quarters=2)], priced(1, 1))
+
+    plan = outcome.plans["a"]
+    assert plan.reachable is False
+    assert plan.planned_kwh == pytest.approx(2 * E16)
+
+
+def test_optimize_now_capacity_limits_only_the_first_quarter() -> None:
+    outcome = run(
+        [planned(need=2 * E16, quarters=3)],
+        priced(1, 2, 3),
+        caps(16, 16, 16),
+        caps(8, 8, 8),
+    )
+
+    assert [c for c in shape(outcome).values()] == [8.0, 16.0, 8.0]
+    assert outcome.allocations["a"] == 8.0
+
+
+def test_optimize_the_first_quarter_current_is_the_plans_first_quarter() -> None:
+    outcome = run([planned(need=E16)], priced(0.1, 1, 1, 1))
+
+    assert outcome.allocations["a"] == shape(outcome)[q(0)]
+
+
+@pytest.mark.parametrize(
+    "deadline",
+    [NOW, NOW - timedelta(hours=1)],
+    ids=["deadline-is-now", "deadline-in-the-past"],
+)
+def test_optimize_plans_nothing_for_a_deadline_at_or_before_now(
+    deadline: datetime,
+) -> None:
+    demand = Demand("a", L1, Tier.PLANNED, 6, 16, 16, need_kwh=E16, deadline=deadline)
+
+    outcome = run([demand], priced(1, 1))
+
+    plan = outcome.plans["a"]
+    assert outcome.allocations == {"a": 0.0}
+    assert plan.quarters == ()
+    assert plan.planned_kwh == 0.0
+    assert plan.reachable is False
+
+
+def test_optimize_a_deadline_inside_the_first_quarter_plans_that_quarter() -> None:
+    now = NOW + timedelta(minutes=5)
+    demand = Demand(
+        "a",
+        L1,
+        Tier.PLANNED,
+        6,
+        16,
+        16,
+        need_kwh=10.0,
+        deadline=NOW + 10 * timedelta(minutes=1),
+    )
+
+    outcome = run([demand], priced(1), now=now)
+
+    assert shape(outcome) == {NOW: 16.0}
+    assert outcome.allocations == {"a": 16.0}
+    assert outcome.plans["a"].reachable is False
+
+
+def test_optimize_a_zero_need_plans_nothing() -> None:
+    outcome = run([planned(need=0.0)], priced(1, 1, 1, 1))
+
+    assert outcome.plans["a"].quarters == ()
+    assert outcome.plans["a"].reachable is True
+    assert outcome.allocations == {"a": 0.0}
+
+
+def test_optimize_plans_the_repeated_hour_of_the_fall_back_night_in_utc() -> None:
+    now = datetime(2026, 10, 25, 0, 0, tzinfo=UTC)
+    prices = {now + QUARTER * t: 1.0 for t in range(4)}
+    prices |= {now + QUARTER * (4 + t): 0.1 for t in range(4)}
+    demand = Demand(
+        "a",
+        L1,
+        Tier.PLANNED,
+        6,
+        16,
+        16,
+        need_kwh=4 * E16,
+        deadline=now + 2 * timedelta(hours=1),
+    )
+
+    outcome = run([demand], prices, now=now)
+
+    plan = outcome.plans["a"]
+    assert [q_.start.astimezone(UTC) for q_ in plan.quarters] == [
+        now + QUARTER * (4 + t) for t in range(4)
+    ]
+    assert [q_.start.isoformat() for q_ in plan.quarters] == [
+        "2026-10-25T02:00:00+01:00",
+        "2026-10-25T02:15:00+01:00",
+        "2026-10-25T02:30:00+01:00",
+        "2026-10-25T02:45:00+01:00",
+    ]
+    assert all(q_.price == 0.1 for q_ in plan.quarters)
+    assert outcome.allocations == {"a": 0.0}
+
+
+def test_optimize_a_48_hour_horizon_of_192_quarters_plans_the_cheapest_first() -> None:
+    prices = {q(t): 0.01 * t for t in range(192)}
+    demand = Demand(
+        "a",
+        L1,
+        Tier.PLANNED,
+        6,
+        16,
+        16,
+        need_kwh=4 * E16,
+        deadline=NOW + timedelta(hours=48),
+    )
+
+    outcome = run([demand], prices, block=2)
+
+    assert shape(outcome) == {q(t): 16.0 for t in range(4)}
+    assert outcome.allocations == {"a": 16.0}
+    assert outcome.proven is True
+
+
+def test_optimize_the_overfill_bound_uses_the_highest_current_of_either_quarter() -> (
+    None
+):
+    # Pinned: the bound is need + e * max(first-quarter, later) current, which is the
+    # plan's `max_current` through decide; here only the first quarter can run.
+    demand = Demand("a", L1, Tier.PLANNED, 6, 4, 16, need_kwh=0.1, deadline=q(1))
+
+    outcome = run([demand], priced(1))
+
+    assert shape(outcome) == {q(0): 6.0}
+    assert outcome.plans["a"].reachable is True
+
+
+# --- the tiers on the leftover (T4) ------------------------------------------------
+
+
+def tier_demand(charger_id: str, tier: Tier, **kwargs: float) -> Demand:
+    low = kwargs.get("low", 6)
+    high = kwargs.get("high", 16)
+    if tier is Tier.PLANNED:
+        return Demand(
+            charger_id, L1, tier, low, high, high, need_kwh=E16, deadline=q(4)
+        )
+    return Demand(charger_id, L1, tier, low, high, high)
+
+
+QUARTER_ZERO_TIERS = [Tier.SMART_OFF, Tier.CHARGE_NOW, Tier.SPARE]
+
+
+def tiered(tier: Tier, demands: list[Demand]) -> list[Demand]:
+    return [
+        Demand(
+            d.charger_id,
+            d.phases,
+            tier,
+            d.min_current,
+            d.max_current,
+            d.now_max_current,
+        )
+        for d in demands
+    ]
+
+
+@pytest.mark.parametrize("tier", QUARTER_ZERO_TIERS, ids=lambda t: t.name)
+@pytest.mark.parametrize(
+    ("claims", "capacity", "expected"),
+    [
+        ([("a", 6, 16, L1), ("b", 6, 16, L1)], caps(16, 16, 16), {"a": 8.0, "b": 8.0}),
+        (
+            [("p", 10, 10, L1), ("c", 6, 16, L1)],
+            caps(16, 16, 16),
+            {"p": 10.0, "c": 6.0},
+        ),
+        (
+            [
+                ("a", 6, 16, frozenset({Phase.L1, Phase.L2})),
+                ("b", 6, 16, L1),
+                ("c", 6, 16, L2),
+            ],
+            caps(16, 16, 16),
+            {"a": 8.0, "b": 8.0, "c": 8.0},
+        ),
+        (
+            [("a", 6, 8, L1), ("b", 6, 16, L1), ("c", 6, 16, L1)],
+            caps(30, 30, 30),
+            {"a": 8.0, "b": 11.0, "c": 11.0},
+        ),
+    ],
+    ids=["even-split", "on-off-first", "mixed-phases", "limited-first"],
+)
+def test_optimize_every_quarter_zero_tier_reproduces_the_named_share_results(
+    tier: Tier,
+    claims: list[tuple[str, float, float, frozenset[Phase]]],
+    capacity: dict[Phase, float],
+    expected: dict[str, float],
+) -> None:
+    demands = [Demand(i, ph, tier, lo, hi, hi) for i, lo, hi, ph in claims]
+
+    outcome = run(demands, None, capacity, capacity)
+
+    assert outcome.allocations == expected
+
+
+@pytest.mark.parametrize(
+    ("high", "low"),
+    [
+        (Tier.SMART_OFF, Tier.CHARGE_NOW),
+        (Tier.SMART_OFF, Tier.PLANNED),
+        (Tier.SMART_OFF, Tier.SPARE),
+        (Tier.CHARGE_NOW, Tier.PLANNED),
+        (Tier.CHARGE_NOW, Tier.SPARE),
+        (Tier.PLANNED, Tier.SPARE),
+    ],
+    ids=lambda t: t.name,
+)
+def test_optimize_a_lower_tier_takes_only_what_a_higher_tier_leaves(
+    high: Tier, low: Tier
+) -> None:
+    demands = [
+        tier_demand("lo", low),
+        tier_demand("hi", high),
+    ]  # lower tier listed first
+    prices = priced(0.1, 1, 1, 1)
+
+    outcome = run(demands, prices, caps(16, 16, 16), caps(16, 16, 16), block=1)
+
+    assert outcome.allocations == {"lo": 0.0, "hi": 16.0}
+
+
+def test_optimize_a_lower_tier_gets_the_leftover_on_another_phase() -> None:
+    demands = [
+        Demand("lo", L2, Tier.SPARE, 6, 16, 16),
+        Demand("hi", L1, Tier.CHARGE_NOW, 6, 16, 16),
+    ]
+
+    assert run(demands).allocations == {"lo": 16.0, "hi": 16.0}
+
+
+def test_optimize_smart_off_current_holds_in_the_later_quarters() -> None:
+    off = Demand("s", L1, Tier.SMART_OFF, 10, 10, 10)
+    car = planned("p", need=3.0, quarters=16)
+
+    outcome = run([off, car], {q(t): 1.0 for t in range(16)})
+
+    assert outcome.allocations == {"s": 10.0, "p": 6.0}
+    assert {c for c in shape(outcome, "p").values()} == {6.0}
+
+
+def test_optimize_two_planned_cars_at_equal_prices_run_now_evenly() -> None:
+    cars = [planned("a", need=E16), planned("b", need=E16)]
+
+    outcome = run(cars, priced(1, 1, 1, 1))
+
+    assert outcome.allocations == {"a": 8.0, "b": 8.0}
+
+
+def test_optimize_the_quarter_zero_stages_ignore_a_deadline_and_a_need() -> None:
+    demand = Demand(
+        "a", L1, Tier.CHARGE_NOW, 6, 16, 16, need_kwh=0.0001, deadline=NOW - 5 * QUARTER
+    )
+
+    assert run([demand]).allocations == {"a": 16.0}
+
+
+def test_optimize_equal_minimum_and_maximum_is_on_off_even_below_the_first_quarter_limit() -> (
+    None
+):
+    # Pinned: `min == max` makes a demand on/off in every tier; `now_max_current` only
+    # lowers the first quarter, it never lifts an on/off demand above its current.
+    demand = Demand("a", L1, Tier.CHARGE_NOW, 6, 6, 16)
+
+    assert run([demand]).allocations == {"a": 6.0}
+
+
+# --- Demand, Outcome, SolverError, NODE_LIMIT ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "field"),
+    [
+        ({"phases": frozenset()}, "phases"),
+        ({"min_current": -1}, "min_current"),
+        ({"min_current": True}, "min_current"),
+        ({"max_current": float("nan")}, "max_current"),
+        ({"max_current": "16"}, "max_current"),
+        ({"now_max_current": True}, "now_max_current"),
+        ({"now_max_current": -0.5}, "now_max_current"),
+        ({"need_kwh": float("inf")}, "need_kwh"),
+        ({"need_kwh": -1.0}, "need_kwh"),
+        ({"deadline": datetime(2026, 10, 22, 5, 0)}, "deadline"),  # noqa: DTZ001 - deliberately naive
+        ({"tier": 2}, "tier"),
+        ({"tier": None}, "tier"),
+        ({"tier": Tier.PLANNED}, "deadline"),
+    ],
+)
+def test_demand_rejects_each_invalid_field_naming_it(
+    kwargs: dict[str, object], field: str
+) -> None:
+    fields: dict[str, object] = {
+        "charger_id": "a",
+        "phases": L1,
+        "tier": Tier.CHARGE_NOW,
+        "min_current": 6,
+        "max_current": 16,
+        "now_max_current": 16,
+    }
+    fields.update(kwargs)
+
+    with pytest.raises(ValueError, match=f"^{field}"):
+        Demand(**fields)  # type: ignore[arg-type]  # deliberately invalid values
+
+
+@pytest.mark.parametrize(
+    "demand",
+    [
+        lambda: Demand("a", L1, Tier.SPARE, 0, 0, 0),
+        lambda: Demand("a", L1, Tier.PLANNED, 6, 4, 0, deadline=NOW),
+        lambda: Demand("a", L1, Tier.CHARGE_NOW, 6, 0, 16),
+        lambda: Demand("a", L1, Tier.CHARGE_NOW, 6, 16, 16, deadline=NOW),
+        lambda: Demand("a", L1, Tier.CHARGE_NOW, 6.5, 16.0, 16.0),
+    ],
+    ids=["all-zero", "max-below-min", "max-zero", "deadline-ignored", "fractional-min"],
+)
+def test_demand_accepts_zero_and_a_maximum_below_the_minimum(
+    demand: Callable[[], Demand],
+) -> None:
+    assert demand().charger_id == "a"
+
+
+def test_demand_is_frozen() -> None:
+    demand = Demand("a", L1, Tier.CHARGE_NOW, 6, 16, 16)
+
+    with pytest.raises(FrozenInstanceError):
+        demand.min_current = 8  # type: ignore[misc]  # frozen dataclass
+
+
+def test_the_tier_members_are_ordered_by_precedence() -> None:
+    assert [t.name for t in Tier] == ["SMART_OFF", "CHARGE_NOW", "PLANNED", "SPARE"]
+    assert [int(t) for t in Tier] == [0, 1, 2, 3]
+
+
+def test_solver_error_carries_status_and_message_and_is_reexported() -> None:
+    error = SolverError(2, "Infeasible")
+
+    assert str(error) == "HiGHS status 2: Infeasible"
+    assert (error.status, error.message) == (2, "Infeasible")
+    assert isinstance(error, RuntimeError)
+    assert ev.SolverError is SolverError
+
+
+def test_node_limit_is_a_power_of_two_multiple_of_a_thousand() -> None:
+    assert isinstance(NODE_LIMIT, int)
+    assert NODE_LIMIT % 1000 == 0
+    multiple = NODE_LIMIT // 1000
+    assert multiple & (multiple - 1) == 0
+    assert NODE_LIMIT == 8000
+
+
+def test_outcome_is_frozen_and_holds_its_three_fields() -> None:
+    outcome = Outcome({"a": 1.0}, {}, True)
+
+    assert (outcome.allocations, outcome.plans, outcome.proven) == (
+        {"a": 1.0},
+        {},
+        True,
+    )
+    with pytest.raises(FrozenInstanceError):
+        outcome.proven = False  # type: ignore[misc]  # frozen dataclass
+
+
+# --- optimize: arguments, errors, capacities (T7) -------------------------------------
+
+
+def test_optimize_of_no_demands_returns_before_any_check() -> None:
+    naive = datetime(2026, 1, 1)  # noqa: DTZ001 - deliberately naive
+
+    outcome = optimize([], naive, {}, {}, {}, 230.0, 2, None, "Mars/Base")
+
+    assert outcome == Outcome({}, {}, True)
+
+
+@pytest.mark.parametrize(
+    ("now", "timezone", "error"),
+    [
+        (NOW.replace(tzinfo=None), "UTC", ValueError),
+        (NOW, "Mars/Base", ZoneInfoNotFoundError),
+    ],
+    ids=["naive-now", "unknown-zone"],
+)
+def test_optimize_rejects_a_naive_now_and_an_unknown_zone(
+    now: datetime, timezone: str, error: type[Exception]
+) -> None:
+    demand = Demand("a", L1, Tier.CHARGE_NOW, 6, 16, 16)
+
+    with pytest.raises(error):
+        optimize([demand], now, {}, CAP25, CAP25, 230.0, 2, None, timezone)
+
+
+@pytest.mark.parametrize(
+    "tiers",
+    [(Tier.CHARGE_NOW, Tier.CHARGE_NOW), (Tier.CHARGE_NOW, Tier.SPARE)],
+    ids=["same-tier", "different-tiers"],
+)
+def test_optimize_rejects_a_repeated_charger_id(tiers: tuple[Tier, Tier]) -> None:
+    demands = [Demand("a", L1, t, 6, 16, 16) for t in tiers]
+
+    with pytest.raises(ValueError, match="unique"):
+        run(demands)
+
+
+@pytest.mark.parametrize(
+    "capacity",
+    [{Phase.L1: -5.0, Phase.L2: -5.0, Phase.L3: -5.0}, {}],
+    ids=["negative", "absent"],
+)
+def test_optimize_treats_negative_and_absent_capacity_as_zero(
+    capacity: dict[Phase, float],
+) -> None:
+    demands = [
+        Demand("c", L1, Tier.CHARGE_NOW, 6, 16, 16),
+        planned("p", need=E16),
+        Demand("s", L1, Tier.SPARE, 6, 16, 16),
+        Demand("o", L1, Tier.SMART_OFF, 6, 16, 16),
+    ]
+
+    outcome = run(demands, priced(1, 1, 1, 1), capacity, capacity)
+
+    assert outcome.allocations == {"c": 0.0, "p": 0.0, "s": 0.0, "o": 0.0}
+    assert outcome.plans["p"].quarters == ()
+    assert outcome.plans["p"].reachable is False
+    assert outcome.plans["p"].planned_kwh == 0.0
+
+
+def test_optimize_does_not_mutate_its_arguments() -> None:
+    demands = [planned("a"), Demand("c", L1, Tier.CHARGE_NOW, 6, 16, 16)]
+    prices = priced(1, 2, 3, 4)
+    capacity = caps(20, 20, 20)
+    now_capacity = caps(18, 18, 18)
+    before = (list(demands), dict(prices), dict(capacity), dict(now_capacity))
+
+    run(demands, prices, capacity, now_capacity)
+
+    assert (demands, prices, capacity, now_capacity) == before
+
+
+def test_optimize_is_idempotent_and_returns_every_id() -> None:
+    demands = [
+        Demand("c", L1, Tier.CHARGE_NOW, 6, 16, 16),
+        planned("a"),
+        Demand("s", L2, Tier.SPARE, 6, 16, 16),
+    ]
+    prices = priced(0.3, 0.1, 0.2, 0.1)
+
+    first = run(demands, prices, block=2)
+
+    assert run(demands, prices, block=2) == first
+    assert list(first.allocations) == ["c", "a", "s"]
+    assert list(first.plans) == ["a"]
+
+
+def test_optimize_main_showcase_runs_and_prints(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    showcase()
+
+    out = capsys.readouterr().out
+    assert "proven optimal: True" in out
+    assert "no room" in out
+
+
+# --- rounding checks (C4): a limit broken after rounding raises SolverError ------------
+
+
+def test_a_current_outside_its_limits_after_rounding_raises_with_status_zero() -> None:
+    demand = Demand("a", L1, Tier.CHARGE_NOW, 6, 16, 16)
+
+    with pytest.raises(SolverError) as caught:
+        _current(demand, True, 17.0)
+
+    assert caught.value.status == 0
+    assert "a solved at 17.0 A" in caught.value.message
+    assert _current(demand, True, 0.2) == 0.0
+    assert _current(demand, True, 16.0) == 16.0
+
+
+def test_a_phase_over_its_capacity_after_rounding_raises_with_status_zero() -> None:
+    demand = Demand("a", L1, Tier.CHARGE_NOW, 6, 16, 16)
+    limits = {phase: 10.0 for phase in Phase}
+
+    with pytest.raises(SolverError) as caught:
+        _verify([demand], {"a": 12.0}, {}, NOW, limits, limits)
+
+    assert caught.value.status == 0
+    assert "L1" in caught.value.message
+    _verify([demand], {"a": 10.0}, {}, NOW, limits, limits)
+
+
+# --- the solver call (A5): single thread, node budget, no time limit -----------------
+
+
+def test_optimize_never_passes_a_time_limit_and_runs_single_threaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = optimize_module.milp
+    seen: list[dict[str, object]] = []
+
+    def spy(*args: object, **kwargs: object) -> object:
+        options = kwargs["options"]
+        assert isinstance(options, dict)
+        seen.append(dict(options))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(optimize_module, "milp", spy)
+
+    run([planned(), Demand("c", L1, Tier.CHARGE_NOW, 6, 16, 16)], priced(1, 2, 3, 4))
+
+    assert seen
+    for options in seen:
+        assert "time_limit" not in options
+        assert options["threads"] == 1
+        assert options["node_limit"] == NODE_LIMIT
+        assert options["mip_rel_gap"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (
+            4,
+            "The HiGHS status code was not recognized. (HiGHS Status 16: Solution limit reached)",
+        ),
+        (1, "Iteration or time limit reached"),
+    ],
+    ids=["status-four", "status-one"],
+)
+def test_optimize_a_node_budget_stop_with_a_point_is_not_proven(
+    monkeypatch: pytest.MonkeyPatch, status: int, message: str
+) -> None:
+    real = optimize_module.milp
+
+    def stopped(*args: object, **kwargs: object) -> SimpleNamespace:
+        result = real(*args, **kwargs)
+        return SimpleNamespace(
+            status=status, message=message, x=result.x, mip_node_count=NODE_LIMIT
+        )
+
+    monkeypatch.setattr(optimize_module, "milp", stopped)
+
+    outcome = run([planned()], priced(1, 2, 3, 4))
+
+    assert outcome.proven is False
+    assert shape(outcome) == {q(0): 16.0}
+
+
+def test_optimize_a_status_four_below_the_node_limit_is_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failed(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            status=4,
+            message="Solution limit reached",
+            x=np.array([1.0]),
+            mip_node_count=NODE_LIMIT - 1,
+        )
+
+    monkeypatch.setattr(optimize_module, "milp", failed)
+
+    with pytest.raises(SolverError) as caught:
+        run([Demand("a", L1, Tier.CHARGE_NOW, 6, 16, 16)])
+
+    assert caught.value.status == 4
+
+
+# --- T1: no limit is ever broken (property) ---------------------------------------------
+
+
+def _limit_hi(demand: Demand, first: bool) -> float:
+    """The highest current of a demand in a quarter, written out independently."""
+    top = demand.now_max_current if first else demand.max_current
+    if top < demand.min_current:
+        return 0.0
+    return demand.min_current if demand.min_current == demand.max_current else top
+
+
+def _random_demands(rng: random.Random, now: datetime) -> list[Demand]:
+    phase_sets = [L1, L2, frozenset({Phase.L1, Phase.L2}), ALL]
+    demands: list[Demand] = []
+    for index in range(rng.randint(1, 4)):
+        tier = rng.choice(list(Tier))
+        low = rng.choice([0, 1, 6, 6, 7.5, 10])
+        kind = rng.choice(["adjustable", "adjustable", "on-off", "inverted"])
+        high = {
+            "adjustable": rng.choice([low, 8, 16, 16]),
+            "on-off": low,
+            "inverted": max(0, low - 2),
+        }[kind]
+        first = rng.choice([high, high, rng.choice([0, 4, 8, 16])])
+        deadline = None
+        if tier is Tier.PLANNED:
+            deadline = now + timedelta(minutes=rng.choice([-30, 0, 5, 15, 40, 60, 100]))
+        demands.append(
+            Demand(
+                f"d{index}",
+                rng.choice(phase_sets),
+                tier,
+                float(low),
+                float(high),
+                float(first),
+                need_kwh=rng.choice([0.0, 0.3, 1.0, 3.0]),
+                deadline=deadline,
+            )
+        )
+    return demands
+
+
+def _random_capacity(rng: random.Random) -> dict[Phase, float]:
+    return {
+        phase: rng.choice([-5.0, 0.0, 6.0, 10.5, 16.0, 25.0, 40.0])
+        for phase in Phase
+        if rng.random() > 0.15
+    }
+
+
+@settings(deadline=None, max_examples=80, derandomize=True)
+@given(st.randoms(use_true_random=False))
+def test_optimize_never_breaks_a_limit(rng: random.Random) -> None:
+    now = NOW + timedelta(minutes=rng.choice([0, 0, 7, 14]))
+    demands = _random_demands(rng, now)
+    capacity = _random_capacity(rng)
+    now_capacity = _random_capacity(rng)
+    prices = {
+        q(t): rng.choice([0.1, 0.3, 0.6, -0.1])
+        for t in range(12)
+        if rng.random() > 0.25
+    }
+    outcome = optimize(
+        demands,
+        now,
+        prices,
+        capacity,
+        now_capacity,
+        230.0,
+        rng.randint(1, 4),
+        rng.choice([None, 0.4]),
+        "Europe/Copenhagen",
+    )
+    clipped_later = {p: max(0.0, capacity.get(p, 0.0)) for p in Phase}
+    clipped_now = {p: max(0.0, now_capacity.get(p, 0.0)) for p in Phase}
+
+    assert list(outcome.allocations) == [d.charger_id for d in demands]
+    assert set(outcome.plans) == {
+        d.charger_id for d in demands if d.tier is Tier.PLANNED
+    }
+    drawn_now = {p: 0.0 for p in Phase}
+    drawn_later: dict[datetime, dict[Phase, float]] = {}
+    smart_off = {p: 0.0 for p in Phase}
+    for d in demands:
+        current = outcome.allocations[d.charger_id]
+        for phase in d.phases:
+            drawn_now[phase] += current
+            if d.tier is Tier.SMART_OFF:
+                smart_off[phase] += current
+        _assert_current(d, current, True)
+        if d.tier is not Tier.PLANNED:
+            continue
+        plan = outcome.plans[d.charger_id]
+        first = 0.0
+        for quarter in plan.quarters:
+            start = quarter.start.astimezone(UTC)
+            assert floor_to_quarter(now) <= start < d.deadline  # type: ignore[operator]  # PLANNED has a deadline
+            assert (start - NOW) % QUARTER == timedelta(0)
+            _assert_current(d, quarter.current, start == floor_to_quarter(now))
+            if start == floor_to_quarter(now):
+                first = quarter.current
+            else:
+                slot = drawn_later.setdefault(start, {p: 0.0 for p in Phase})
+                for phase in d.phases:
+                    slot[phase] += quarter.current
+        assert current == first
+    for phase in Phase:
+        assert drawn_now[phase] <= clipped_now[phase] + 1e-6
+        assert smart_off[phase] <= clipped_later[phase] + 1e-6
+        for slot in drawn_later.values():
+            assert slot[phase] + smart_off[phase] <= clipped_later[phase] + 1e-6
+
+
+def _assert_current(demand: Demand, current: float, first: bool) -> None:
+    top = _limit_hi(demand, first)
+    if current == 0:
+        return
+    assert demand.min_current - 1e-9 <= current <= top + 1e-9
+    if demand.min_current == demand.max_current:
+        assert current == demand.min_current
+    else:
+        assert current == int(current)
+
+
+# --- T2: the lexicographic tuple equals an exhaustive enumeration's -----------------------
+
+LEVELS_ADJUSTABLE = (0.0, 6.0, 7.0)
+LEVELS_ON_OFF = (0.0, 10.0)
+LEVELS_SIX = (0.0, 6.0)
+
+
+def _tau(t: int, n: int, count: int, total: int, is_priced: bool) -> int:
+    return (t + 1) * (count - n) if is_priced else (total - t) * (n + 1)
+
+
+def level_tuple(
+    demands: list[Demand],
+    grid: list[list[float]],
+    prices: dict[datetime, float],
+    block: int,
+    cap: float | None,
+    total: int,
+) -> tuple[float, ...]:
+    """The levels P1 to P7 of one assignment, written out from the plan's model."""
+    levels: list[float] = []
+    energy = [energy_per_quarter_kwh(1.0, len(d.phases), 230.0) for d in demands]
+    delivered = [e * sum(row) for e, row in zip(energy, grid, strict=True)]
+    levels.append(
+        sum(
+            max(0.0, d.need_kwh - got)
+            for d, got in zip(demands, delivered, strict=True)
+        )
+    )
+    unpriced = sum(
+        e * i
+        for e, row in zip(energy, grid, strict=True)
+        for t, i in enumerate(row)
+        if q(t) not in prices
+    )
+    levels.append(unpriced)
+    if cap is not None:
+        levels.append(
+            sum(
+                e * i
+                for e, row in zip(energy, grid, strict=True)
+                for t, i in enumerate(row)
+                if q(t) in prices and prices[q(t)] > cap
+            )
+        )
+    if block > 1:
+        short = 0
+        for row in grid:
+            on = [i > 0 for i in row]
+            for t, is_on in enumerate(on):
+                if (
+                    is_on
+                    and (t == 0 or not on[t - 1])
+                    and not all(on[t + 1 : t + block])
+                ):
+                    short += 1
+        levels.append(float(short))
+    levels.append(
+        sum(
+            prices[q(t)] * e * i
+            for e, row in zip(energy, grid, strict=True)
+            for t, i in enumerate(row)
+            if q(t) in prices
+        )
+    )
+    if q(0) in prices:
+        on_now = [row[0] > 0 for row in grid if row]
+        levels.append(-float(sum(on_now)))
+        levels.extend(-float(flag) for flag in on_now)
+        running = [row[0] for row in grid if row and row[0] > 0]
+        levels.append(-min(running) if running else 0.0)
+    count = len(demands)
+    levels.append(
+        float(
+            sum(
+                _tau(t, n, count, total, q(t) in prices) * i
+                for n, row in enumerate(grid)
+                for t, i in enumerate(row)
+            )
+        )
+    )
+    return tuple(levels)
+
+
+def _assignments(levels: tuple[float, ...], quarters: int) -> list[tuple[float, ...]]:
+    return list(itertools.product(levels, repeat=quarters))
+
+
+@settings(deadline=None, max_examples=60, derandomize=True)
+@given(st.randoms(use_true_random=False))
+def test_optimize_matches_a_brute_force_enumeration_level_by_level(
+    rng: random.Random,
+) -> None:
+    count = 2 if rng.random() < 0.75 else 1
+    shared = rng.choice([L1, L2])
+    kinds = [rng.choice(["adjustable", "on-off-10", "on-off-6"]) for _ in range(count)]
+    sizes = {
+        "adjustable": LEVELS_ADJUSTABLE,
+        "on-off-10": LEVELS_ON_OFF,
+        "on-off-6": LEVELS_SIX,
+    }
+    horizon = max(
+        h
+        for h in range(2, 7)
+        if h == 2 or math.prod(len(sizes[k]) ** h for k in kinds) <= 30000
+    )
+    horizon = rng.randint(2, horizon)
+    demands: list[Demand] = []
+    levels: list[tuple[float, ...]] = []
+    for index, kind in enumerate(kinds):
+        low, high = {
+            "adjustable": (6.0, 7.0),
+            "on-off-10": (10.0, 10.0),
+            "on-off-6": (6.0, 6.0),
+        }[kind]
+        demands.append(
+            Demand(
+                f"d{index}",
+                shared if rng.random() < 0.7 else rng.choice([L1, L2]),
+                Tier.PLANNED,
+                low,
+                high,
+                high,
+                need_kwh=rng.choice([0.0, 0.3, 0.7, 1.0, 1.4, 2.0]),
+                deadline=q(rng.randint(1, horizon)),
+            )
+        )
+        levels.append(sizes[kind])
+    prices = {
+        q(t): rng.choice([0.1, 0.2, 0.5]) for t in range(horizon) if rng.random() > 0.3
+    }
+    block = rng.randint(1, 3)
+    cap = rng.choice([None, 0.3])
+    amps = [0, 6, 7, 10, 12, 13, 14, 16, 20]
+    later = {p: float(rng.choice(amps)) for p in Phase}
+    first = {p: float(rng.choice(amps)) for p in Phase}
+
+    outcome = optimize(
+        demands, NOW, prices, later, first, 230.0, block, cap, "Europe/Copenhagen"
+    )
+
+    windows = [len(quarter_starts(NOW, d.deadline)) for d in demands]  # type: ignore[arg-type]  # PLANNED has a deadline
+    total = max(windows)
+    energy = [energy_per_quarter_kwh(1.0, len(d.phases), 230.0) for d in demands]
+    best: tuple[float, ...] | None = None
+    options = [_assignments(lv, w) for lv, w in zip(levels, windows, strict=True)]
+    for grid in itertools.product(*options):
+        if not _feasible(demands, grid, later, first, energy):
+            continue
+        key = level_tuple(demands, [list(r) for r in grid], prices, block, cap, total)
+        if best is None or _lex_less(key, best):
+            best = key
+    assert best is not None
+    if not outcome.proven:
+        return
+    found = [
+        [shape(outcome, d.charger_id).get(q(t), 0.0) for t in range(w)]
+        for d, w in zip(demands, windows, strict=True)
+    ]
+    got = level_tuple(demands, found, prices, block, cap, total)
+    assert got == pytest.approx(best, abs=1e-6)
+
+
+def _feasible(
+    demands: list[Demand],
+    grid: tuple[tuple[float, ...], ...],
+    later: dict[Phase, float],
+    first: dict[Phase, float],
+    energy: list[float],
+) -> bool:
+    for t in range(max(len(row) for row in grid)):
+        for phase in Phase:
+            drawn = sum(
+                row[t]
+                for d, row in zip(demands, grid, strict=True)
+                if phase in d.phases and t < len(row)
+            )
+            if drawn > (first if t == 0 else later)[phase] + 1e-9:
+                return False
+    for d, row, e in zip(demands, grid, energy, strict=True):
+        if e * sum(row) > d.need_kwh + e * d.max_current + 1e-9:
+            return False
+    return True
+
+
+def _lex_less(a: tuple[float, ...], b: tuple[float, ...]) -> bool:
+    for x, y in zip(a, b, strict=True):
+        if abs(x - y) > 1e-6:
+            return x < y
+    return False
