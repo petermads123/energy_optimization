@@ -176,8 +176,12 @@ Phase capacity, draw and reservations, measurement freshness and max-min-fair sh
 ### `src/energy_optimization/ev/decide.py`
 
 The decision core: classification, priority tiers, planning, sharing, actions, reasons,
-status and events. An unplanned expected finish is computed in UTC and is `None` for a
-trickle of current no calendar can hold, instead of raising `OverflowError`.
+status and events. Its time arithmetic is in UTC throughout (every aware input is
+converted before it is added to or compared; only output datetimes are presented in the
+settings timezone). Both expected-finish branches add in UTC: a planned one adds its last
+quarter's length to that quarter's UTC start, so it is right in the repeated hour of the
+fall-back night, and an unplanned one is `None` for a trickle of current no calendar can
+hold, instead of raising `OverflowError`.
 
 | Signature | Description |
 |---|---|
@@ -259,9 +263,11 @@ float-residue and `user_current_limit=0` regressions, determinism across hash se
 standard-library-only AST scan, the 100 ms performance check, and two `hypothesis`
 properties over generated snapshots: one (T17) whose invariants are computed independently of
 the module's helpers, and one that sends each snapshot through the dict round trip and gets
-the same decision; the invariants include a plan-fit oracle keyed in UTC. Also the
+the same decision; the invariants include a plan-fit oracle keyed in UTC and
+`expected_finish` after the first planned quarter, compared as instants. Also the
 stateless-core tests: the unplanned expected finish added in UTC across both 2026 DST
-nights, `reaches_target` across the fold, a trickle of current giving `None`, no state
+nights, a planned expected finish ending in or at the repeated hour of the fall-back
+night, `reaches_target` across the fold, a trickle of current giving `None`, no state
 between interleaved snapshots, and the public surface equal to round 1's (exports, removed
 modules and names, dataclass fields, signatures); and the `main` showcase.
 

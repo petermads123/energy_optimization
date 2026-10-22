@@ -608,7 +608,11 @@ def _reaches(item: _Item, ctx: _Context) -> bool | None:
         return None
     finish = _expected_finish(item, ctx)
     now = ctx.now.astimezone(UTC)
-    return finish is not None and item.deadline > now and finish <= item.deadline
+    return (
+        finish is not None
+        and item.deadline > now
+        and finish.astimezone(UTC) <= item.deadline
+    )
 
 
 def main() -> None:
