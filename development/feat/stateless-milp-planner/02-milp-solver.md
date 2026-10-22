@@ -1,6 +1,6 @@
 # MILP solver
 
-<!-- claude-plan step=4 status=active -->
+<!-- claude-plan step=5 status=active -->
 
 
 | Field | Value |
@@ -17,7 +17,7 @@
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done (re-run after the second step-6 halt) |
-| 4 | Verify | `/verify` | in `/build` | pending (re-run) |
+| 4 | Verify | `/verify` | in `/build` | done (re-run after the second step-6 halt) |
 | 5 | Test | `/test` | in `/build` | pending (re-run) |
 | 6 | Concept check | `/concept-check` | in `/build` | pending (re-run) |
 | 7 | Ship | `/ship` | in `/build` | pending |
@@ -1096,6 +1096,22 @@ row, and the `test_ev_optimize.py` entry, are updated for the leftover rule and 
 | Deviations 16 and 17 | Both recorded in section 3 (step-3 re-run subsection) with reason and evidence; deviations 5 and 9 carry "reversed" / "superseded" pointers. The Public API table is unchanged by both. `presolve` is `True` in `optimize.py` (line 209) and the spy test asserts `mip_rel_gap == 0.0` and `presolve is True`. |
 | `STRUCTURE.md` | Auditor report applied or rebutted: `optimize.py` entry, no change (agreed). Item 1 (`test_ev_optimize.py`): the first half (the planned tier's full progressive fill) was already written by step 3; applied the two parts it lacked, "a zero gap and presolve on" in the solver-spy clause, and the unpriced-not-filled and 8 / 8 / 8 mixed-phase pins. Item 2 (`test_ev_decide.py`): already present as "the two step-6 snapshots HiGHS called infeasible without presolve (explicit literals)"; rebutted as done, wording kept. `decide`'s own spy test checks only the node budget, threads and gap, as the auditor noted; no drift. |
 | Showcases | model, result, quarters, planning, allocation, optimize, decide, codec all exit 0 with readable output (the expected `RuntimeWarning` on `optimize` only). `optimize.main` unchanged and still in the required form. |
+
+### Re-run after the second step-6 halt (step 3 fifth run)
+
+| Check | Result |
+|---|---|
+| `ruff check .` | `All checks passed!` |
+| `ruff format --check .` | `57 files already formatted` |
+| `mypy` | `Success: no issues found in 26 source files` |
+| `pytest` | `1407 passed in 144.33s` (matches step 3's count) |
+| Plan completeness | Public API table re-checked by introspection: `optimize.py` public names are exactly `Demand`, `Outcome`, `SolverError`, `Tier`, `main`, `optimize` (+ `NODE_LIMIT = 8000`); `optimize(...)` has the nine planned parameters and return type; `Demand` fields and defaults (`need_kwh=0.0`, `deadline=None`) as planned. No Missing, no Unplanned. |
+| S2 against the amended row | `_stage_now`: S1 inclusion, then rounds of a solved level `f`; at that level each unsaturated demand in ranking order takes one amp if it fits on all its phases in what is left, one that does not fit (or is at its `hi`) is frozen; loop ends when all are frozen. No S3 solve remains. Matches section 2's S2 and the removed S3 row (deviation 23). |
+| P6 against the amended row | `_fill_now`: when a round saturates no car, each live car in ranking order calls `_Problem.raise_to(col, f + 1)`; cars that rose stay live, the rest drop out; integer columns rounded before comparison (deviation 21). Matches section 2's P6 row. |
+| Retry rule | `_Problem._solve` calls `_milp(presolve=True)`; `_failed` (status 2 or `x is None`) triggers one `_milp(presolve=False)`; only the retry's result is judged (status 0 proven; status 1 or status 4 with `mip_node_count >= NODE_LIMIT` and a point is not proven; anything else raises with the retry's status and message). Statuses 3 and 4 below the limit with a point are not retried. Options `node_limit`, `mip_rel_gap=0.0`, `threads=1`, no `time_limit`. Matches "Every solve" and deviation 24. |
+| Deviations 23 and 24 | Both recorded in section 3 with reason and evidence; deviation 1 and the S3 row carry "gone, deviation 23" pointers. The Public API table is unchanged by both. |
+| `STRUCTURE.md` | Auditor report (third pass) checked against the code as it stands. Edits 1 and 2 (purpose paragraph: leftover rule, retry) were already in the file as step 3 wrote them; rebutted as done, wording kept. Edit 3 (`optimize` row): step 3's wording "fails twice" applied in the auditor's clearer form, "fails and its one retry with presolve toggled fails too (carrying the retry's status and message)". Edit 4 (`test_ev_optimize.py`): (b) the leftover wording and the retry clause were already present; applied the one missing part, "failing without a retry" for a status 4 below the limit (true: `_failed` does not fire for it). No signature drift. |
+| Showcases | `python -m energy_optimization.ev.<module>` for model, result, quarters, planning, allocation, optimize, decide, codec: all exit 0 with readable output (the expected `RuntimeWarning` only). `optimize.main` unchanged, still in the required form (named inputs, call, result, print, `Tier` members listed in a comment). |
 
 ---
 
