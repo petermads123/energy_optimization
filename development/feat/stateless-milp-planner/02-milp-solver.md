@@ -1,6 +1,6 @@
 # MILP solver
 
-<!-- claude-plan step=5 status=active -->
+<!-- claude-plan step=6 status=active -->
 
 
 | Field | Value |
@@ -18,7 +18,7 @@
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done (re-run after the second step-6 halt) |
 | 4 | Verify | `/verify` | in `/build` | done (re-run after the second step-6 halt) |
-| 5 | Test | `/test` | in `/build` | pending (re-run) |
+| 5 | Test | `/test` | in `/build` | done (re-run after the second step-6 halt) |
 | 6 | Concept check | `/concept-check` | in `/build` | pending (re-run) |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
@@ -1074,6 +1074,40 @@ above). Every module showcase exits 0. `STRUCTURE.md`'s `optimize.py` purpose pa
 row, and the `test_ev_optimize.py` entry, are updated for the leftover rule and the retry.
 
 
+### Step-5 re-run after the second step-6 halt (2026-10-22)
+
+25. *`_fill_now` keeps a higher value.* In the raise pass `value[n] = reached + 1` lowered the
+    recorded value of a car already above the level (unequal minimums). Only the `at_top`
+    shortcut reads `value`, and the next round resets it from `reached`, so no result changed
+    and no test can see it; it is now `max(value[n], reached + 1)`. Pinned only by the
+    unequal-minimums results (right before and after). Public API unchanged.
+
+*Retry scope, aligned with the code (no behaviour change).* `_failed` retries status 2 with or
+without a point and any result without a point (status 0, 3 or 4 without `x`); a result with a
+point and any other status is judged as it is. Section 2's "Every solve" bullet, deviation 24,
+the `_failed` and `_solve` docstrings, `Outcome.proven`, `optimize`'s `Raises:` and
+`STRUCTURE.md` now say so. A6's "reports infeasible, or stops without a point" is read as "no
+usable point"; no change to section 1.
+
+**A5 with every solve retried (forced failure; not in the suite).** `r2c_forced.py`: whole
+`decide` on `benchmark_snapshot`; every first attempt runs the real solver and is then
+reported as a status 4 without a point, so each solve pays for both attempts (the retry is the
+real presolve-off result). 4 cores, one thread, `NODE_LIMIT = 8000`, seconds, seeds 1 to 8
+(a few quick test runs shared the machine during the 10-charger cells). No
+`PLAN_NOT_PROVEN_OPTIMAL`, no `SolverError`, first and retry call counts equal in every run.
+
+| Cell | Tier | Times (seeds 1 to 8) | Worst | Unforced worst (fifth run) |
+|---|---|---|---|---|
+| 3 @ 35 A | 10 s | 1.58 0.35 1.47 1.09 2.44 0.91 1.07 0.79 | 2.44 | 1.09 |
+| 7 @ 70 A | 60 s | 8.69 17.28 5.37 5.34 4.77 4.42 5.46 5.70 | 17.28 | 7.82 |
+| 10 @ 70 A | 120 s | 14.86 11.99 22.98 5.61 89.94 5.48 19.82 73.61 | 89.94 (seed 5) | 46.70 |
+
+Every tier still holds with every solve doubled; the 10-charger worst case is 90 s of 120 s
+(seed 5; 46.7 s unforced). Nothing to record for step 8 on the promised grid. A real retry
+repeats only the solve that failed, so this is an upper bound; a tighter grid carries no
+time promise.
+
+
 ## 4. Verification log
 
 > Written in step 4: the static half. Command output, not a summary of it.
@@ -1258,6 +1292,78 @@ Edge cases considered and deliberately skipped, with reasons:
   levels^(quarters x demands)).
 - *Pinning `_fit_now`'s call count*: it is a shortcut, covered by the results it must not change.
 - *The 192-quarter horizon through `decide`*: unchanged from the first run.
+
+### Re-run after the second step-6 halt (step 5, third run, 2026-10-22)
+
+Two `test-designer` reports (`input-space`: 10 cases and 4 contradictions; `contract`: 10
+cases and 6 contradictions) were merged with the orchestrator's guidance. Every case was
+written except the slow one (contract 10, measured instead: section 3). No bug was found:
+every new test was green on its first run, so there is no red evidence to record. To check
+the tests bite, three mutations of `optimize.py` were run, each turned the intended test red,
+and the file was restored: `_failed` widened to `status != 0`
+(`..._a_budget_stop_with_a_point_is_not_retried[status-one]`), the fractional guard
+`value + 1 > top` removed from `_stage_now`
+(`..._a_fractional_first_quarter_limit_never_takes_the_remainder_amp[SMART_OFF]`), and the
+retry's failure reported with the first attempt's status
+(`..._a_failed_retry_raises_with_the_retrys_status_and_message[three-without-a-point]`).
+
+| Intent | Test names | Result |
+|---|---|---|
+| A6 the retry reports its own failure | `test_optimize_a_failed_retry_raises_with_the_retrys_status_and_message` (5: status 3, 4 below the limit with a point, 2 with a point, 0 and 4 at the limit without a point; status, message, `str` and the presolve flags `[True, False]`), `test_decide_reports_the_retrys_failure_not_the_first_attempts` (3, through `decide`) | pass |
+| A5/A6 the retry's options | `test_optimize_the_retry_changes_nothing_but_presolve_and_never_adds_a_time_limit` (every first attempt fails: key set, threads, node budget, gap, and each retry equals its first attempt apart from `presolve`); `test_optimize_never_passes_a_time_limit_and_runs_single_threaded` now asserts the retry contract (below) | pass |
+| A6 a budget stop with a point is not retried | `test_optimize_a_budget_stop_with_a_point_is_not_retried` (status 1 and status 4 at the limit: no `presolve=False` call, not proven, allocations equal a clean run's) | pass |
+| A6 a retry that stops with a point | `test_optimize_a_retry_that_stops_at_status_one_with_a_point_is_kept_and_not_proven` | pass |
+| A6 the planned remainder through a retry | `test_optimize_the_planned_remainder_survives_a_retry_of_every_solve` (2: proven retry, and a retry that stops at the budget; 7 / 7 / 6, `proven` follows the retry; the raise pass, probes and levels all retry) | pass |
+| A5 retried runs are deterministic | `test_optimize_a_retried_run_issues_the_same_solver_calls_every_run` (the call sequence alternates True, False and is equal across two runs), `test_optimize_the_tiny_seed_still_exercises_the_real_retry` (seed 1931 equal across runs, with a message if HiGHS stops needing the retry) | pass |
+| A3 fractional limits and rooms | `test_optimize_a_fractional_first_quarter_limit_never_takes_the_remainder_amp` (4 tiers: a 6.5 A limit leaves 6 / 7, 10.5 A gives 10), `test_optimize_the_remainder_at_zero_above_the_minimum_and_on_a_fractional_room` (4 tiers x 4 rooms: 18, 21, 22, 20.5 A) | pass |
+| A3 binding versus free phases | `test_optimize_a_car_on_the_binding_phase_drops_out_while_one_on_a_free_phase_keeps_rising` (4 tiers x 2 rankings: 7 / 6 / 16) | pass |
+| A3 on/off cars in the raise pass | `test_optimize_an_on_off_car_inside_the_ranking_takes_its_current_and_the_remainder_skips_it` (4 tiers x whole 10 A and fractional 7.5 A) | pass |
+| A3 unequal minimums | `test_optimize_unequal_minimums_send_the_remainder_to_the_lowest_not_the_higher_minimum` (4 tiers x 3 rows, one with the higher minimum between the others) | pass |
+| A3 smart-off's two rooms | `test_optimize_smart_off_shares_the_smaller_of_its_two_rooms_one_amp_at_a_time` (later binds, now binds, charge-now ignores the later room) | pass |
+| A3/A5 `raise_to` stopped at the budget | `test_optimize_a_raise_to_solve_stopped_at_the_budget_is_not_proven` | pass |
+| A3 odd first quarter forced by prices | `test_optimize_a_cost_forced_odd_first_quarter_gives_the_extra_amp_to_the_first_ranked` (both rankings) | pass |
+| A3 planned tier against round 1's `share` | `test_optimize_the_planned_tier_equals_round_ones_share_on_generated_claims` (40 seeds: every car fits at its minimum and the needs leave only the even split to decide) | pass |
+| A1 slack | `test_optimize_limits_hold_to_the_solver_tolerance_and_the_documented_slack` (3 tiers x 3 rooms) | pass |
+
+**Settled contradictions.**
+
+- *Retry scope* (both reports' contradiction 1, input-space 1, contract 1 to 4): deviation 24,
+  section 2's "Every solve", the `_failed` and `_solve` docstrings, `Outcome`, `optimize`'s
+  `Raises:` and `STRUCTURE.md` aligned with what the code does; behaviour unchanged (section 3).
+- *`Outcome.proven` docstring* (input-space 2): now says the retry's result counts.
+- *Solver-tolerance slack* (input-space 4): accepted. A room is honoured to HiGHS's 1e-7 plus
+  `_verify`'s 1e-6 A, below the resolution of any current measurement; a room 5e-10 short of a
+  whole amp counts as that amp (pinned: 21 - 5e-10 A gives 7 / 7 / 7, 19.99 A does not). No
+  halt, no code change.
+- *`_fill_now`'s `value`* (input-space 3, contract 6): fixed (deviation 25), harmless today.
+- *STRUCTURE.md against section 3* (contract 5): the purpose paragraph, the `optimize` row and
+  the `test_ev_optimize.py` entry now describe the retry and the remainder tests.
+- *The `presolve is True` test* (contract 6): `test_optimize_never_passes_a_time_limit_and_runs_single_threaded`
+  asserted `presolve is True` on every call, which held only because its input never triggers a
+  retry. It now asserts the retry contract: the key set, no `time_limit`, threads and node
+  budget on every call, and a `presolve=False` call only straight after a `presolve=True` one
+  with every other option equal. Changed in place, not weakened.
+- *A5 with every solve retried* (contract case 10): measured, not added to the suite (section
+  3): worst 2.44 s, 17.28 s and 89.94 s for the 3-, 7- and 10-charger cells against 10, 60 and
+  120 s. No tier breaks; nothing for step 8.
+
+**Bugs found:** none, so no red/green pairs this run.
+
+**Suite.** `ruff check .`, `ruff format --check .`, `mypy`: clean. `pytest`: 1525 passed in
+148.6 s (1407 before this run; 118 added, 115 in `test_ev_optimize.py` and 3 in
+`test_ev_decide.py`, plus one existing test changed in place). Every module showcase exits 0.
+
+Edge cases considered and deliberately skipped, with reasons:
+
+- *The forced-retry A5 cells as a test* (contract 10): minutes of runtime, and the forced case
+  is not the promised grid; measured once and recorded.
+- *Remainder equal to the number of cars* and *a single car*: unreachable by the fill (a level
+  maximised for all cars leaves at least one stuck; a lone car is always stuck), as the
+  input-space report said.
+- *Empty demands, naive `now`, text, purity of `_stage_now`*: the changed code does not touch
+  them and the existing tests cover them.
+- *A direct test of `_fill_now`'s `value` after the raise pass*: private state with no
+  observable effect, so it is pinned only through the results.
 
 ## 6. Concept check
 
