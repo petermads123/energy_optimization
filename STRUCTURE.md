@@ -187,7 +187,7 @@ fallback: a solve that ends without a point raises `SolverError`.
 | `class Tier(IntEnum)`: `SMART_OFF = 0`, `CHARGE_NOW = 1`, `PLANNED = 2`, `SPARE = 3` | Which precedence stage a demand belongs to. |
 | `Demand(charger_id: str, phases: frozenset[Phase], tier: Tier, min_current: float, max_current: float, now_max_current: float, need_kwh: float = 0.0, deadline: datetime \| None = None)` | One charger asking for current, given in ranking order; validates itself with `ValueError` naming the field. |
 | `Outcome(allocations: dict[str, float], plans: dict[str, SessionPlan], proven: bool)` | Quarter-0 current of every demand, a plan per `PLANNED` demand, `proven` False when a solve stopped at the node budget with a point. |
-| `optimize(demands: Sequence[Demand], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], now_capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str) -> Outcome` | Solve the lexicographic model; `SolverError` on failure, `ValueError` for a naive `now` or a repeated charger id. |
+| `optimize(demands: Sequence[Demand], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], now_capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str) -> Outcome` | Solve the lexicographic model; `SolverError` on failure, `ValueError` for a naive `now` or a repeated charger id, `ZoneInfoNotFoundError` for an unknown `timezone`. |
 | `main() -> None` | Showcase: a charge-now car, two planned cars and a spare-capacity car on one phase, then a phase with no room. |
 
 ### `src/energy_optimization/ev/decide.py`

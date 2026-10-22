@@ -831,6 +831,7 @@ def main() -> None:
             for quarter in range(4):
                 prices[now + timedelta(hours=hour, minutes=15 * quarter)] = price
     l1 = frozenset({Phase.L1})
+    # Tier: SMART_OFF, CHARGE_NOW, PLANNED, SPARE
     demands = [
         Demand("boost", l1, Tier.CHARGE_NOW, 6, 16, 16),
         Demand("a", l1, Tier.PLANNED, 6, 16, 16, need_kwh=12.0, deadline=deadline),

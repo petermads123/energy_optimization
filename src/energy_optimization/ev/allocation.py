@@ -1,4 +1,4 @@
-"""Phase capacity and current sharing.
+"""Phase capacity, draw and reservations.
 
 Pure helpers: what a phase may carry (budget and phase guard), what chargers draw or
 are reserved at, and whether phase measurements can be trusted. Sharing the capacity

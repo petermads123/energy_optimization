@@ -1,6 +1,6 @@
 # MILP solver
 
-<!-- claude-plan step=4 status=active -->
+<!-- claude-plan step=5 status=active -->
 
 
 | Field | Value |
@@ -17,7 +17,7 @@
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done |
-| 4 | Verify | `/verify` | in `/build` | pending |
+| 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
@@ -726,12 +726,13 @@ and `tests/test_ev_optimize.py` and loses `Claim`, `share`, `PlanRequest` and `p
 
 | Check | Result |
 |---|---|
-| `ruff check .` | |
-| `ruff format --check .` | |
-| `mypy` | |
-| Plan completeness | every signature in the Public API table exists as written |
-| `STRUCTURE.md` | in sync |
-| `python -m <package>.<module>` | |
+| `ruff check .` | `All checks passed!` |
+| `ruff format --check .` | `57 files already formatted` |
+| `mypy` | `Success: no issues found in 26 source files` (no scipy override needed) |
+| `pytest` | `1166 passed in 127.98s` |
+| Plan completeness | every signature in the Public API table exists as written: `SolverError(status, message)` with `str` form, `NODE_LIMIT = 8000`, `Tier`, `Demand` (fields, defaults, validation), `Outcome`, `optimize(...)`, `main`, `EventKind.PLAN_NOT_PROVEN_OPTIMAL`, `SolverError` in `ev.__all__`, dependencies in `pyproject.toml`; `PlanRequest`, `plan_sessions`, `Claim`, `share` removed. No Missing, no Unplanned; deviations 1 to 9 are recorded in section 3 (`NODE_LIMIT` value fixed by the benchmark, as planned) |
+| `STRUCTURE.md` | in sync. Auditor: no drift. Applied its note 1 (`optimize` row now lists `ZoneInfoNotFoundError`) and note 2 (stale first line of `allocation.py` reworded; `test_ev_optimize.py`'s docstring left for step 5, which fills the file) |
+| `python -m energy_optimization.ev.<module>` | model, result, quarters, planning, allocation, decide, codec, optimize all exit 0 and print readable output (the expected `RuntimeWarning` only). Showcase form checked; `optimize.main` gained a same-line-style comment listing the `Tier` members |
 
 ---
 
