@@ -16,7 +16,7 @@
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
-| 3 | Implement | `/implement` | in `/build` | pending |
+| 3 | Implement | `/implement` | in `/build` | in progress (halted at guide item 8) |
 | 4 | Verify | `/verify` | in `/build` | pending |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
@@ -549,7 +549,68 @@ The `plan-critic` verdict was "accept with the changes". Every finding is applie
 > planned" is a complete and good entry. On a fix round, also the reproduction test's red
 > run, pasted here before the fix was written — step 6 cites it.
 
----
+**State at the halt.** Guide items 1 to 6 are done in `src/`: dependencies installed,
+`EventKind.PLAN_NOT_PROVEN_OPTIMAL`, `optimize.py`, `decide.py` wired to it, the greedy
+code removed from `planning.py` and `allocation.py`, `SolverError` exported. Items 7 (tests)
+and 9 (`STRUCTURE.md`, `README.md`) are **not** done, because item 8's benchmark halted the
+build first (see **Halted**). `ruff`, `ruff format` and `mypy` on `src/` are clean; the old
+tests still import removed names and fail to collect.
+
+**Node-limit spike, re-run in the project venv** (scipy 1.18.1, HiGHS 1.12.0, 80-variable
+knapsack, node limits 1, 3, 10): `status == 4`, `message == "The HiGHS status code was not
+recognized. (HiGHS Status 16: Solution limit reached)"`, `mip_node_count == node_limit`,
+`x` present, and the `threads` `RuntimeWarning`. It equals the survey, so the not-proven rule
+is built as planned.
+
+**Deviations from the plan** (the Public API table is unchanged by all of them):
+
+1. *S3 is sequential, not one weighted solve.* The plan's `max Σ (m − r_d)·i_{d,0}` ties when
+   one multi-phase car outweighs two single-phase ones (weights 3 against 2 + 1), so the
+   "remainder in ranking order" was not strict. S3 now maximises each demand in ranking order,
+   holding the earlier ones. The same for S1, which the plan already described as inclusion in
+   ranking order (built as one level per demand rather than a `2^(m-1-r)` weighted sum).
+2. *Minimum-block penalty is aggregated, with no `y` variables.* Per quarter `t` with
+   `m = min(L-1, quarters left)` after it: `Σ_{k=1..m} x_{t+k} + m·w_t + m·x_{t-1} − m·x_t ≥ 0`
+   with `w_t` binary. Same meaning as the plan's `y`/`w` rows (a run starting at `t` with a
+   later quarter of its block off costs 1; a run the deadline cuts short costs nothing), but one
+   row per quarter instead of `L` rows plus `y`. Measured on seed 1 of the benchmark: 16 s
+   against 9 s in total. The block rows and `w` are added only after P3, because they cannot
+   change P1 to P3.
+3. *Levels are skipped when the last solution already reaches the level's lower bound*
+   (shortfall, unpriced and above-cap energy at 0; S1 inclusion at 1; S3 at the demand's
+   maximum; P4 when the last solution has no short run). The level is then held without a
+   solve. Same optimum, fewer solves.
+4. *Hold tolerance.* Integer-valued levels hold at `v + 0.5`; continuous ones at
+   `v + 1e-6 + 1e-9·|v|`, not `v + 1e-6·max(1, |v|)`. A price level of about 110 allowed a
+   slack of 1.1e-4, which is two amp-quarters at a price step of 0.001.
+5. *`presolve` is False, not True.* On the captured planning levels of benchmark seed 1 the
+   total fell from 13.9 s to 8.6 s with presolve off; `mip_heuristic_effort`,
+   `mip_detect_symmetry`, `mip_pool_soft_limit` and the RINS/RENS switches did not help (the
+   last two made it far slower).
+6. *Two small bounds, `_fit_now` and `_even_now`,* let P5's second part and P6 be held without
+   a solve when the last solution reaches what the first quarter's capacity alone allows. They
+   rarely fire on the benchmark (the other levels already bind first); kept as a cheap shortcut.
+
+**Benchmark (guide item 8), and why the build halted.** `bench.py` in the scratchpad: `decide`
+on 10 adjustable 6 to 16 A chargers on mixed phases (L1, L2, L3, all three, L1 + L2), each a
+session with a need of 8 to 45 kWh and a ready time between 06:00 and 18:30, a 40-hour hourly
+price series, `min_block_quarters = 4`, `price_cap = 0.45`, per-phase budget 32 A, five seeds,
+this machine (4 cores, HiGHS on one thread):
+
+| NODE_LIMIT | seed 1 | seed 2 | seed 3 | seed 4 | seed 5 | worst |
+|---|---|---|---|---|---|---|
+| 4000 | 10.1 s | 5.7 s | 20.2 s | 19.0 s | 15.9 s | **20.2 s** |
+| 1000 | 9.8 s | 5.7 s | 18.2 s | 17.7 s | 15.4 s | **18.2 s** |
+| 1 (diagnostic, not a valid value) | 8.1 s | 5.5 s | 10.9 s | 10.0 s | n/a | the root work alone is 8 to 11 s |
+
+With 5 chargers the worst of the five seeds is 8.6 s, with 7 chargers 8.8 s. Every run was
+proven optimal (no `PLAN_NOT_PROVEN_OPTIMAL`), and two repeated calls on the same snapshot gave
+equal decisions. The cost is per level, not per node: the seven planning solves (P1, P3, P4,
+P5, P5b, P6, P7) take 0.5 to 5 s each on a 1300 to 1900 column model, and most finish at the
+root or within a few dozen nodes, so a node budget does not bound them. Seed 3, per solve:
+P1 0.7 s, P3 2.0 s, P4 2.2 s, P5 4.4 s, P5b 1.8 s, P6 2.4 s, P7 5.2 s. Risk 1's levers are
+spent: skipping empty levels (item 3 above), the aggregated block constraint (item 2), and a
+lower `NODE_LIMIT` (above).
 
 ## 4. Verification log
 
@@ -646,3 +707,40 @@ taken back through steps 1 to 7 on the same branch.
 > step that halted, the question for the user — and, once answered, the answer and what
 > changed because of it. Never deleted; it is the record of where the plan was thinner
 > than the code needed.
+
+### Step 3, 2026-10-22
+
+Halted by the implement step at guide item 8 (the A5 benchmark), under the plan's Risk 1:
+the worst case for 10 chargers does not return within 10 s.
+
+Reason: on the specified worst case (10 chargers on mixed phases, a price cap, minimum block
+of 4, a tight budget) `decide` takes 5.7 to 20.2 s on this machine over five seeds, with every
+level proven optimal. The time is the root work of seven exact planning solves (0.5 to 5 s
+each), not branch-and-bound, so no `NODE_LIMIT` helps: with the limit at 1 the same instances
+still take 8 to 11 s, and with 1000 the worst case is 18.2 s. Risk 1's three levers were
+used (empty levels skipped, the aggregated block constraint, a lower node limit), plus level
+shortcuts and `presolve = False`. A5 as written cannot be met by this model, and no
+wall-clock limit is allowed. Fewer chargers fit: 5 chargers worst 8.6 s, 7 chargers worst
+8.8 s. Determinism (Risk 2) held on repeated calls.
+
+Question for the user: how should A5 change? The options, with what each costs:
+
+1. **Raise the bound** to what the model needs, for example 30 s for 10 chargers (measured
+   worst 20.2 s). Nothing else in the plan changes. Calls become slow for a household
+   controller that calls every 5 minutes, but still fit that cadence.
+2. **Lower the charger count** the bound is promised for, for example "up to 6 chargers in
+   10 s" (5 chargers: 8.6 s, 7 chargers: 8.8 s on this machine; the margin is thin). The
+   plan stays as built.
+3. **Drop the exact lexicographic order from the last three levels** (P5 second part, P6, P7:
+   most cars on now, the even split, the earlier-first tie-break), which are about half of
+   the time on seed 3 (9.4 of 18.7 s), replacing them with a cheaper rule or a single merged
+   solve. This amends A2's "optimal for the stated precedence" and A3's even split for the
+   planned tier, and needs a new plan for the replacement.
+4. **Split the call**: keep the model and the bound but let the caller pass a smaller set of
+   chargers (only those that can charge in the next hours). That changes the public contract
+   and is a new concept.
+
+What exists is committed: `optimize.py`, `decide.py` wired to it, the greedy code removed.
+Tests (guide item 7), `STRUCTURE.md` and `README.md` (item 9) are not done and wait for the
+answer, because options 3 and 4 change what they test. On the answer, `/build` resumes from
+step 3 at item 7.

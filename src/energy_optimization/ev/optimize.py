@@ -193,7 +193,7 @@ class _Problem:
         options = {
             "node_limit": NODE_LIMIT,
             "mip_rel_gap": 0.0,
-            "presolve": True,
+            "presolve": False,
             "threads": 1,
         }
         with warnings.catch_warnings():
@@ -227,11 +227,35 @@ class _Problem:
         self.x = found
         return found
 
-    def minimise(self, objective: Mapping[int, float]) -> bool:
+    def hold(
+        self, objective: Mapping[int, float], value: float, integral: bool
+    ) -> None:
+        """Hold a level at its optimum for every level after it.
+
+        Args:
+            objective: Coefficient per column.
+            value: The optimum.
+            integral: Whether the objective can only take whole values, which allows
+                a half-unit tolerance instead of a numerical one.
+        """
+        terms = [(col, v) for col, v in sorted(objective.items()) if v]
+        slack = 0.5 if integral else _TOLERANCE + 1e-9 * abs(value)
+        self.row(terms, -math.inf, value + slack)
+
+    def minimise(
+        self,
+        objective: Mapping[int, float],
+        *,
+        integral: bool = False,
+        floor: float | None = None,
+    ) -> bool:
         """Minimise one level, then hold it at its optimum.
 
         Args:
             objective: Coefficient per column; zero coefficients are ignored.
+            integral: Whether the objective can only take whole values.
+            floor: A lower bound on the objective. When the last solution already
+                reaches it, the level is held without a solve.
 
         Returns:
             False when the level has no non-zero coefficient and was skipped.
@@ -242,9 +266,13 @@ class _Problem:
         vector = np.zeros(len(self._lb))
         for col, value in terms:
             vector[col] = value
+        if floor is not None and self.x is not None:
+            known = float(vector[: len(self.x)] @ self.x)
+            if known <= floor + _EPS:
+                self.hold(objective, known, integral)
+                return True
         solution = self._solve(vector)
-        optimum = float(vector @ solution)
-        self.row(terms, -math.inf, optimum + _TOLERANCE * max(1.0, abs(optimum)))
+        self.hold(objective, float(vector @ solution), integral)
         return True
 
     def solution(self) -> NDArray[np.float64]:
@@ -298,7 +326,7 @@ def _stage_now(
         if terms:
             first.row(terms, -math.inf, room[phase])
     for demand in demands:
-        first.minimise({chosen[demand.charger_id]: -1.0})
+        first.minimise({chosen[demand.charger_id]: -1.0}, integral=True, floor=-1.0)
     solved = first.solution()
     included = [d for d in demands if solved[chosen[d.charger_id]] > 0.5]
     if not included:
@@ -323,7 +351,7 @@ def _stage_now(
         for d in included:
             if d.charger_id not in frozen:
                 fill.row([(cols[d.charger_id], 1.0), (level, -1.0)], 0.0, math.inf)
-        fill.minimise({level: -1.0})
+        fill.minimise({level: -1.0}, integral=True)
         reached = round(float(fill.solution()[level]))
         for d in included:
             if d.charger_id not in frozen:
@@ -358,7 +386,9 @@ def _stage_now(
         if terms:
             last.row(terms, -math.inf, room[phase])
     for d in included:
-        last.minimise({cols[d.charger_id]: -1.0})
+        last.minimise(
+            {cols[d.charger_id]: -1.0}, integral=True, floor=-top[d.charger_id]
+        )
     final = last.solution()
     allocation = {d.charger_id: 0.0 for d in demands}
     for d in included:
@@ -374,6 +404,89 @@ class _Vars:
     i: list[int]
     shortfall: int
     energy: float
+
+
+def _short_runs(
+    solved: NDArray[np.float64], columns: Sequence[_Vars], length: int
+) -> int:
+    """Count the runs shorter than the minimum block in a solution.
+
+    A run counts when it starts and a quarter of the following `length - 1` quarters
+    inside the window is off; a run the deadline cuts short does not.
+    """
+    count = 0
+    for c in columns:
+        on = [solved[x] > 0.5 for x in c.x]
+        for t, is_on in enumerate(on):
+            starts_run = is_on and (t == 0 or not on[t - 1])
+            if starts_run and not all(on[t + 1 : t + length]):
+                count += 1
+    return count
+
+
+def _add_blocks(problem: _Problem, columns: Sequence[_Vars], length: int) -> list[int]:
+    """Add the minimum-block penalties and return their columns.
+
+    For every quarter `t` with at least one quarter after it in the window, a binary
+    `w` is forced to 1 when a run starts at `t` and one of the next `length - 1`
+    quarters of the window is off.
+    """
+    waste: list[int] = []
+    for c in columns:
+        count = len(c.x)
+        for t in range(count):
+            m = min(length - 1, count - 1 - t)
+            if m <= 0:
+                continue
+            w = problem.var(0, 1, True)
+            waste.append(w)
+            terms = [(c.x[t + k], 1.0) for k in range(1, m + 1)]
+            terms.append((w, float(m)))
+            terms.append((c.x[t], -float(m)))
+            if t > 0:
+                terms.append((c.x[t - 1], float(m)))
+            problem.row(terms, 0.0, math.inf)
+    return waste
+
+
+def _fit_now(demands: Sequence[Demand], room: Mapping[Phase, float], run: _Run) -> int:
+    """Return the most demands that fit in the first quarter at their minimum.
+
+    It looks at the first quarter's capacity alone, so it bounds what the full model
+    can have on now: a solution that reaches it is optimal for that level.
+    """
+    small = _Problem(run)
+    cols = [small.var(0, 1 if _hi(d, True) > 0 else 0, True) for d in demands]
+    for phase in Phase:
+        terms = [
+            (c, d.min_current)
+            for c, d in zip(cols, demands, strict=True)
+            if phase in d.phases
+        ]
+        if terms:
+            small.row(terms, -math.inf, room[phase])
+    small.minimise({c: -1.0 for c in cols}, integral=True)
+    return round(sum(small.solution()[c] for c in cols))
+
+
+def _even_now(demands: Sequence[Demand], room: Mapping[Phase, float], run: _Run) -> int:
+    """Return the highest current every given demand could have at once now.
+
+    Like `_fit_now` it looks at the first quarter's capacity alone, as a bound.
+    """
+    small = _Problem(run)
+    cols = [small.var(d.min_current, _hi(d, True), True) for d in demands]
+    even = small.var(0, max((_hi(d, True) for d in demands), default=0.0), True)
+    for phase in Phase:
+        terms = [
+            (c, 1.0) for c, d in zip(cols, demands, strict=True) if phase in d.phases
+        ]
+        if terms:
+            small.row(terms, -math.inf, room[phase])
+    for c in cols:
+        small.row([(even, 1.0), (c, -1.0)], -math.inf, 0.0)
+    small.minimise({even: -1.0}, integral=True)
+    return round(small.solution()[even])
 
 
 def _stage_plan(
@@ -394,14 +507,9 @@ def _stage_plan(
     """
     problem = _Problem(run)
     total = max(1, len(horizon))
-    windows = [
-        len(quarter_starts(horizon[0], d.deadline)) if d.deadline else 0
-        for d in demands
-    ]
     columns: list[_Vars] = []
-    starts: list[list[int]] = []
-    waste: list[list[int]] = []
-    for d, count in zip(demands, windows, strict=True):
+    for d in demands:
+        count = len(quarter_starts(horizon[0], d.deadline)) if d.deadline else 0
         energy = energy_per_quarter_kwh(1.0, len(d.phases), voltage)
         xs: list[int] = []
         currents: list[int] = []
@@ -422,50 +530,31 @@ def _stage_plan(
         else:
             problem.row([(shortfall, 1.0)], d.need_kwh, math.inf)
         columns.append(_Vars(xs, currents, shortfall, energy))
-        ys: list[int] = []
-        ws: list[int] = []
-        if min_block_quarters > 1:
-            for t in range(count):
-                y = problem.var(0, 1, False)
-                w = problem.var(0, 1, False)
-                before = [(xs[t - 1], 1.0)] if t > 0 else []
-                problem.row([(y, 1.0), (xs[t], -1.0), *before], 0.0, math.inf)
-                ys.append(y)
-                ws.append(w)
-            for t in range(count):
-                for k in range(1, min_block_quarters):
-                    if t + k < count:
-                        problem.row(
-                            [(xs[t + k], 1.0), (ws[t], 1.0), (ys[t], -1.0)],
-                            0.0,
-                            math.inf,
-                        )
-        starts.append(ys)
-        waste.append(ws)
     for t in range(total):
         for phase in Phase:
             terms = [
-                (columns[n].i[t], 1.0)
-                for n, d in enumerate(demands)
-                if phase in d.phases and t < windows[n]
+                (c.i[t], 1.0)
+                for d, c in zip(demands, columns, strict=True)
+                if phase in d.phases and t < len(c.i)
             ]
             if terms:
                 room = now_room[phase] if t == 0 else later_room[phase]
                 problem.row(terms, -math.inf, room)
 
-    def priced(t: int) -> float | None:
+    def price_at(t: int) -> float | None:
         return prices.get(horizon[t])
 
     # P1: meet each need.
-    problem.minimise({c.shortfall: 1.0 for c in columns})
+    problem.minimise({c.shortfall: 1.0 for c in columns}, floor=0.0)
     # P2: avoid unpriced quarters.
     problem.minimise(
         {
             i: c.energy
-            for c, count in zip(columns, windows, strict=True)
-            for t, i in enumerate(c.i[:count])
-            if priced(t) is None
-        }
+            for c in columns
+            for t, i in enumerate(c.i)
+            if price_at(t) is None
+        },
+        floor=0.0,
     )
     # P3: use quarters above the price cap only to meet the need.
     if price_cap is not None:
@@ -474,21 +563,33 @@ def _stage_plan(
                 i: c.energy
                 for c in columns
                 for t, i in enumerate(c.i)
-                if (p := priced(t)) is not None and p > price_cap
-            }
+                if (p := price_at(t)) is not None and p > price_cap
+            },
+            floor=0.0,
         )
-    # P4: avoid runs shorter than the minimum block.
-    problem.minimise({w: 1.0 for ws in waste for w in ws})
+    # P4: avoid runs shorter than the minimum block. The blocks are added only now:
+    # until here they cannot change the optimum.
+    if min_block_quarters > 1:
+        waste = _add_blocks(problem, columns, min_block_quarters)
+        penalty = {w: 1.0 for w in waste}
+        if _short_runs(problem.solution(), columns, min_block_quarters) == 0:
+            problem.hold(penalty, 0.0, integral=True)
+        else:
+            problem.minimise(penalty, integral=True)
     # P5: lowest price; then as many cars as possible on now.
     problem.minimise(
         {
             i: p * c.energy
             for c in columns
             for t, i in enumerate(c.i)
-            if (p := priced(t)) is not None
+            if (p := price_at(t)) is not None
         }
     )
-    problem.minimise({c.x[0]: -1.0 for c in columns if c.x})
+    possible = [n for n, c in enumerate(columns) if c.x and _hi(demands[n], True) > 0]
+    fits = _fit_now([demands[n] for n in possible], now_room, run) if possible else 0
+    problem.minimise(
+        {columns[n].x[0]: -1.0 for n in possible}, integral=True, floor=-float(fits)
+    )
     solved = problem.solution()
     on_now = [n for n, c in enumerate(columns) if c.x and solved[c.x[0]] > 0.5]
     for n, c in enumerate(columns):
@@ -496,20 +597,25 @@ def _stage_plan(
             problem.fix(c.x[0], 1.0 if n in on_now else 0.0)
     # P6: an even split of the first quarter among the cars that are on now.
     if on_now:
-        even = problem.var(0, max(_hi(demands[n], True) for n in on_now), True)
+        ceiling = _even_now([demands[n] for n in on_now], now_room, run)
+        even = problem.var(0, ceiling, True)
         for n in on_now:
             problem.row([(even, 1.0), (columns[n].i[0], -1.0)], -math.inf, 0.0)
-        problem.minimise({even: -1.0})
+        reached = min(round(solved[columns[n].i[0]]) for n in on_now)
+        if reached >= ceiling:
+            problem.hold({even: -1.0}, -float(ceiling), integral=True)
+        else:
+            problem.minimise({even: -1.0}, integral=True)
     # P7: earlier priced quarters first, unpriced quarters latest first, better-ranked
     # cars earlier.
     weight: dict[int, float] = {}
     for n, c in enumerate(columns):
         for t, i in enumerate(c.i):
-            if priced(t) is None:
+            if price_at(t) is None:
                 weight[i] = float((total - t) * (n + 1))
             else:
                 weight[i] = float((t + 1) * (n + 1))
-    problem.minimise(weight)
+    problem.minimise(weight, integral=True)
     solved = problem.solution()
     return {
         d.charger_id: [float(round(solved[i])) for i in c.i]
