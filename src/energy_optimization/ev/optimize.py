@@ -283,8 +283,12 @@ class _Problem:
                 a half-unit tolerance instead of a numerical one.
         """
         terms = [(col, v) for col, v in sorted(objective.items()) if v]
-        slack = 0.5 if integral else _TOLERANCE + 1e-9 * abs(value)
-        self.row(terms, -math.inf, value + slack)
+        if integral:
+            # The optimum is a whole number; the solver's value may be off by its
+            # integrality tolerance times the coefficients.
+            self.row(terms, -math.inf, round(value) + 0.5)
+        else:
+            self.row(terms, -math.inf, value + _TOLERANCE + 1e-9 * abs(value))
 
     def minimise(
         self,
@@ -500,6 +504,63 @@ def _add_blocks(problem: _Problem, columns: Sequence[_Vars], length: int) -> lis
     return waste
 
 
+def _price_ticks(values: Sequence[float]) -> list[int] | None:
+    """Return the prices as whole multiples of their largest common tick, if coarse.
+
+    Prices are quoted on a grid (a Nord Pool price in EUR per MWh to two decimals is a
+    multiple of 1e-5 EUR per kWh). When every price is a whole multiple of a tick of at
+    least 1e-7, the cost of a plan with whole-amp currents is a whole number of ticks
+    (times the energy of one amp-quarter), so it can be held exactly rather than to a
+    tolerance that a price step can slip under.
+
+    Args:
+        values: The prices.
+
+    Returns:
+        Each price in ticks, or None when the grid is finer than 1e-7 or all are zero.
+    """
+    scaled = [round(v * 1e9) for v in values]
+    step = math.gcd(*scaled) if scaled else 0
+    if step < 100:
+        return None
+    return [v // step for v in scaled]
+
+
+def _minimise_price(
+    problem: _Problem,
+    demands: Sequence[Demand],
+    columns: Sequence[_Vars],
+    horizon: Sequence[datetime],
+    prices: Mapping[datetime, float],
+    whole: bool,
+) -> None:
+    """Minimise and hold the cost of the plan (level P5, first part).
+
+    The cost is minimised in whole ticks of the price grid when the prices have one and
+    every current is whole, so the hold is exact: a plan that is dearer by one tick is
+    never let through by the solver's tolerance. Otherwise it is held to a tolerance.
+    """
+    cells = [
+        (n, t, i)
+        for n, c in enumerate(columns)
+        for t, i in enumerate(c.i)
+        if horizon[t] in prices
+    ]
+    ticks = _price_ticks([prices[horizon[t]] for _, t, _ in cells]) if whole else None
+    if ticks is None:
+        problem.minimise(
+            {i: prices[horizon[t]] * columns[n].energy for n, t, i in cells}
+        )
+        return
+    problem.minimise(
+        {
+            i: float(tick * len(demands[n].phases))
+            for (n, _, i), tick in zip(cells, ticks, strict=True)
+        },
+        integral=True,
+    )
+
+
 def _fit_now(demands: Sequence[Demand], room: Mapping[Phase, float], run: _Run) -> int:
     """Return the most demands that fit in the first quarter at their minimum.
 
@@ -543,7 +604,9 @@ def _fill_now(
         for n in live:
             problem.row([(columns[n].i[0], 1.0), (level, -1.0)], 0.0, math.inf)
         solved = problem.solution()
-        known = min(math.floor(solved[columns[n].i[0]] + _EPS) for n in live)
+        # Integer columns come back within the solver's integrality tolerance of a
+        # whole number (6.9999995 for 7), so they are rounded before they are compared.
+        known = min(round(solved[columns[n].i[0]]) for n in live)
         if known >= ceiling:
             problem.fix(level, float(ceiling))
             problem.set_known(level, float(ceiling))
@@ -561,9 +624,9 @@ def _fill_now(
         for n in live:
             col = columns[n].i[0]
             at_top = value[n] >= top[n] - _EPS
-            free = held[col] >= reached + 1 - _EPS
+            free = round(held[col]) >= reached + 1
             if not (at_top or free):
-                free = -problem.probe({col: -1.0}) >= reached + 1 - _EPS
+                free = round(-problem.probe({col: -1.0})) >= reached + 1
             if at_top or not free:
                 stuck.append(n)
         if not stuck:
@@ -591,8 +654,11 @@ def _on_now_and_even(
     """
     possible = [n for n, c in enumerate(columns) if c.x and _hi(demands[n], True) > 0]
     if not priced_now:
+        # Energy, not amps: a three-phase car delivers three times the kWh per amp.
         problem.minimise(
-            {columns[n].i[0]: 1.0 for n in possible}, integral=whole, floor=0.0
+            {columns[n].i[0]: float(len(demands[n].phases)) for n in possible},
+            integral=whole,
+            floor=0.0,
         )
     fits = _fit_now([demands[n] for n in possible], now_room, run) if possible else 0
     problem.minimise(
@@ -700,20 +766,13 @@ def _stage_plan(
         else:
             problem.minimise(penalty, integral=True)
     # P5: lowest price; then as many cars as possible on now.
-    problem.minimise(
-        {
-            i: p * c.energy
-            for c in columns
-            for t, i in enumerate(c.i)
-            if (p := price_at(t)) is not None
-        }
-    )
-    # P5, second part, and P6. An unpriced first quarter keeps only what the need
-    # forces (its total is minimised and held); the cars on now share it as a priced one.
     whole = all(
         d.min_current != d.max_current or float(d.min_current).is_integer()
         for d in demands
     )
+    _minimise_price(problem, demands, columns, horizon, prices, whole)
+    # P5, second part, and P6. An unpriced first quarter keeps only what the need
+    # forces (its total is minimised and held); the cars on now share it as a priced one.
     _on_now_and_even(
         problem, demands, columns, now_room, run, price_at(0) is not None, whole
     )

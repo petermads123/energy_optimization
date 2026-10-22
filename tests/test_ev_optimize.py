@@ -1250,12 +1250,25 @@ def level_tuple(
             if q(t) in prices
         )
     )
-    if q(0) in prices:
-        on_now = [row[0] > 0 for row in grid if row]
-        levels.append(-float(sum(on_now)))
-        levels.extend(-float(flag) for flag in on_now)
-        running = [row[0] for row in grid if row and row[0] > 0]
-        levels.append(-min(running) if running else 0.0)
+    if q(0) not in prices:
+        # An unpriced first quarter keeps only the energy the need forces (P5, amended).
+        levels.append(
+            sum(e * row[0] for e, row in zip(energy, grid, strict=True) if row)
+        )
+    on_now = [row[0] > 0 for row in grid if row]
+    levels.append(-float(sum(on_now)))
+    levels.extend(-float(flag) for flag in on_now)
+    # P6: the cars on now that can still be raised share the first quarter, lowest
+    # first, then the rest goes in ranking order. Cars at their only current (on/off,
+    # or limited to their minimum) are not part of the fill.
+    live = [
+        n
+        for n, d in enumerate(demands)
+        if d.min_current != d.max_current and d.now_max_current > d.min_current
+    ]
+    running = [grid[n][0] for n in live if grid[n] and grid[n][0] > 0]
+    levels.append(-min(running) if running else 0.0)
+    levels.extend(-(grid[n][0] if grid[n] else 0.0) for n in live)
     count = len(demands)
     levels.append(
         float(
@@ -1279,7 +1292,7 @@ def test_optimize_matches_a_brute_force_enumeration_level_by_level(
     rng: random.Random,
 ) -> None:
     count = 2 if rng.random() < 0.75 else 1
-    shared = rng.choice([L1, L2])
+    shared = rng.choice([L1, L2, ALL])
     kinds = [rng.choice(["adjustable", "on-off-10", "on-off-6"]) for _ in range(count)]
     sizes = {
         "adjustable": LEVELS_ADJUSTABLE,
@@ -1303,7 +1316,7 @@ def test_optimize_matches_a_brute_force_enumeration_level_by_level(
         demands.append(
             Demand(
                 f"d{index}",
-                shared if rng.random() < 0.7 else rng.choice([L1, L2]),
+                shared if rng.random() < 0.7 else rng.choice([L1, L2, ALL]),
                 Tier.PLANNED,
                 low,
                 high,
@@ -1442,3 +1455,342 @@ def test_optimize_planned_cars_on_mixed_phases_fill_evenly_by_phase() -> None:
     outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2))
 
     assert outcome.allocations == {"a": 8.0, "b": 8.0, "c": 8.0}
+
+
+# --- the planned tier's even first quarter: step 5 re-run (A3, A2, A5, A6) ----------------
+
+E1 = energy_per_quarter_kwh(1.0, 1, 230.0)  # 0.0575 kWh per amp-quarter on one phase
+E3 = energy_per_quarter_kwh(1.0, 3, 230.0)  # the same on three phases
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["a first", "b first"])
+def test_optimize_an_unpriced_first_quarter_forced_to_one_car_switches_on_the_better_ranked(
+    reverse: bool,
+) -> None:
+    # The later quarters hold 48 A-quarters against 54 needed, so the first quarter must
+    # carry 6 A and only one car fits there: the better-ranked one, whatever its id.
+    a = planned("a", need=1.84)
+    b = planned("b", need=energy_per_quarter_kwh(22, 1, 230.0))
+    cars = [b, a] if reverse else [a, b]
+
+    outcome = run(cars, priced(None, 0.2, 0.2, 0.2))
+
+    first = cars[0].charger_id
+    second = cars[1].charger_id
+    assert outcome.allocations == {first: 6.0, second: 0.0}
+
+
+def test_optimize_a_forced_expensive_first_quarter_is_split_evenly() -> None:
+    # The capacity of the cheap quarter is exactly the need of one car, so the dear first
+    # quarter must carry 16 A; the split costs the same whatever it is, so it is even.
+    cars = [planned("a", need=E16, quarters=2), planned("b", need=E16, quarters=2)]
+
+    outcome = run(cars, priced(0.5, 0.1))
+
+    assert outcome.allocations == {"a": 8.0, "b": 8.0}
+    assert shape(outcome, "a")[q(1)] == 8.0
+    assert shape(outcome, "b")[q(1)] == 8.0
+
+
+def test_optimize_the_even_split_never_pulls_a_car_into_an_expensive_first_quarter() -> (
+    None
+):
+    # `a` has only the first quarter, so it alone is on now; switching `b` on at 6 A or
+    # splitting 8 / 8 would cost more than the cheap later quarters.
+    cars = [
+        planned("a", need=energy_per_quarter_kwh(10, 1, 230.0), quarters=1),
+        planned("b", need=E16),
+    ]
+
+    outcome = run(cars, priced(0.5, 0.1, 0.1, 0.1))
+
+    assert outcome.allocations == {"a": 10.0, "b": 0.0}
+    assert q(0) not in shape(outcome, "b")
+
+
+def test_optimize_planned_cars_tied_at_a_cap_leave_the_rest_to_the_uncapped_car() -> (
+    None
+):
+    # Two cars reach their 10 A ceiling in the first round together; the third carries
+    # on alone in the second round and stops at what is left.
+    cars = [
+        planned("a", need=1.84, now_high=10),
+        planned("b", need=1.84, now_high=10),
+        planned("c", need=1.84),
+    ]
+
+    outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2), caps(34, 34, 34), caps(34, 34, 34))
+
+    assert outcome.allocations == {"a": 10.0, "b": 10.0, "c": 14.0}
+
+
+def test_optimize_a_capped_first_car_passes_the_ranking_remainder_on() -> None:
+    # The level stops at 6 A and every car could rise alone, so none saturates: the
+    # remainder goes in ranking order, and the first car is capped at 7 A.
+    cars = [
+        planned("a", need=E16, now_high=7),
+        planned("b", need=E16),
+        planned("c", need=E16),
+    ]
+
+    outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2), caps(20, 20, 20), caps(20, 20, 20))
+
+    assert outcome.allocations == {"a": 7.0, "b": 7.0, "c": 6.0}
+
+
+def test_optimize_planned_cars_where_one_phase_binds_raise_the_free_phase_car_to_its_top() -> (
+    None
+):
+    # L1 binds at 10 + 10; `c` alone on L2 is free at the first level and then rises to
+    # its own top.
+    cars = [
+        planned("a", need=1.84, phases=frozenset({Phase.L1, Phase.L2})),
+        planned("b", need=E16),
+        planned("c", need=E16, phases=L2),
+    ]
+
+    outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2), caps(20, 30, 16), caps(20, 30, 16))
+
+    assert outcome.allocations == {"a": 10.0, "b": 10.0, "c": 16.0}
+
+
+def test_optimize_an_on_off_car_ranked_first_keeps_its_slot_and_the_adjustable_takes_the_rest() -> (
+    None
+):
+    # Two of the three fit at their minimum (22 A > 21 A): the on/off car and `a`. The
+    # on/off car is not part of the fill but uses room, so `a` rises to 11 A.
+    cars = [
+        planned("p", need=2 * energy_per_quarter_kwh(10, 1, 230.0), low=10, high=10),
+        planned("a", need=1.84),
+        planned("b", need=1.84),
+    ]
+
+    outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2), caps(30, 30, 30), caps(21, 21, 21))
+
+    assert outcome.allocations == {"p": 10.0, "a": 11.0, "b": 0.0}
+
+
+def test_optimize_a_fractional_on_off_car_lowers_the_even_level_to_an_exact_fit() -> (
+    None
+):
+    # 29.5 A leaves 22 A for two adjustable cars beside a 7.5 A on/off car: 11 / 11,
+    # neither rounding 7.5 up (level 10) nor leaving the level unfloored (12).
+    cars = [
+        planned("p", need=2 * energy_per_quarter_kwh(7.5, 1, 230.0), low=7.5, high=7.5),
+        planned("a", need=1.84),
+        planned("b", need=1.84),
+    ]
+
+    outcome = run(
+        cars, priced(0.2, 0.2, 0.2, 0.2), caps(29.5, 29.5, 29.5), caps(29.5, 29.5, 29.5)
+    )
+
+    assert outcome.allocations == {"p": 7.5, "a": 11.0, "b": 11.0}
+
+
+def test_optimize_an_unpriced_first_quarter_takes_the_smaller_fractional_on_off_car() -> (
+    None
+):
+    # The need forces at least 7.5 A into the first quarter; the other choice would force
+    # `a` in at 8 A. The held total is a float, so it is held with the float tolerance.
+    cars = [
+        planned("a", need=1.84),
+        planned("p", need=3 * energy_per_quarter_kwh(7.5, 1, 230.0), low=7.5, high=7.5),
+    ]
+
+    outcome = run(cars, priced(None, 0.2, 0.2, 0.2))
+
+    assert outcome.allocations == {"a": 0.0, "p": 7.5}
+
+
+def test_optimize_planned_cars_all_capped_below_the_room_get_their_caps() -> None:
+    cars = [planned(name, need=1.84, now_high=8) for name in "abc"]
+
+    outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2), caps(30, 30, 30), caps(30, 30, 30))
+
+    assert outcome.allocations == {"a": 8.0, "b": 8.0, "c": 8.0}
+
+
+@pytest.mark.parametrize(
+    ("cars", "capacity", "expected"),
+    [
+        pytest.param(
+            [planned("a", need=1.84), planned("b", need=1.84, low=10)],
+            18,
+            {"a": 8.0, "b": 10.0},
+            id="unequal minimums level from the lowest",
+        ),
+        pytest.param(
+            [planned("a", need=E16, now_high=7), planned("b", need=E16)],
+            30,
+            {"a": 7.0, "b": 16.0},
+            id="a car at its first-quarter limit",
+        ),
+        pytest.param(
+            [planned("a", need=1.84, now_high=6), planned("b", need=1.84)],
+            30,
+            {"a": 6.0, "b": 16.0},
+            id="a car limited to its minimum does not hold the level down",
+        ),
+        pytest.param(
+            [planned("a", need=6 * E1 * 4, low=6, high=6), planned("b", need=1.84)],
+            30,
+            {"a": 6.0, "b": 16.0},
+            id="an on/off car does not hold the level down",
+        ),
+        pytest.param(
+            [planned("a", need=1.84, now_high=10.5), planned("b", need=1.84)],
+            30,
+            {"a": 10.0, "b": 16.0},
+            id="a fractional first-quarter limit is filled to its whole amp",
+        ),
+        pytest.param(
+            [planned("a", need=E16, now_high=4), planned("b", need=E16)],
+            30,
+            {"a": 0.0, "b": 16.0},
+            id="a car off now is left out of the fill",
+        ),
+    ],
+)
+def test_optimize_planned_cars_fill_to_their_own_limits_at_equal_prices(
+    cars: list[Demand], capacity: float, expected: dict[str, float]
+) -> None:
+    room = caps(capacity, capacity, capacity)
+
+    outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2), room, room)
+
+    assert outcome.allocations == expected
+
+
+def test_optimize_a_need_limited_car_saturates_below_its_max_and_the_other_takes_the_rest() -> (
+    None
+):
+    # On cost alone 0 / 16 and 6 / 10 tie; cars on now picks 6 / 10, and `a` is stuck at
+    # 6 A only because raising it would break the price level (found by a probe).
+    cars = [
+        planned("a", need=energy_per_quarter_kwh(6, 1, 230.0)),
+        planned("b", need=1.84),
+    ]
+
+    outcome = run(cars, priced(0.1, 0.5, 0.5, 0.5))
+
+    assert outcome.allocations == {"a": 6.0, "b": 10.0}
+
+
+def test_optimize_the_fill_never_moves_current_from_a_cheaper_quarter_into_the_first() -> (
+    None
+):
+    # The cheap second quarter is full at 16 A, so the dear first quarter holds 10 A by
+    # cost; only one car fits at 6 A or more and ranking picks `a`.
+    cars = [
+        planned("a", need=E16, quarters=2),
+        planned("b", need=10 * E1, quarters=2),
+    ]
+
+    outcome = run(cars, priced(0.2, 0.1))
+
+    assert outcome.allocations == {"a": 10.0, "b": 0.0}
+    assert shape(outcome, "a") == {q(0): 10.0, q(1): 6.0}
+    assert shape(outcome, "b") == {q(1): 10.0}
+
+
+def test_optimize_an_unpriced_first_quarter_with_an_odd_forced_total_gives_the_extra_amp_by_rank() -> (
+    None
+):
+    # 13 A are forced into the first quarter and both cars go on: each could rise alone
+    # but not both, so the extra amp goes to the better-ranked car.
+    cars = [planned(name, need=13 * E1, quarters=2, low=6, high=7) for name in "ab"]
+
+    outcome = run(cars, {}, caps(13, 13, 13), caps(13, 13, 13))
+
+    assert outcome.allocations == {"a": 7.0, "b": 6.0}
+    assert shape(outcome, "a") == {q(0): 7.0, q(1): 6.0}
+    assert shape(outcome, "b") == {q(0): 6.0, q(1): 7.0}
+
+
+def test_optimize_the_fill_leaves_every_plan_reachable_with_the_same_total_energy() -> (
+    None
+):
+    cars = [
+        planned("a", need=1.84, high=8),
+        planned("b", need=1.84),
+        planned("c", need=1.84),
+    ]
+
+    outcome = run(cars, priced(0.2, 0.2, 0.5, 0.5), caps(30, 30, 30), caps(30, 30, 30))
+
+    assert outcome.allocations == {"a": 8.0, "b": 11.0, "c": 11.0}
+    for name in "abc":
+        assert outcome.plans[name].reachable
+        assert outcome.plans[name].planned_kwh == pytest.approx(1.84)
+    assert sum(shape(outcome, name).get(q(0), 0.0) for name in "abc") == 30
+    assert sum(shape(outcome, name).get(q(1), 0.0) for name in "abc") == 30
+
+
+def test_optimize_an_unpriced_first_quarter_holds_the_forced_energy_not_the_forced_amps() -> (
+    None
+):
+    # A three-phase car and a single-phase car each need 12 A-quarters and the later
+    # quarter holds 16 A on L1. At least 12 A of the two must run now: 6 / 6, 12 / 0 or
+    # 0 / 12. Unpriced quarters are used only as far as the need forces them (A2), and
+    # that is measured in kWh: 0 / 12 puts 0.69 kWh there, 6 / 6 puts 1.38 kWh.
+    cars = [
+        planned("c", need=12 * E3, quarters=2, phases=ALL),
+        planned("s", need=12 * E1, quarters=2),
+    ]
+
+    outcome = run(cars, {})
+
+    assert outcome.allocations == {"c": 0.0, "s": 12.0}
+    assert shape(outcome, "c") == {q(1): 12.0}
+    assert outcome.plans["s"].planned_kwh == pytest.approx(12 * E1)
+
+
+def test_optimize_a_first_quarter_dearer_by_one_price_tick_gets_no_extra_amp() -> None:
+    # Moving 1 A from the later quarter into the first costs 0.00001 * 0.0575 kWh, which
+    # a hold slack of 1e-6 cannot see; a price of EUR 10 per MWh resolution is such a tick.
+    # The cheaper quarter must be filled first however small the difference is.
+    cars = [planned("a", need=20 * E1, quarters=2)]
+
+    outcome = run(cars, priced(0.20001, 0.2), caps(14, 14, 14), caps(16, 16, 16))
+
+    assert outcome.allocations == {"a": 6.0}
+    assert shape(outcome) == {q(0): 6.0, q(1): 14.0}
+
+
+def test_optimize_equal_prices_still_leave_the_split_free_after_the_tick_fix() -> None:
+    # The same instance at equal prices has no cheaper quarter, so the first quarter is
+    # free and the earlier-first tie-break pulls current into it.
+    cars = [planned("a", need=20 * E1, quarters=2)]
+
+    outcome = run(cars, priced(0.2, 0.2), caps(14, 14, 14), caps(16, 16, 16))
+
+    assert outcome.allocations == {"a": 14.0}
+
+
+def test_optimize_the_fill_is_robust_to_solver_integrality_noise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # HiGHS returns an integer as 6.9999995 within its 1e-6 integrality tolerance; a
+    # car at 7 A must still be seen as able to rise, or the ranking remainder is lost.
+    real = optimize_module.milp
+
+    def noisy(*args: object, **kwargs: object) -> SimpleNamespace:
+        result = real(*args, **kwargs)
+        x = np.where(result.x > 0.5, result.x - 5e-7, result.x)
+        return SimpleNamespace(
+            status=result.status,
+            message=result.message,
+            x=x,
+            mip_node_count=getattr(result, "mip_node_count", 0),
+        )
+
+    cars = [planned(name, need=1.84) for name in "ab"]
+    room = caps(15, 15, 15)
+
+    clean = run(cars, priced(0.2, 0.2, 0.2, 0.2), room, room)
+    monkeypatch.setattr(optimize_module, "milp", noisy)
+    outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2), room, room)
+
+    assert clean.allocations == {"a": 8.0, "b": 7.0}
+    assert outcome.allocations == clean.allocations
