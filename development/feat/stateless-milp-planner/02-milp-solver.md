@@ -1,6 +1,6 @@
 # MILP solver
 
-<!-- claude-plan step=3 status=active -->
+<!-- claude-plan step=4 status=active -->
 
 
 | Field | Value |
@@ -16,9 +16,9 @@
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
-| 3 | Implement | `/implement` | in `/build` | in progress (sent back at step 6) |
-| 4 | Verify | `/verify` | in `/build` | done |
-| 5 | Test | `/test` | in `/build` | done |
+| 3 | Implement | `/implement` | in `/build` | done (re-run after the step-6 halt) |
+| 4 | Verify | `/verify` | in `/build` | pending (re-run) |
+| 5 | Test | `/test` | in `/build` | pending (re-run) |
 | 6 | Concept check | `/concept-check` | in `/build` | pending (re-run) |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
@@ -583,7 +583,7 @@ is built as planned.
 4. *Hold tolerance.* Integer-valued levels hold at `v + 0.5`; continuous ones at
    `v + 1e-6 + 1e-9·|v|`, not `v + 1e-6·max(1, |v|)`. A price level of about 110 allowed a
    slack of 1.1e-4, which is two amp-quarters at a price step of 0.001.
-5. *`presolve` is False, not True.* On the captured planning levels of benchmark seed 1 the
+5. *`presolve` is False, not True.* (Reversed at the step-6 halt: deviation 17.) On the captured planning levels of benchmark seed 1 the
    total fell from 13.9 s to 8.6 s with presolve off; `mip_heuristic_effort`,
    `mip_detect_symmetry`, `mip_pool_soft_limit` and the RINS/RENS switches did not help (the
    last two made it far slower).
@@ -648,7 +648,7 @@ remainder variables integer even when pinned at an on/off charger's fractional a
 (7.5 A), which made the model infeasible, and rounded the result to 8 A. Pinned variables are
 now continuous and read back exactly. Found by the ported `share` tests.
 
-**Deviation 9: P5's "cars on now" and P6 apply only when the first quarter is priced.** As
+**Deviation 9: P5's "cars on now" and P6 apply only when the first quarter is priced.** (Superseded at the step-6 halt: deviation 16.) As
 planned, an all-unpriced horizon put the car on in quarter 0 (and gave it extra quarters),
 contradicting A2's "unpriced quarters used only when needed and latest first". With an
 unpriced first quarter the two levels are skipped, so a car runs now only if the need forces
@@ -765,6 +765,89 @@ Timing after these changes (whole `decide`, 4 cores, one thread, `NODE_LIMIT = 8
 seeds 1 to 8: 7.4, 4.7, 10.3, 7.0, 42.7, 3.0, 12.9, 14.5, worst 42.7 (the P5 ranking level adds
 solves; every tier still passes with a wide margin). The 10-charger tier test takes about 73 s
 in the suite.
+
+### Step-3 re-run after the step-6 halt (2026-10-22)
+
+Both changes are in `src/energy_optimization/ev/optimize.py`; the Public API table is
+unchanged. Section 2's P5 and P6 rows already carry the amended text.
+
+**Red runs, before the fix** (reproductions added to `tests/test_ev_optimize.py` and
+`tests/test_ev_decide.py`, committed red as `WIP step 3: reproductions ...`):
+
+- `test_optimize_three_planned_cars_fill_the_first_quarter_evenly_up_to_each_limit`
+  (A capped at 8 A, B and C 6 to 16 A, 30 A, equal prices, need 1.84 kWh each):
+  `AssertionError ... Differing items: {'b': 14.0} != {'b': 11.0}, {'c': 8.0} != {'c': 11.0}`.
+- `test_optimize_two_planned_cars_forced_into_an_unpriced_first_quarter_share_it`
+  (16 A, no prices, need 1.84 kWh each): `assert {'a': 16.0, 'b': 0.0} == {'a': 8.0, 'b': 8.0}`.
+- `test_decide_solves_snapshots_highs_called_infeasible_without_presolve[two chargers at 10 A]`
+  and `[four chargers at 10 A]` (step 6's #40 and #246, written out as literal snapshot dicts):
+  `SolverError: HiGHS status 2: The problem is infeasible. (HiGHS Status 8: model_status is Infeasible; primal_status is None)`.
+
+All four are green after the fix. Added beside them as pins:
+`test_optimize_an_unpriced_first_quarter_is_not_filled_beyond_what_the_need_forces` (latest-first
+kept: one car with a small need and no prices gets 0 A now),
+`test_optimize_planned_cars_that_cannot_all_rise_share_the_remainder_in_ranking_order` (20 A,
+three cars: 8 / 6 / 6), `test_optimize_planned_cars_on_mixed_phases_fill_evenly_by_phase`
+(8 / 8 / 8), and `presolve is True` in the solver-call spy test.
+
+16. *P5 and P6 as amended (deviation 9 superseded).* `_on_now_and_even` now runs in every
+    case. With an unpriced first quarter it first minimises and holds the total first-quarter
+    current of the planned cars (only what the need forces), then maximises the cars on now
+    and ranks them as when priced. P6 is `_fill_now`, a full progressive fill in the S2 style:
+    each round maximises an integer level `f` with `i_{d,0} >= f` for the live cars, holds it,
+    saturates every car at its maximum or that cannot be raised above `f` with every other
+    live car held (a probe solve per candidate, skipped when the last solution already has the
+    car above `f`), and goes on with the rest. One addition to the plan's wording, so the loop
+    ends: if a round saturates no car (each could rise alone but not all together, e.g. three
+    cars on 20 A) the remainder goes in ranking order, as S3 does. `_even_now` is removed
+    (private; its shortcut is now the `known >= ceiling` test in `_fill_now`). `_Problem`
+    gained `probe` (a solve that holds nothing and keeps no witness) and `set_known`, and
+    `_solve` a `keep` flag. Results: 8 / 11 / 11 and 8 / 8.
+17. *`presolve = True` (deviation 5 reversed).* With `presolve = False` HiGHS reported
+    "infeasible" for feasible models. Step 6's planned-heavy set (500 snapshots) and its
+    `random_snapshot` set (600): 0 `SolverError`s now (was 3: #40 and #246 status 2, #111
+    status 4 after 40.7 s); #111 returns in 23 s while another 500-snapshot run shared the
+    machine (17 s in step 6's run). Nothing else needed changing to make presolve work.
+    #111 is not added as a regression test: at 16 A and 3 chargers it is off the A5 grid
+    and takes about 17 s, which no test should spend; #40 and #246 take 1 s.
+
+*Tests changed because of these two changes.* No test pinned deviation 9's skip or a single
+max-min, so none was removed. One test depended on presolve being off:
+`test_a_real_node_budget_stop_returns_a_plan_within_every_limit` used 2 chargers at 16 A,
+seeds 1 to 6, to reach a real node-budget stop; with presolve those solve at the root (no
+stop, no `SolverError`), so it now uses 4 chargers at 20 A, seeds 4 to 6 (one stop with a
+point, two status 4 without), which still hits both paths with `NODE_LIMIT = 1` (18 s).
+
+**Benchmark, re-timed (guide item 8, fourth run).** Whole `decide`, `benchmark_snapshot`
+(mixed phases, 40 h series with an unpriced tail, `min_block_quarters = 4`, price cap), 4
+cores, one thread, `NODE_LIMIT = 8000`, seconds, nothing else running; seeds 1 to 8 on the four
+named cells, 1 to 5 on the others. No `PLAN_NOT_PROVEN_OPTIMAL` anywhere.
+
+| Cell | Tier | Times | Worst |
+|---|---|---|---|
+| 1 @ 35 A | 10 s | 0.09 0.07 0.11 0.04 0.06 | 0.11 |
+| 2 @ 35 A | 10 s | 0.25 0.15 0.29 0.11 0.13 | 0.29 |
+| 3 @ 35 A | 10 s | 0.92 0.21 0.51 0.35 0.97 0.36 0.37 0.28 | 0.97 |
+| 2 @ 50 A | 10 s | 0.19 0.12 0.25 0.09 0.12 | 0.25 |
+| 3 @ 50 A | 10 s | 0.39 0.21 0.35 0.29 0.26 | 0.39 |
+| 5 @ 50 A | 60 s | 1.36 0.89 2.51 2.15 1.79 0.73 0.79 1.11 | 2.51 |
+| 3 @ 70 A | 10 s | 0.43 0.23 0.37 0.34 0.31 | 0.43 |
+| 5 @ 70 A | 60 s | 1.02 0.70 1.05 0.75 0.55 | 1.05 |
+| 7 @ 70 A | 60 s | 3.88 7.83 2.43 2.00 2.09 1.52 2.47 2.67 | 7.83 |
+| 10 @ 70 A | 120 s | 8.84 6.79 12.98 2.31 59.54 2.05 6.41 20.83 | **59.54** (seed 5) |
+
+Every tier holds; the 10-charger worst case is 59.5 s of 120 s (42.7 s before this pass: the
+progressive fill and the minimised unpriced total add solves, presolve takes some back).
+Risk 1 does not trigger.
+
+**`NODE_LIMIT` stays 8000.** The plan's rule (largest power-of-two multiple of 1000 that keeps
+every tier inside) again has no upper end on the grid: 10 @ 70 A seed 5 takes 55.7, 57.2 and
+58.5 s at 8000, 16000 and 32000. The case that fixed 8000 before, one adjustable car with flat
+prices and 6 A left by a reserved charger, no longer binds with presolve: 0.0 to 0.1 s at
+8000, 16000, 64000, 128000, 256000 and 1,024,000. So the value is no longer chosen by a
+measurement; it is kept (the node-budget tests and the not-proven path are written around it),
+and no value up to 1,024,000 changes a time on the grid.
+
 
 ## 4. Verification log
 
@@ -1154,3 +1237,6 @@ need forces into quarter 0 share it. Deviation 9 is superseded. The `presolve = 
 (deviation 5) is fixed in the same pass: `presolve = True`, with the two infeasible snapshots
 (#40, #246 in step 6's scratch set) and #111 as regression tests. `/build` resumes at step 3
 with both changes; steps 5 and 6 then run again, and the A5 grid is re-timed.
+
+**Resolved (2026-10-22, step 3 fourth run):** P5 and P6 as amended (deviation 16) and
+`presolve = True` (deviation 17), the A5 grid re-timed (section 3); steps 4 to 6 run again.

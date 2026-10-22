@@ -274,7 +274,9 @@ the `Raises:` branches, the empty-demands early return and negative or absent ca
 rounding checks that raise with status 0; the solver call spied for no `time_limit`, one
 thread and the node budget; a node-budget stop with a point being not proven and a status 4
 below the limit failing; a `hypothesis` property that no limit is ever broken (T1) and one
-that the level-by-level tuple equals a brute-force enumeration (T2); and the `main`
+that the level-by-level tuple equals a brute-force enumeration (T2); and the planned tier's
+full progressive fill (8 / 11 / 11 on 30 A, 8 / 8 for two cars forced into an unpriced first
+quarter, the ranking remainder when no car can be saturated); and the `main`
 showcase.
 
 ### `tests/test_ev_allocation.py`
@@ -300,7 +302,7 @@ nights (including an unplanned finish landing exactly on the spring-forward tran
 a planned expected finish ending in or at the repeated hour of the fall-back night and at
 the spring-forward transition, `reaches_target` across the fold, a trickle of current (including a reserved
 charger's tiny measured draw) giving `None` and surviving the codec round trip, no state
-between interleaved snapshots, the solver's failure statuses raising `SolverError` from `decide` (including a later level stopping without a point), node-budget stops (stubbed and real) adding `PLAN_NOT_PROVEN_OPTIMAL` last and round-tripping the codec, the solver call spied, decisions equal under permuted chargers, states and sessions, planned fractional on/off chargers, the fallback capping only the first planned quarter, a ready time inside the current quarter, tiny needs planned in the ready-time quarter (or now with a one-quarter block), the first-ranked planned car charging first on equal prices and a plan below its max staying normal, a mid-quarter ready time credited the whole quarter (pinned, not endorsed), unpriced and empty price series, the price-cap event boundary, the tiers' waiting reason codes and stale prices sharing evenly (T4-T7), and the public surface equal to round 1's plus `SolverError`, `PLAN_NOT_PROVEN_OPTIMAL` and `optimize`'s names (exports, removed modules and names, dataclass fields, signatures, enum members); and the `main` showcase.
+between interleaved snapshots, the solver's failure statuses raising `SolverError` from `decide` (including a later level stopping without a point), node-budget stops (stubbed and real) adding `PLAN_NOT_PROVEN_OPTIMAL` last and round-tripping the codec, the solver call spied, decisions equal under permuted chargers, states and sessions, planned fractional on/off chargers, the fallback capping only the first planned quarter, a ready time inside the current quarter, tiny needs planned in the ready-time quarter (or now with a one-quarter block), the first-ranked planned car charging first on equal prices and a plan below its max staying normal, a mid-quarter ready time credited the whole quarter (pinned, not endorsed), unpriced and empty price series, the price-cap event boundary, the tiers' waiting reason codes and stale prices sharing evenly (T4-T7), the two step-6 snapshots HiGHS called infeasible without presolve (explicit literals), and the public surface equal to round 1's plus `SolverError`, `PLAN_NOT_PROVEN_OPTIMAL` and `optimize`'s names (exports, removed modules and names, dataclass fields, signatures, enum members); and the `main` showcase.
 
 ### `tests/test_ev_codec.py`
 
