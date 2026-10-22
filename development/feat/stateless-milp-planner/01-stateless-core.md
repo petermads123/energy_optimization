@@ -1,6 +1,6 @@
 # Stateless core
 
-<!-- claude-plan step=7 status=active -->
+<!-- claude-plan step=8 status=active -->
 
 | Field | Value |
 |---|---|
@@ -19,7 +19,7 @@
 | 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | done |
 | 6 | Concept check | `/concept-check` | in `/build` | done |
-| 7 | Ship | `/ship` | in `/build` | pending |
+| 7 | Ship | `/ship` | in `/build` | done |
 | 8 | Recommend | `/recommend` | with the user | pending |
 | 9 | Pull request | `/create-pr` | with the user | pending |
 | 10 | Review | `/watch-pr` | on the pull request | pending |
@@ -334,14 +334,6 @@ section deleted, AppDaemon entry rewritten. No test-file additions yet (T2-T5 ar
 | `STRUCTURE.md` | `structure-auditor` found 3 items. (1) `test_ev_decide.py` entry now names both `hypothesis` properties: applied. (2) `result.py` entry now mentions the tuple normalisation in `ChargerDecision` and `Decision`: applied. (3) `STEP_NAMES` / `STEP_SKILLS` undocumented in the hooks sections: rebutted, not applied; the hook sections are kept as on `main`, hooks are outside this round, and the gap pre-dates it |
 | `python -m energy_optimization.ev.<module>` | `model`, `result`, `quarters`, `planning`, `allocation`, `decide`, `codec` all exit 0 and print a readable showcase; the `RuntimeWarning` about `sys.modules` is the expected re-export one |
 
----|---|
-| `ruff check .` | |
-| `ruff format --check .` | |
-| `mypy` | |
-| Plan completeness | every signature in the Public API table exists as written |
-| `STRUCTURE.md` | in sync |
-| `python -m <package>.<module>` | |
-
 ---
 
 ## 5. Test log
@@ -531,8 +523,8 @@ The earlier round is `feat/ev-charging-core` round 1 (`development/feat/ev-charg
 
 | Field | Value |
 |---|---|
-| Commits | |
-| Pushed to | |
+| Commits | 14 before this one, `c0597eb` to `5468eb7`: Concept: stateless core; Plan: stateless core; Plan: stateless core, reviewed and accepted; WIP step 3: restore round-1 core, drop round-2 modules, port finish fix; Implement stateless core: restore round-1 ev core, update docs; WIP step 4: verify stateless core, sync STRUCTURE.md; WIP step 5: decide tests (UTC finish, trickle, surface, plan-fit oracle); WIP step 5: codec and planning tests, section 5, halt on planned-finish fold defect; Halt answered at step 5: all time arithmetic in UTC (A6); WIP step 5: planned expected finish in UTC (D1/D2), finish-after-plan-start invariant; WIP step 5: A6 sweep, UTC compare in reaches_target, STRUCTURE.md, close step 5; WIP step 6: concept check, A3 pin gap sent back to step 5; WIP step 5: pin the spring-forward gap rendering of planned and unplanned finishes; WIP step 6: concept check re-run, A3 met, marker to step 7. Plus the closing `Ship: Stateless core`. Every step left a commit. Review: whole-tree gates green (1221 passed); no scratch files or debug output; one active plan; one leftover empty template table in section 4 removed |
+| Pushed to | `origin/feat/stateless-milp-planner` |
 
 ---
 
