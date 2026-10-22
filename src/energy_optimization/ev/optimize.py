@@ -149,8 +149,10 @@ class Outcome:
     Attributes:
         allocations: The quarter-0 current of every demand, by charger id.
         plans: A plan for every `PLANNED` demand, by charger id.
-        proven: False when any solve (a level, or a probe that decides a level) stopped
-            at the node budget.
+        proven: False when any solve (a level, or a probe that decides a level) ended
+            at the node budget with a point; for a solve that was retried, the retry's
+            result counts, so a first attempt that stopped without a point and a proven
+            retry leave it True.
     """
 
     allocations: dict[str, float]
@@ -206,7 +208,12 @@ class _Problem:
     def _solve(
         self, objective: NDArray[np.float64], keep: bool = True
     ) -> NDArray[np.float64]:
-        """Solve once, update the run's proof status and return the solution.
+        """Solve, retry once if the attempt failed, and return the solution.
+
+        The first attempt runs with presolve on. When it fails (`_failed`) the same model
+        is solved again with presolve off, and only that second result is judged: proven
+        on status 0, not proven on a node-budget stop that has a point, otherwise a
+        `SolverError` carrying the retry's status and message.
 
         Args:
             objective: The objective vector to minimise.
@@ -379,7 +386,13 @@ class _Problem:
 
 
 def _failed(result: OptimizeResult) -> bool:
-    """Whether a solve is worth one retry: infeasible, or stopped without a point."""
+    """Whether a solve is worth one retry.
+
+    That is a result HiGHS reports infeasible (status 2, with or without a point), or any
+    result that carries no point (status 0, 2, 3 or 4 without `x`). A result with a point
+    and any other status (a node-budget stop, or a status 3 or 4 below the limit with a
+    point) is judged as it is and never retried.
+    """
     return int(result.status) == 2 or result.x is None
 
 
@@ -673,7 +686,8 @@ def _fill_now(
             rising = []
             for n in live:
                 if problem.raise_to(columns[n].i[0], reached + 1):
-                    value[n] = float(reached + 1)
+                    # A car already above the level keeps its higher value.
+                    value[n] = max(value[n], float(reached + 1))
                     rising.append(n)
             live = rising
             continue
@@ -905,11 +919,13 @@ def optimize(
     checks below.
 
     Raises:
-        SolverError: If HiGHS reports an error or finds no solution in any solve, and
-            again when the solve is retried once with presolve toggled (carrying the
-            status and message of the last attempt), or if rounding leaves a current outside
-            its limits or a phase over its capacity (carrying status 0, the solver's
-            "optimal", with a message naming the charger or phase).
+        SolverError: If a solve fails. A solve that is infeasible or has no point is
+            first retried once with presolve off, so this means the retry failed too, or
+            the first attempt had a point but not a usable status (carrying the status and
+            message of the attempt judged, the retry's when there was one). Also if
+            rounding leaves a current outside its limits or a phase over its capacity
+            (carrying status 0, the solver's "optimal", with a message naming the charger
+            or phase).
         ValueError: If `now` is naive or a charger id is repeated.
         ZoneInfoNotFoundError: If `timezone` is not a known zone.
     """

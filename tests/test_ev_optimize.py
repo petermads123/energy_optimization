@@ -1069,12 +1069,22 @@ def test_optimize_never_passes_a_time_limit_and_runs_single_threaded(
     run([planned(), Demand("c", L1, Tier.CHARGE_NOW, 6, 16, 16)], priced(1, 2, 3, 4))
 
     assert seen
+    previous: dict[str, object] | None = None
     for options in seen:
+        assert set(options) == {"node_limit", "mip_rel_gap", "presolve", "threads"}
         assert "time_limit" not in options
         assert options["threads"] == 1
         assert options["node_limit"] == NODE_LIMIT
         assert options["mip_rel_gap"] == 0.0
-        assert options["presolve"] is True
+        # The retry contract: presolve is on, except for the one retry that follows a
+        # failed attempt, which changes that option and nothing else.
+        if options["presolve"] is False:
+            assert previous is not None
+            assert previous["presolve"] is True
+            assert {**previous, "presolve": False} == options
+        else:
+            assert options["presolve"] is True
+        previous = options
 
 
 @pytest.mark.parametrize(
@@ -2252,3 +2262,489 @@ def test_price_ticks_gives_up_when_the_grid_is_too_fine_or_too_wide(
     values: list[float],
 ) -> None:
     assert _price_ticks(values) is None
+
+
+# --- step 5, third run: the retry, the one-amp remainder and their edges ---------------
+
+
+def _failed_first(message: str = "first") -> SimpleNamespace:
+    return SimpleNamespace(status=2, message=message, x=None, mip_node_count=0)
+
+
+@pytest.mark.parametrize(
+    ("status", "x", "nodes"),
+    [
+        (3, None, 0),
+        (4, np.array([1.0]), NODE_LIMIT - 1),
+        (2, np.array([1.0]), 0),
+        (0, None, 0),
+        (4, None, NODE_LIMIT),
+    ],
+    ids=[
+        "three-without-a-point",
+        "four-below-the-limit-with-a-point",
+        "two-with-a-point",
+        "zero-without-a-point",
+        "four-at-the-limit-without-a-point",
+    ],
+)
+def test_optimize_a_failed_retry_raises_with_the_retrys_status_and_message(
+    monkeypatch: pytest.MonkeyPatch, status: int, x: object, nodes: int
+) -> None:
+    seen: list[bool] = []
+
+    def stub(*_args: object, **kwargs: object) -> SimpleNamespace:
+        presolve = bool(kwargs["options"]["presolve"])  # type: ignore[index]  # a dict
+        seen.append(presolve)
+        if presolve:
+            return _failed_first()
+        return SimpleNamespace(
+            status=status, message="second", x=x, mip_node_count=nodes
+        )
+
+    monkeypatch.setattr(optimize_module, "milp", stub)
+
+    with pytest.raises(SolverError) as caught:
+        run([Demand("a", L1, Tier.CHARGE_NOW, 6, 16, 16)])
+
+    assert caught.value.status == status  # never the first attempt's 2
+    assert caught.value.message == "second"
+    assert str(caught.value) == f"HiGHS status {status}: second"
+    assert seen == [True, False]
+
+
+def test_optimize_the_retry_changes_nothing_but_presolve_and_never_adds_a_time_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = optimize_module.milp
+    seen: list[dict[str, object]] = []
+
+    def flaky(*args: object, **kwargs: object) -> object:
+        options = dict(kwargs["options"])  # type: ignore[call-overload]  # a dict
+        seen.append(options)
+        if options["presolve"]:
+            return _failed_first()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(optimize_module, "milp", flaky)
+
+    run([planned(), Demand("c", L1, Tier.CHARGE_NOW, 6, 16, 16)], priced(1, 2, 3, 4))
+
+    assert seen
+    assert len(seen) % 2 == 0  # every first attempt failed and was retried once
+    for options in seen:
+        assert set(options) == {"node_limit", "mip_rel_gap", "presolve", "threads"}
+        assert options["threads"] == 1
+        assert options["node_limit"] == NODE_LIMIT
+        assert options["mip_rel_gap"] == 0.0
+    for first, retry in zip(seen[0::2], seen[1::2], strict=True):
+        assert first["presolve"] is True
+        assert retry == {**first, "presolve": False}
+
+
+def test_optimize_a_retry_that_stops_at_status_one_with_a_point_is_kept_and_not_proven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clean = run([planned()], priced(1, 2, 3, 4))
+    real = optimize_module.milp
+
+    def stub(*args: object, **kwargs: object) -> object:
+        if kwargs["options"]["presolve"]:  # type: ignore[index]  # a dict
+            return _failed_first()
+        result = real(*args, **kwargs)
+        return SimpleNamespace(status=1, message="limit", x=result.x, mip_node_count=0)
+
+    monkeypatch.setattr(optimize_module, "milp", stub)
+
+    outcome = run([planned()], priced(1, 2, 3, 4))
+
+    assert outcome.allocations == clean.allocations
+    assert outcome.proven is False
+
+
+@pytest.mark.parametrize(
+    ("status", "nodes"), [(1, 0), (4, NODE_LIMIT)], ids=["status-one", "status-four"]
+)
+def test_optimize_a_budget_stop_with_a_point_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch, status: int, nodes: int
+) -> None:
+    clean = run([planned()], priced(1, 2, 3, 4))
+    real = optimize_module.milp
+    seen: list[bool] = []
+
+    def stub(*args: object, **kwargs: object) -> object:
+        seen.append(bool(kwargs["options"]["presolve"]))  # type: ignore[index]  # a dict
+        result = real(*args, **kwargs)
+        return SimpleNamespace(
+            status=status, message="limit", x=result.x, mip_node_count=nodes
+        )
+
+    monkeypatch.setattr(optimize_module, "milp", stub)
+
+    outcome = run([planned()], priced(1, 2, 3, 4))
+
+    assert seen
+    assert False not in seen  # a stop with a point is an answer, not a failure
+    assert outcome.proven is False
+    assert outcome.allocations == clean.allocations
+
+
+@pytest.mark.parametrize(
+    "budget_stop", [False, True], ids=["proven-retry", "budget-stop-retry"]
+)
+def test_optimize_the_planned_remainder_survives_a_retry_of_every_solve(
+    monkeypatch: pytest.MonkeyPatch, budget_stop: bool
+) -> None:
+    real = optimize_module.milp
+
+    def stub(*args: object, **kwargs: object) -> object:
+        if kwargs["options"]["presolve"]:  # type: ignore[index]  # a dict
+            return _failed_first()
+        result = real(*args, **kwargs)
+        if budget_stop:
+            return SimpleNamespace(
+                status=4, message="limit", x=result.x, mip_node_count=NODE_LIMIT
+            )
+        return result
+
+    monkeypatch.setattr(optimize_module, "milp", stub)
+
+    # The raise passes, the probes and the levels all go through the retry.
+    outcome = _probe_case()
+
+    assert outcome.allocations == {"a": 7.0, "b": 7.0, "c": 6.0}
+    assert outcome.proven is not budget_stop
+
+
+def _calls_of(
+    monkeypatch: pytest.MonkeyPatch, failing_first: bool
+) -> list[list[tuple[int, tuple[int, ...], tuple[float, ...], bool]]]:
+    """Spy on `milp`; each list in the result is one run, one entry per call."""
+    real = optimize_module.milp
+    runs: list[list[tuple[int, tuple[int, ...], tuple[float, ...], bool]]] = [[]]
+
+    def spy(*args: object, **kwargs: object) -> object:
+        c = np.asarray(kwargs["c"])
+        used = np.flatnonzero(c)
+        presolve = bool(kwargs["options"]["presolve"])  # type: ignore[index]  # a dict
+        runs[-1].append(
+            (
+                len(c),
+                tuple(int(i) for i in used),
+                tuple(float(v) for v in c[used]),
+                presolve,
+            )
+        )
+        if failing_first and presolve:
+            return _failed_first()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(optimize_module, "milp", spy)
+    return runs
+
+
+def test_optimize_a_retried_run_issues_the_same_solver_calls_every_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs = _calls_of(monkeypatch, failing_first=True)
+
+    first = _probe_case()
+    runs.append([])
+    second = _probe_case()
+
+    assert first == second
+    assert runs[0] == runs[1]
+    assert [call[3] for call in runs[0][:4]] == [True, False, True, False]
+
+
+def test_optimize_the_tiny_seed_still_exercises_the_real_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs = _calls_of(monkeypatch, failing_first=False)
+
+    first = _tiny(1931)
+    runs.append([])
+    second = _tiny(1931)
+
+    assert first == second
+    assert runs[0] == runs[1]
+    # If this fails, HiGHS no longer reports seed 1931 infeasible with presolve on (a
+    # newer scipy): the seed tests above would then pass without covering the retry.
+    assert any(not call[3] for call in runs[0]), "seed 1931 no longer needs the retry"
+
+
+# --- the one-amp remainder: edges the share comparison cannot reach ---------------------
+
+
+@pytest.mark.parametrize(
+    "tier", [*QUARTER_ZERO_TIERS, Tier.PLANNED], ids=lambda t: t.name
+)
+def test_optimize_a_fractional_first_quarter_limit_never_takes_the_remainder_amp(
+    tier: Tier,
+) -> None:
+    def car(name: str, now_high: float) -> Demand:
+        if tier is Tier.PLANNED:
+            return planned(name, need=1.84, now_high=now_high)
+        return Demand(name, L1, tier, 6, 16, now_high)
+
+    now_room = caps(13, 13, 13)
+    later = caps(40, 40, 40) if tier is Tier.PLANNED else now_room
+    prices = priced(0.2, 0.2, 0.2, 0.2)
+
+    shared = run([car("a", 6.5), car("b", 16)], prices, later, now_room)
+    alone = run([car("a", 10.5)], prices, caps(40, 40, 40), caps(25, 25, 25))
+
+    assert shared.allocations == {"a": 6.0, "b": 7.0}
+    assert alone.allocations == {"a": 10.0}
+
+
+@pytest.mark.parametrize("tier", list(Tier), ids=lambda t: t.name)
+@pytest.mark.parametrize("reverse", [False, True], ids=["a-first", "b-first"])
+def test_optimize_a_car_on_the_binding_phase_drops_out_while_one_on_a_free_phase_keeps_rising(
+    tier: Tier, reverse: bool
+) -> None:
+    both = frozenset({Phase.L1, Phase.L2})
+
+    def car(name: str, phases: frozenset[Phase]) -> Demand:
+        if tier is Tier.PLANNED:
+            return planned(name, need=1.84, phases=phases)
+        return Demand(name, phases, tier, 6, 16, 16)
+
+    cars = [car("a", L1), car("b", both), car("c", L2)]
+    if reverse:
+        cars[0], cars[1] = cars[1], cars[0]
+    room = caps(13, 25, 0)
+
+    outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2), room, room)
+
+    first, second = ("b", "a") if reverse else ("a", "b")
+    assert outcome.allocations == {first: 7.0, second: 6.0, "c": 16.0}
+
+
+@pytest.mark.parametrize("tier", list(Tier), ids=lambda t: t.name)
+@pytest.mark.parametrize(
+    ("current", "room", "expected"),
+    [
+        (10, 25, {"a": 8.0, "p": 10.0, "c": 7.0}),
+        (7.5, 21, {"a": 7.0, "p": 7.5, "c": 6.0}),
+    ],
+    ids=["whole-on-off", "fractional-on-off"],
+)
+def test_optimize_an_on_off_car_inside_the_ranking_takes_its_current_and_the_remainder_skips_it(
+    tier: Tier, current: float, room: float, expected: dict[str, float]
+) -> None:
+    def adjustable(name: str) -> Demand:
+        if tier is Tier.PLANNED:
+            return planned(name, need=1.84)
+        return Demand(name, L1, tier, 6, 16, 16)
+
+    if tier is Tier.PLANNED:
+        pump = planned(
+            "p",
+            need=2 * energy_per_quarter_kwh(current, 1, 230.0),
+            low=current,
+            high=current,
+        )
+    else:
+        pump = Demand("p", L1, tier, current, current, current)
+    by_phase = caps(room, room, room)
+
+    outcome = run(
+        [adjustable("a"), pump, adjustable("c")],
+        priced(0.2, 0.2, 0.2, 0.2),
+        by_phase,
+        by_phase,
+    )
+
+    assert outcome.allocations == expected
+
+
+@pytest.mark.parametrize("tier", list(Tier), ids=lambda t: t.name)
+@pytest.mark.parametrize(
+    ("mins", "room", "expected"),
+    [
+        ([1, 1, 2], 5, {"a": 2.0, "b": 1.0, "c": 2.0}),
+        ([4, 1, 1], 7, {"a": 4.0, "b": 2.0, "c": 1.0}),
+        ([6, 9, 6], 22, {"a": 7.0, "b": 9.0, "c": 6.0}),
+    ],
+    ids=["higher-minimum-last", "higher-minimum-first", "higher-minimum-between"],
+)
+def test_optimize_unequal_minimums_send_the_remainder_to_the_lowest_not_the_higher_minimum(
+    tier: Tier, mins: list[int], room: int, expected: dict[str, float]
+) -> None:
+    cars = _tier_group(tier, mins)
+    by_phase = caps(room, room, room)
+
+    outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2), by_phase, by_phase)
+
+    assert outcome.allocations == expected
+
+
+@pytest.mark.parametrize("tier", list(Tier), ids=lambda t: t.name)
+@pytest.mark.parametrize(
+    ("room", "expected"),
+    [
+        (18, {"a": 6.0, "b": 6.0, "c": 6.0}),
+        (21, {"a": 7.0, "b": 7.0, "c": 7.0}),
+        (22, {"a": 8.0, "b": 7.0, "c": 7.0}),
+        (20.5, {"a": 7.0, "b": 7.0, "c": 6.0}),
+    ],
+    ids=[
+        "no-remainder-at-the-minimum",
+        "no-remainder-above",
+        "one-after-rising",
+        "half-an-amp",
+    ],
+)
+def test_optimize_the_remainder_at_zero_above_the_minimum_and_on_a_fractional_room(
+    tier: Tier, room: float, expected: dict[str, float]
+) -> None:
+    cars = _tier_group(tier, [6, 6, 6])
+    by_phase = caps(room, room, room)
+
+    outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2), by_phase, by_phase)
+
+    assert outcome.allocations == expected
+
+
+@pytest.mark.parametrize(
+    ("tier", "capacity", "now_capacity", "expected"),
+    [
+        (Tier.SMART_OFF, 20, 30, (7.0, 7.0, 6.0)),
+        (Tier.SMART_OFF, 30, 20, (7.0, 7.0, 6.0)),
+        (Tier.CHARGE_NOW, 20, 30, (10.0, 10.0, 10.0)),
+    ],
+    ids=["smart-off-later-binds", "smart-off-now-binds", "charge-now-ignores-later"],
+)
+def test_optimize_smart_off_shares_the_smaller_of_its_two_rooms_one_amp_at_a_time(
+    tier: Tier,
+    capacity: float,
+    now_capacity: float,
+    expected: tuple[float, float, float],
+) -> None:
+    cars = [Demand(n, L1, tier, 6, 16, 16) for n in "abc"]
+
+    outcome = run(
+        cars,
+        None,
+        caps(capacity, capacity, capacity),
+        caps(now_capacity, now_capacity, now_capacity),
+    )
+
+    assert tuple(outcome.allocations[n] for n in "abc") == expected
+
+
+def test_optimize_a_raise_to_solve_stopped_at_the_budget_is_not_proven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_milp = optimize_module.milp
+    real_raise = optimize_module._Problem.raise_to
+    raised: list[float] = []
+
+    def stopped(*args: object, **kwargs: object) -> SimpleNamespace:
+        result = real_milp(*args, **kwargs)
+        return SimpleNamespace(
+            status=1,
+            message="Iteration or time limit reached",
+            x=result.x,
+            mip_node_count=NODE_LIMIT,
+        )
+
+    def raise_to(self: optimize_module._Problem, col: int, level: float) -> bool:
+        raised.append(level)
+        monkeypatch.setattr(optimize_module, "milp", stopped)
+        try:
+            return real_raise(self, col, level)
+        finally:
+            monkeypatch.setattr(optimize_module, "milp", real_milp)
+
+    monkeypatch.setattr(optimize_module._Problem, "raise_to", raise_to)
+
+    outcome = _probe_case()
+
+    assert raised  # the raise pass ran
+    assert outcome.proven is False
+    assert outcome.allocations == {"a": 7.0, "b": 7.0, "c": 6.0}
+
+
+def test_optimize_a_cost_forced_odd_first_quarter_gives_the_extra_amp_to_the_first_ranked() -> (
+    None
+):
+    # The prices force 13 A into the dear first quarter and 13 A into the cheap second
+    # one. Both cars must be on now (6 A each), so the odd amp goes by ranking.
+    def pair(order: str) -> list[Demand]:
+        return [planned(n, need=13 * E1, quarters=2) for n in order]
+
+    forward = run(pair("ab"), priced(0.3, 0.1), caps(13, 13, 13), caps(20, 20, 20))
+    backward = run(pair("ba"), priced(0.3, 0.1), caps(13, 13, 13), caps(20, 20, 20))
+
+    assert forward.allocations == {"a": 7.0, "b": 6.0}
+    assert backward.allocations == {"b": 7.0, "a": 6.0}
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_optimize_the_planned_tier_equals_round_ones_share_on_generated_claims(
+    seed: int,
+) -> None:
+    # Every car fits at its minimum and the needs force nothing in the first quarter
+    # beyond that minimum, so only the even split decides it: round 1's `share`.
+    rng = random.Random(seed)
+    pool = [L1, L1, L2, frozenset({Phase.L1, Phase.L2}), ALL]
+    claims = []
+    for n in range(rng.randint(2, 4)):
+        low = rng.randint(1, 8)
+        claims.append(
+            (f"c{n}", rng.choice(pool), low, low + rng.choice([0, 0, 2, 5, 8]))
+        )
+    room = {
+        phase: float(
+            sum(lo for _, ph, lo, _ in claims if phase in ph) + rng.randint(0, 12)
+        )
+        for phase in Phase
+    }
+    later = {
+        phase: float(sum(hi for _, ph, _, hi in claims if phase in ph))
+        for phase in Phase
+    }
+    demands = [
+        Demand(
+            name,
+            phases,
+            Tier.PLANNED,
+            low,
+            high,
+            high,
+            need_kwh=energy_per_quarter_kwh(1.0, len(phases), 230.0) * (3 * high + low),
+            deadline=q(4),
+        )
+        for name, phases, low, high in claims
+    ]
+
+    outcome = run(demands, priced(0.2, 0.2, 0.2, 0.2), later, room)
+
+    assert outcome.allocations == _reference_share(claims, room), seed
+
+
+@pytest.mark.parametrize("tier", QUARTER_ZERO_TIERS, ids=lambda t: t.name)
+@pytest.mark.parametrize(
+    ("room", "expected"),
+    [
+        (20 - 5e-10, (7.0, 7.0, 6.0)),
+        (19.99, (7.0, 6.0, 6.0)),
+        (21 - 5e-10, (7.0, 7.0, 7.0)),
+    ],
+    ids=["a-hair-under-twenty", "clearly-under-twenty", "a-hair-under-twenty-one"],
+)
+def test_optimize_limits_hold_to_the_solver_tolerance_and_the_documented_slack(
+    tier: Tier, room: float, expected: tuple[float, float, float]
+) -> None:
+    # Accepted at the amp-measurement scale: HiGHS honours a row to 1e-7 and `_verify`
+    # allows 1e-6 on top. A room 5e-10 short of a whole amp counts as that amp; a room
+    # 0.01 A short does not. Either way the draw never exceeds the room by 1e-6.
+    cars = [Demand(n, L1, tier, 6, 16, 16) for n in "abc"]
+    by_phase = caps(room, room, room)
+
+    outcome = run(cars, None, by_phase, by_phase)
+
+    assert tuple(outcome.allocations[n] for n in "abc") == expected
+    assert sum(outcome.allocations.values()) <= room + 1e-6

@@ -339,7 +339,7 @@ Every solve:
 - Options are `{"node_limit": NODE_LIMIT, "mip_rel_gap": 0.0, "presolve": True, "threads": 1}`; the retry uses `"presolve": False`.
 - The `threads` warning is suppressed in a `warnings.catch_warnings()` filtered to that
   message only. There is never a `time_limit`.
-- A solve whose result is status 2 (infeasible), or has no `x`, is retried once with the same model and `presolve` toggled (deviation 24); the retry's result is the one judged below, and only its failure raises. No other status is retried.
+- A solve whose result is status 2 (infeasible, with or without a point) or has no `x` (whatever the status: 0, 2, 3 or 4 without a point) is retried once with the same model and `presolve` toggled (deviation 24, aligned in step 5); the retry's result is the one judged below, and only its failure raises. A result that has a point and any other status (a node-budget stop, or a status 3 or 4 below the limit) is judged as it is and never retried.
 - `res.status == 0` is proven.
 - `res.x` present, with either `res.status == 1` or (`res.status == 4` and
   `res.mip_node_count >= NODE_LIMIT`), is the best found at the node budget, so
@@ -1005,8 +1005,13 @@ All green after the fix.
     with `presolve = True` as before; when the result is status 2 or has no `x`, it calls
     again, same model, same node budget, `presolve = False`, and judges only that result: it
     is proven on status 0, not proven on a node-budget stop with a point, and a second failure
-    raises `SolverError` with the retry's status and message. Statuses 3, and 4 below the node
-    limit with a point, are not retried. Deterministic (the same two calls every run), no
+    raises `SolverError` with the retry's status and message. *Which results are retried
+    (aligned in step 5 with what the code does, `_failed`):* status 2 whether or not it has a
+    point, and any result without a point (status 0, 3 or 4 without `x` as well). A status 3
+    or 4 below the node limit that has a point is not retried, nor is a node-budget stop with
+    a point. (The first wording said status 3 is never retried; it never carries a point in
+    scipy, so it is. This is A6's "reports infeasible, or stops without a point", read as "no
+    usable point"; the code is unchanged.) Deterministic (the same two calls every run), no
     wall-clock limit. The retry applies to every solve, probes included.
     - *Evidence.* Seeds 1931 and 5662: `SolverError` status 2 before, solved by the retry now
       (the retry's solve is the one that succeeds; `trace1931.py` had shown the previous

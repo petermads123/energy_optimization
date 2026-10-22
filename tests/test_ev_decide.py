@@ -3362,6 +3362,38 @@ def test_decide_raises_solver_error_for_every_failure_status(
     assert str(caught.value) == f"HiGHS status {status}: {message}"
 
 
+@pytest.mark.parametrize(
+    ("status", "solution", "nodes"),
+    [
+        (3, None, 0),
+        (2, np.array([1.0]), 0),
+        (4, np.array([1.0]), optimize_module.NODE_LIMIT - 1),
+    ],
+    ids=["unbounded", "infeasible-with-a-point", "four-below-the-node-limit"],
+)
+def test_decide_reports_the_retrys_failure_not_the_first_attempts(
+    monkeypatch: pytest.MonkeyPatch, status: int, solution: object, nodes: int
+) -> None:
+    seen: list[bool] = []
+
+    def stub(*_args: object, **kwargs: object) -> SimpleNamespace:
+        presolve = bool(kwargs["options"]["presolve"])  # type: ignore[index]  # a dict
+        seen.append(presolve)
+        if presolve:
+            return SimpleNamespace(status=2, message="first", x=None, mip_node_count=0)
+        return SimpleNamespace(
+            status=status, message="second", x=solution, mip_node_count=nodes
+        )
+
+    monkeypatch.setattr(optimize_module, "milp", stub)
+
+    with pytest.raises(SolverError) as caught:
+        decide(snap([adj("a")], sessions=[now_session("a")]))
+
+    assert str(caught.value) == f"HiGHS status {status}: second"
+    assert seen == [True, False]
+
+
 def test_a_status_four_below_the_node_limit_raises_whatever_its_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
