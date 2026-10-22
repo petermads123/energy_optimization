@@ -30,7 +30,7 @@ from .planning import SessionPlan, energy_per_quarter_kwh
 from .quarters import floor_to_quarter, quarter_starts
 from .result import PlannedQuarter
 
-NODE_LIMIT = 1000
+NODE_LIMIT = 8000
 """Branch-and-bound nodes allowed per level solve."""
 
 _TOLERANCE = 1e-6
@@ -145,10 +145,6 @@ class _Run:
     message: str = ""
 
 
-class _NoIncumbentError(Exception):
-    """The node budget ended before HiGHS found a point; the last solution stands."""
-
-
 class _Problem:
     """A growing mixed-integer program that is minimised level by level."""
 
@@ -221,11 +217,6 @@ class _Problem:
         stopped = status == 4 and (nodes >= NODE_LIMIT or "Solution limit" in message)
         at_budget = status == 1 or stopped
         if solution is None:
-            if at_budget and self.x is not None:
-                # The budget ran out before HiGHS found a point of its own, but the
-                # last solution satisfies every row held so far: it is the best known.
-                self._run.proven = False
-                raise _NoIncumbentError
             raise SolverError(status, message)
         if status != 0:
             if not at_budget:
@@ -258,7 +249,6 @@ class _Problem:
         *,
         integral: bool = False,
         floor: float | None = None,
-        known: float | None = None,
     ) -> bool:
         """Minimise one level, then hold it at its optimum.
 
@@ -267,8 +257,6 @@ class _Problem:
             integral: Whether the objective can only take whole values.
             floor: A lower bound on the objective. When the last solution already
                 reaches it, the level is held without a solve.
-            known: The objective of the last solution, when it cannot be read from it
-                (columns added since). Used if the node budget ends without a point.
 
         Returns:
             False when the level has no non-zero coefficient and was skipped.
@@ -284,14 +272,7 @@ class _Problem:
             if known <= floor + _EPS:
                 self.hold(objective, known, integral)
                 return True
-        try:
-            solution = self._solve(vector)
-        except _NoIncumbentError:
-            assert self.x is not None
-            if known is None:
-                known = float(vector[: len(self.x)] @ self.x[: len(vector)])
-            self.hold(objective, known, integral)
-            return True
+        solution = self._solve(vector)
         self.hold(objective, float(vector @ solution), integral)
         return True
 
@@ -362,7 +343,7 @@ def _stage_now(
             key = d.charger_id
             lower = value[key]
             upper = value[key] if key in frozen else top[key]
-            cols[key] = fill.var(lower, upper, True)
+            cols[key] = fill.var(lower, upper, lower < upper)
         level = fill.var(0, max(top.values()), True)
         for phase in Phase:
             terms = [(cols[d.charger_id], 1.0) for d in included if phase in d.phases]
@@ -398,7 +379,11 @@ def _stage_now(
     # S3: the remainder goes in ranking order.
     last = _Problem(run)
     cols = {
-        d.charger_id: last.var(value[d.charger_id], top[d.charger_id], True)
+        d.charger_id: last.var(
+            value[d.charger_id],
+            top[d.charger_id],
+            value[d.charger_id] < top[d.charger_id],
+        )
         for d in included
     }
     for phase in Phase:
@@ -412,7 +397,10 @@ def _stage_now(
     final = last.solution()
     allocation = {d.charger_id: 0.0 for d in demands}
     for d in included:
-        allocation[d.charger_id] = float(round(final[cols[d.charger_id]]))
+        pinned = value[d.charger_id] >= top[d.charger_id]
+        allocation[d.charger_id] = (
+            value[d.charger_id] if pinned else float(round(final[cols[d.charger_id]]))
+        )
     return allocation
 
 
@@ -509,6 +497,37 @@ def _even_now(demands: Sequence[Demand], room: Mapping[Phase, float], run: _Run)
     return round(small.solution()[even])
 
 
+def _on_now_and_even(
+    problem: _Problem,
+    demands: Sequence[Demand],
+    columns: Sequence[_Vars],
+    now_room: Mapping[Phase, float],
+    run: _Run,
+) -> None:
+    """Run the second part of P5 and P6: cars on now, then an even first quarter."""
+    possible = [n for n, c in enumerate(columns) if c.x and _hi(demands[n], True) > 0]
+    fits = _fit_now([demands[n] for n in possible], now_room, run) if possible else 0
+    problem.minimise(
+        {columns[n].x[0]: -1.0 for n in possible}, integral=True, floor=-float(fits)
+    )
+    solved = problem.solution()
+    on_now = [n for n, c in enumerate(columns) if c.x and solved[c.x[0]] > 0.5]
+    for n, c in enumerate(columns):
+        if c.x:
+            problem.fix(c.x[0], 1.0 if n in on_now else 0.0)
+    # P6: an even split of the first quarter among the cars that are on now.
+    if on_now:
+        ceiling = _even_now([demands[n] for n in on_now], now_room, run)
+        even = problem.var(0, ceiling, True)
+        for n in on_now:
+            problem.row([(even, 1.0), (columns[n].i[0], -1.0)], -math.inf, 0.0)
+        reached = min(round(solved[columns[n].i[0]]) for n in on_now)
+        if reached >= ceiling:
+            problem.hold({even: -1.0}, -float(ceiling), integral=True)
+        else:
+            problem.minimise({even: -1.0}, integral=True)
+
+
 def _stage_plan(
     demands: Sequence[Demand],
     horizon: Sequence[datetime],
@@ -595,8 +614,7 @@ def _stage_plan(
         if _short_runs(problem.solution(), columns, min_block_quarters) == 0:
             problem.hold(penalty, 0.0, integral=True)
         else:
-            shorts = _short_runs(problem.solution(), columns, min_block_quarters)
-            problem.minimise(penalty, integral=True, known=float(shorts))
+            problem.minimise(penalty, integral=True)
     # P5: lowest price; then as many cars as possible on now.
     problem.minimise(
         {
@@ -606,27 +624,10 @@ def _stage_plan(
             if (p := price_at(t)) is not None
         }
     )
-    possible = [n for n, c in enumerate(columns) if c.x and _hi(demands[n], True) > 0]
-    fits = _fit_now([demands[n] for n in possible], now_room, run) if possible else 0
-    problem.minimise(
-        {columns[n].x[0]: -1.0 for n in possible}, integral=True, floor=-float(fits)
-    )
-    solved = problem.solution()
-    on_now = [n for n, c in enumerate(columns) if c.x and solved[c.x[0]] > 0.5]
-    for n, c in enumerate(columns):
-        if c.x:
-            problem.fix(c.x[0], 1.0 if n in on_now else 0.0)
-    # P6: an even split of the first quarter among the cars that are on now.
-    if on_now:
-        ceiling = _even_now([demands[n] for n in on_now], now_room, run)
-        even = problem.var(0, ceiling, True)
-        for n in on_now:
-            problem.row([(even, 1.0), (columns[n].i[0], -1.0)], -math.inf, 0.0)
-        reached = min(round(solved[columns[n].i[0]]) for n in on_now)
-        if reached >= ceiling:
-            problem.hold({even: -1.0}, -float(ceiling), integral=True)
-        else:
-            problem.minimise({even: -1.0}, integral=True)
+    if price_at(0) is not None:
+        # Only a priced first quarter is worth being on in; an unpriced one is used
+        # only when the need forces it, and then latest first (P7).
+        _on_now_and_even(problem, demands, columns, now_room, run)
     # P7: earlier priced quarters first, unpriced quarters latest first, better-ranked
     # cars earlier.
     weight: dict[int, float] = {}

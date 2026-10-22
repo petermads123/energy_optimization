@@ -1,6 +1,6 @@
 # MILP solver
 
-<!-- claude-plan step=3 status=active -->
+<!-- claude-plan step=4 status=active -->
 
 
 | Field | Value |
@@ -16,7 +16,7 @@
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
-| 3 | Implement | `/implement` | in `/build` | in progress (halted again at guide item 8, tight-budget tier) |
+| 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | pending |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
@@ -320,8 +320,8 @@ size.
 | P2 | `Σ e_d·i_{d,t}` over unpriced `t` | Avoid unpriced quarters |
 | P3 | `Σ e_d·i_{d,t}` over `t` priced above `price_cap` | Use the cap only to meet the need |
 | P4 | `Σ w_{d,t}` | Avoid runs shorter than the minimum block |
-| P5 | `Σ π_t·e_d·i_{d,t}` over priced `t`; then maximise `Σ x_{d,0}` and fix `x_{·,0}` | Lowest price; among equally cheap plans, as many cars as possible on now |
-| P6 | Maximise `z` (constraint 6) | Even split among the planned cars on now: a single max-min, accepted at this tier because iterating it inside the big model is costly |
+| P5 | `Σ π_t·e_d·i_{d,t}` over priced `t`; then, when quarter 0 is priced, maximise `Σ x_{d,0}` and fix `x_{·,0}` | Lowest price; among equally cheap plans, as many cars as possible on now (not when quarter 0 is unpriced, deviation 9) |
+| P6 | Maximise `z` (constraint 6), only when quarter 0 is priced | Even split among the planned cars on now: a single max-min, accepted at this tier because iterating it inside the big model is costly |
 | P7 | `Σ τ_{d,t}·i_{d,t}`, with `τ = (t+1)·(r_d+1)` for priced `t` and `τ = (T−t)·(r_d+1)` for unpriced `t`; `r_d` is the position among the `PLANNED` demands | Earlier priced quarters first; unpriced quarters latest first, as in round 1; the better-ranked car gets the earlier quarter. `τ` is not separable, so swapping two cars between quarters changes it |
 
 The full run is S1–S3 for `SMART_OFF`, S1–S3 for `CHARGE_NOW`, P1–P7, then S1–S3 for
@@ -636,16 +636,89 @@ plan's rule `NODE_LIMIT` would be 2000 for the 10-charger tier and no value for 
 tier at 20 A. `NODE_LIMIT` is left at 1000 in the code, provisional. The 3-charger tier passes
 everywhere. At 26 A the 7-charger seeds 1 and 3 take 13.5 s and 4.7 s.
 
-**Deviation 7: a node-limit stop with no point of its own is not an error.** At 20 A, HiGHS
-sometimes stops at the node budget in a later level without any solution at all
-(`status 4`, `x = None`, `mip_node_count = None`, message "Solution limit reached"), which
-raised `SolverError`. The last solution already satisfies every row held so far, so the
-level now keeps it: `_Problem.minimise` holds the level at that solution's objective, marks
-the run not proven (the `PLAN_NOT_PROVEN_OPTIMAL` event) and goes on. The first solve of a
-run, which has no earlier solution, still raises `SolverError` (A6). `status 4` is read as a
-node-budget stop when `mip_node_count >= NODE_LIMIT` or the message says "Solution limit".
-This is a reading of A5 ("a solve stopped by the node budget returns its best plan") against
-A6 ("finds no solution") that the concept does not spell out; flagged for step 6.
+**Deviation 7: reverted (second halt, 2026-10-22).** A node-limit stop with no point of its
+own briefly kept the last solution and went on (`_NoIncumbentError`). The user answered
+"Raise SolverError" and A6 now says so: every level solve that ends without a point raises
+`SolverError(status, message)`. The catch-and-hold, its `known` parameter and the
+`_NoIncumbentError` class are removed from `optimize.py`. `PLAN_NOT_PROVEN_OPTIMAL` remains for
+a node-budget stop that returns a point (status 1, or status 4 with `x`).
+
+**Deviation 8: fractional all-or-nothing currents.** `_stage_now` made the progressive-fill and
+remainder variables integer even when pinned at an on/off charger's fractional assumed current
+(7.5 A), which made the model infeasible, and rounded the result to 8 A. Pinned variables are
+now continuous and read back exactly. Found by the ported `share` tests.
+
+**Deviation 9: P5's "cars on now" and P6 apply only when the first quarter is priced.** As
+planned, an all-unpriced horizon put the car on in quarter 0 (and gave it extra quarters),
+contradicting A2's "unpriced quarters used only when needed and latest first". With an
+unpriced first quarter the two levels are skipped, so a car runs now only if the need forces
+it and P7 orders the unpriced quarters latest first. The concept decided this case (A2), so
+no change to section 1; the plan's P5 and P6 rows are narrowed to priced first quarters.
+
+**Benchmark (guide item 8, third run), final.** `bench.py`: adjustable 6 to 16 A chargers on
+mixed phases (L1, L2, L3, all three, L1 + L2), each a session with a need of 8 to 45 kWh and
+a ready time between 06:00 and 18:30, a 40-hour hourly series (unpriced tail),
+`min_block_quarters = 4`, `price_cap = 0.45`, whole `decide` call, 4 cores, HiGHS on one
+thread, `NODE_LIMIT = 8000`. Seconds, seeds 1 to 5 (the 3-, 7- and 10-charger cells at 70 A also
+seeds 6 to 8). Every run proven optimal (no `PLAN_NOT_PROVEN_OPTIMAL`).
+
+| Cell (chargers @ budget per phase) | Tier | Worst of the seeds |
+|---|---|---|
+| 1 @ 35 A | 10 s | 0.17 |
+| 2 @ 35 A | 10 s | 0.44 |
+| 3 @ 35 A | 10 s | 0.66 |
+| 2 @ 50 A | 10 s | 0.33 |
+| 3 @ 50 A | 10 s | 0.51 |
+| 5 @ 50 A | 60 s | 2.27 |
+| 3 @ 70 A | 10 s | 0.59 |
+| 5 @ 70 A | 60 s | 1.46 |
+| 7 @ 70 A | 60 s | 3.06 |
+| 10 @ 70 A | 120 s | **39.54** (seed 5; the others 1.5 to 9.5) |
+
+Every tier passes, the 10-charger worst case with a threefold margin. The same grid at
+`NODE_LIMIT = 1000` (5 seeds) and `1024000` (3 to 10 chargers, 8 seeds) gave the same times
+within noise (10 chargers: worst 40.05 s and 39.59 s): the node budget never binds on the
+grid, so it does not discriminate.
+
+**`NODE_LIMIT = 8000`.** The plan's rule (largest power-of-two multiple of 1000 that keeps
+every tier inside) has no upper end on this grid. A degenerate small case does bind: one
+adjustable charger with flat prices and 6 A left by a reserved charger
+(`test_planning_capacity_is_starved_only_below_the_adjustable_minimum`) takes 0.8 s at 1000,
+4.7 s at 8000, and 158 s at 1024000. 8000 is the largest value in the series that keeps that
+1-charger case inside the 10 s tier, so it is the value. Budgets tighter than the grid's are
+not timed (the second Halted answer).
+
+**Tests (guide item 7).** The greedy planner's tests and `Claim`/`share`'s are removed from
+`test_ev_planning.py` and `test_ev_allocation.py`; `share`'s tests are kept in the new
+`tests/test_ev_optimize.py`, driven through `optimize` with `CHARGE_NOW` demands (they pass
+unchanged). Changed expectations in `test_ev_decide.py`, each with its A8 kind:
+
+| Test | Change | Kind |
+|---|---|---|
+| `test_two_unreachable_planned_cars_split_a_shared_phase_evenly_now` (was `test_an_empty_plan_left_by_another_sessions_plan_is_waiting_for_capacity`) | 16 A / 0 A becomes 8 A / 8 A, both priority 2, both `IN_PLAN` | even split |
+| `test_a_planned_charger_without_room_now_is_planned_later_and_a_starved_one_waits` (was `..._an_active_tier_at_zero_and_a_starved_charger_wait_for_capacity`) | planned car with 5 A on its phase now: priority 2 and `WAITING_FOR_CAPACITY` become 4 and `PLANNED_LATER` | optimality (plan's quarter-0 current), reason code leftover |
+| `test_a_lower_tier_gets_what_a_higher_tier_leaves` (was `..._only_the_highest_occupied_tier_gets_current`) | spare car on another phase gets 16 A, not 0 | leftover |
+| `test_smart_charging_off_is_served_before_smart_chargers` | `WAITING_FOR_CAPACITY` becomes `WAITING_FOR_HIGHER_PRIORITY` for charge-now behind a smart-off charger | leftover (reason code) |
+| `test_charge_now_takes_the_first_quarter_and_the_plan_starts_after_it` (was `..._do_not_consume_planning_capacity`) | plan `[16, 16]` from now becomes `[16, 11]` from the next quarter; priority 2 / `WAITING_FOR_HIGHER_PRIORITY` becomes 4 / `PLANNED_LATER` | optimality, reason code leftover |
+| `test_smart_off_allocations_shrink_the_capacity_planned_for_smart_sessions`, `test_reserved_chargers_shrink_the_capacity_planned_for_smart_sessions` | plan currents `{10}` / `{15}` become a set topping out at 10 / 15 whose energy covers the need (the plan delivers the need, last quarters step down) | optimality |
+| `assert_invariants`: `assert len(served) <= 1` | replaced by a tier-precedence invariant (a lower tier never holds current a runnable higher-tier charger on a shared phase could use) | leftover |
+
+Added: `test_a_lower_tier_never_takes_current_a_higher_tier_could_use`, the tier timing tests
+(`test_the_a5_tier_bound_holds_for_every_benchmark_seed` for 3 chargers @ 35 A, 7 and 10 @
+70 A, seeds 1 to 5), a repeat-call equality test, and
+`test_the_package_uses_numpy_and_scipy_and_pyproject_declares_them`. Surface tests updated,
+not classified: the export set (+`SolverError`), the removed names (+`plan_sessions`,
+`PlanRequest`, `share`, `Claim`), the dataclass fields (`PlanRequest` replaced by `Demand`),
+the signatures (`plan_sessions` replaced by `optimize`), `EventKind`'s exact members, the AST
+scan (+`numpy`, `scipy`) and the allocation showcase's assertion. No hypothesis
+`max_examples` was lowered: the two `decide` properties (300 and 60 examples) take about 16
+and 5 s. The suite takes 130 s, of which the 10-charger tier test is about 55 s and the 7-charger
+one 11 s; no `slow` marker exists in the repo, so none was added.
+
+**Gates at the end of step 3.** `ruff check .`, `ruff format --check .`, `mypy`: clean.
+`pytest`: 1166 passed. Every module showcase exits 0. `STRUCTURE.md` gains `optimize.py`
+and `tests/test_ev_optimize.py` and loses `Claim`, `share`, `PlanRequest` and `plan_sessions`;
+`README.md` needed no change (it never claimed the package is stdlib-only).
 
 ## 4. Verification log
 
@@ -822,3 +895,6 @@ What exists is committed. Tests (item 7), `STRUCTURE.md` and `README.md` (item 9
    `PLAN_NOT_PROVEN_OPTIMAL` remains for a node-budget stop that returns a point.
 `/build` resumes step 3: revert deviation 7, re-run the grid, fix `NODE_LIMIT`, then guide
 items 7 and 9.
+
+**Resolved (2026-10-22, step 3 third run):** deviation 7 reverted, the grid run and
+`NODE_LIMIT` fixed at 8000 (section 3), tests and `STRUCTURE.md` done.

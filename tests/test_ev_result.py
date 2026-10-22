@@ -71,7 +71,9 @@ def test_status_and_event_kinds_are_exactly_the_planned_set() -> None:
         "CHARGE_NOW_NEED_COVERED",
         "PHASE_DATA_STALE",
         "PRICES_STALE",
+        "PLAN_NOT_PROVEN_OPTIMAL",
     }
+    assert EventKind.PLAN_NOT_PROVEN_OPTIMAL.value == "plan_not_proven_optimal"
 
 
 @pytest.mark.parametrize(

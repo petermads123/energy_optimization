@@ -49,11 +49,8 @@ from energy_optimization.ev import (
 )
 from energy_optimization.ev.allocation import phase_capacity
 from energy_optimization.ev.decide import main as showcase
-from energy_optimization.ev.planning import (
-    PlanRequest,
-    energy_per_quarter_kwh,
-    plan_sessions,
-)
+from energy_optimization.ev.optimize import Demand, optimize
+from energy_optimization.ev.planning import energy_per_quarter_kwh
 
 NOW = datetime(2026, 10, 21, 20, 0, tzinfo=UTC)  # 22:00 CEST
 TZ = "Europe/Copenhagen"
@@ -144,6 +141,7 @@ def snap(
     fallback: int = 6,
     price_cap: float | None = None,
     default_need: float = 30.0,
+    min_block_quarters: int = 2,
 ) -> Snapshot:
     if states is None:
         states = [idle(c.id) for c in chargers]
@@ -158,6 +156,7 @@ def snap(
             TZ,
             price_cap=price_cap,
             default_energy_need_kwh=default_need,
+            min_block_quarters=min_block_quarters,
         ),
         tuple(chargers),
         tuple(states),
@@ -314,7 +313,8 @@ def test_a_starved_charger_beside_a_served_one_limits_the_status(
     assert result.status is Status.LIMITED_BY_BUDGET
 
 
-def test_an_empty_plan_left_by_another_sessions_plan_is_waiting_for_capacity() -> None:
+def test_two_unreachable_planned_cars_split_a_shared_phase_evenly_now() -> None:
+    # A8 kind: even split. Round 1 gave the first car all 16 A and left the second at 0.
     sessions = [sess("a", need=40.0), sess("b", need=5.0)]
 
     result = decide(
@@ -327,12 +327,11 @@ def test_an_empty_plan_left_by_another_sessions_plan_is_waiting_for_capacity() -
         )
     )
 
-    served, starved = by_id(result)["a"], by_id(result)["b"]
-    assert (served.priority, served.allocation) == (2, 16.0)
-    assert (starved.priority, starved.allocation) == (4, 0.0)
-    assert starved.plan == ()
-    assert starved.reason.code is ReasonCode.WAITING_FOR_CAPACITY
-    assert starved.reason.text == "Priority 4 — waiting for capacity"
+    first, second = by_id(result)["a"], by_id(result)["b"]
+    assert (first.priority, first.allocation) == (2, 8.0)
+    assert (second.priority, second.allocation) == (2, 8.0)
+    assert first.plan[0].current == second.plan[0].current == 8.0
+    assert second.reason.code is ReasonCode.IN_PLAN
     assert result.status is Status.LIMITED_BY_BUDGET
     assert kinds(result).count(EventKind.TARGET_UNREACHABLE) == 2
 
@@ -457,7 +456,11 @@ def test_smart_charging_off_allocations_can_starve_a_smart_session(
         assert result.status is Status.WAITING_FOR_CAPACITY
 
 
-def test_an_active_tier_at_zero_and_a_starved_charger_wait_for_capacity() -> None:
+def test_a_planned_charger_without_room_now_is_planned_later_and_a_starved_one_waits() -> (
+    None
+):
+    # A8 kind: optimality (its quarter-0 current is the plan's, and the plan starts
+    # when the phase has room), with the reason code that follows from it.
     chargers = [fixed("f", L1, 27.0), adj("t", ALL), adj("s", L2)]
     states = [idle("f", 27.0, False), idle("t"), idle("s")]
     sessions = [sess("t", need=10.0), sess("s", need=10.0)]
@@ -475,10 +478,10 @@ def test_an_active_tier_at_zero_and_a_starved_charger_wait_for_capacity() -> Non
         )
     )
 
-    assert by_id(result)["s"].priority == 2
+    assert by_id(result)["s"].priority == 4
     assert by_id(result)["s"].plan
     assert by_id(result)["s"].allocation == 0.0
-    assert by_id(result)["s"].reason.code is ReasonCode.WAITING_FOR_CAPACITY
+    assert by_id(result)["s"].reason.code is ReasonCode.PLANNED_LATER
     assert by_id(result)["t"].reason.code is ReasonCode.WAITING_FOR_CAPACITY
     assert result.status is Status.WAITING_FOR_CAPACITY
 
@@ -654,7 +657,8 @@ def test_equal_ready_times_and_needs_rank_by_charger_id() -> None:
     assert allocations(result) == {"b": 0.0, "a": 6.0}
 
 
-def test_only_the_highest_occupied_tier_gets_current() -> None:
+def test_a_lower_tier_gets_what_a_higher_tier_leaves() -> None:
+    # A8 kind: leftover. Round 1 served only the highest occupied tier.
     chargers = [adj("p1", L1), adj("p3", L2)]
     sessions = [now_session("p1"), sess("p3", need=0.0)]
 
@@ -663,8 +667,20 @@ def test_only_the_highest_occupied_tier_gets_current() -> None:
     decisions = by_id(result)
     assert decisions["p1"].allocation == 16.0
     assert decisions["p1"].priority == 1
-    assert decisions["p3"].allocation == 0.0
+    assert decisions["p3"].allocation == 16.0
     assert decisions["p3"].priority == 3
+    assert decisions["p3"].reason.code is ReasonCode.PLAN_COMPLETED
+
+
+def test_a_lower_tier_never_takes_current_a_higher_tier_could_use() -> None:
+    chargers = [adj("p1", L1), adj("p3", L1)]
+    sessions = [now_session("p1"), sess("p3", need=0.0)]
+
+    result = decide(snap(chargers, sessions=sessions, budget=16.0))
+
+    decisions = by_id(result)
+    assert decisions["p1"].allocation == 16.0
+    assert decisions["p3"].allocation == 0.0
     assert decisions["p3"].reason.code is ReasonCode.WAITING_FOR_HIGHER_PRIORITY
 
 
@@ -1250,7 +1266,8 @@ def test_smart_charging_off_is_served_before_smart_chargers() -> None:
     assert off.reason.text == "Smart charging off, charging at 16 A"
     assert off.priority is None
     assert now_decision.allocation == 0.0
-    assert now_decision.reason.code is ReasonCode.WAITING_FOR_CAPACITY
+    # A8 kind: leftover (reason code). A smart-off charger on its phase took the room.
+    assert now_decision.reason.code is ReasonCode.WAITING_FOR_HIGHER_PRIORITY
     assert result.status is Status.WAITING_FOR_CAPACITY
 
 
@@ -1735,7 +1752,9 @@ def test_a_user_limit_below_the_minimum_is_unreachable_too() -> None:
     assert EventKind.TARGET_UNREACHABLE in kinds(result)
 
 
-def test_charge_now_sessions_do_not_consume_planning_capacity() -> None:
+def test_charge_now_takes_the_first_quarter_and_the_plan_starts_after_it() -> None:
+    # A8 kind: optimality. Round 1 planned the first quarter for `p` although charge
+    # now took all of it; the plan now starts in the next quarter.
     chargers = [adj("n"), adj("p")]
     sessions = [now_session("n"), sess("p", need=1.5)]
 
@@ -1746,10 +1765,11 @@ def test_charge_now_sessions_do_not_consume_planning_capacity() -> None:
     )
 
     p = by_id(result)["p"]
-    assert [q.current for q in p.plan] == [16.0, 16.0]
-    assert p.priority == 2
+    assert [q.current for q in p.plan] == [16.0, 11.0]
+    assert p.plan[0].start == (NOW + QUARTER).astimezone(ZONE)
+    assert p.priority == 4
     assert p.allocation == 0.0
-    assert p.reason.code is ReasonCode.WAITING_FOR_HIGHER_PRIORITY
+    assert p.reason.code is ReasonCode.PLANNED_LATER
     assert by_id(result)["n"].allocation == 16.0
 
 
@@ -1764,7 +1784,11 @@ def test_smart_off_allocations_shrink_the_capacity_planned_for_smart_sessions() 
         snap(chargers, sessions=sessions, prices=hourly([0.1] * 12), budget=20.0)
     )
 
-    assert {q.current for q in by_id(result)["p"].plan} == {10.0}
+    # A8 kind: optimality. The plan delivers the need and no more, so its last
+    # quarters step down; none may exceed what the smart-off charger leaves.
+    plan = by_id(result)["p"].plan
+    assert max(q.current for q in plan) == 10.0
+    assert sum(q.current for q in plan) * E16 / 16 >= 3.0 - 1e-9
 
 
 def test_reserved_chargers_shrink_the_capacity_planned_for_smart_sessions() -> None:
@@ -1773,7 +1797,10 @@ def test_reserved_chargers_shrink_the_capacity_planned_for_smart_sessions() -> N
 
     result = decide(snap(chargers, states, [sess("p", need=3.0)], hourly([0.1] * 12)))
 
-    assert {q.current for q in by_id(result)["p"].plan} == {15.0}
+    # A8 kind: optimality, as above; none may exceed what the reservation leaves.
+    plan = by_id(result)["p"].plan
+    assert max(q.current for q in plan) == 15.0
+    assert sum(q.current for q in plan) * E16 / 16 >= 3.0 - 1e-9
 
 
 def test_expected_finish_without_a_plan_follows_the_allocation() -> None:
@@ -1949,7 +1976,7 @@ def test_charger_decisions_come_in_snapshot_order() -> None:
     assert [c.charger_id for c in result.chargers] == ["z", "a", "m"]
 
 
-# --- T18: determinism, purity, stdlib only -------------------------------------
+# --- T18: determinism, purity, dependencies -------------------------------------
 
 
 def mixed_snapshot() -> Snapshot:
@@ -2006,11 +2033,11 @@ def test_the_output_does_not_depend_on_the_hash_seed() -> None:
     assert json.loads(outputs.pop())["chargers"]
 
 
-def test_the_package_imports_only_the_standard_library_and_itself() -> None:
+def test_the_package_imports_only_the_standard_library_numpy_scipy_and_itself() -> None:
     import ast
 
     package = Path(energy_optimization.__file__).resolve().parent
-    allowed = set(sys.stdlib_module_names) | {"energy_optimization"}
+    allowed = set(sys.stdlib_module_names) | {"energy_optimization", "numpy", "scipy"}
     offenders: list[str] = []
     files = sorted(package.rglob("*.py"))
     for path in files:
@@ -2025,6 +2052,28 @@ def test_the_package_imports_only_the_standard_library_and_itself() -> None:
             ]
     assert len(files) >= 8
     assert offenders == []
+
+
+def test_the_package_uses_numpy_and_scipy_and_pyproject_declares_them() -> None:
+    import ast
+    import tomllib
+
+    package = Path(energy_optimization.__file__).resolve().parent
+    outside: set[str] = set()
+    for path in package.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                outside |= {alias.name.split(".")[0] for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                outside.add(node.module.split(".")[0])
+    outside -= set(sys.stdlib_module_names) | {"energy_optimization"}
+    pyproject = package.parents[1] / "pyproject.toml"
+    declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"][
+        "dependencies"
+    ]
+
+    assert outside == {"numpy", "scipy"}
+    assert {d.split(">")[0].split("=")[0].split("<")[0] for d in declared} == outside
 
 
 def test_the_package_reexports_the_public_api() -> None:
@@ -2060,40 +2109,60 @@ def test_the_package_reexports_the_public_api() -> None:
 # --- T20: speed ----------------------------------------------------------------
 
 
-def large_snapshot() -> Snapshot:
+TIER_BUDGETS = {3: 35.0, 7: 70.0, 10: 70.0}  # A per phase; the A5 worst case
+TIER_SECONDS = {3: 10.0, 7: 60.0, 10: 120.0}
+
+
+def benchmark_snapshot(seed: int, count: int, budget: float) -> Snapshot:
+    """The A5 worst case: mixed phases, a 40 h series with an unpriced tail."""
+    rng = random.Random(seed)
+    phase_sets = [L1, L2, L3, ALL, frozenset({Phase.L1, Phase.L2})]
     chargers: list[Charger] = []
     states: list[ChargerState] = []
     sessions: list[Session] = []
-    phase_sets = [ALL, L1, L2, L3, frozenset({Phase.L1, Phase.L2})]
-    for index in range(10):
+    for index in range(count):
         cid = f"c{index}"
-        chargers.append(adj(cid, phase_sets[index % 5]))
+        chargers.append(adj(cid, rng.choice(phase_sets)))
         states.append(idle(cid))
-        need = 600.0 if index < 2 else 20.0 + index
-        sessions.append(sess(cid, ready=time(5 + index % 3, 0), need=need))
+        ready = time(rng.choice([6, 7, 8, 17, 18]), rng.choice([0, 30]))
+        sessions.append(sess(cid, ready=ready, need=rng.uniform(8.0, 45.0)))
     intervals = tuple(
-        PriceInterval(NOW + QUARTER * i, NOW + QUARTER * (i + 1), 0.2 + (i % 7) * 0.05)
-        for i in range(48 * 4)
+        PriceInterval(
+            NOW + timedelta(hours=h),
+            NOW + timedelta(hours=h + 1),
+            round(rng.uniform(0.1, 0.6), 3),
+        )
+        for h in range(40)
     )
-    prices = PriceSeries(intervals, NOW)
-    # A cap below every price forces the cap-breaking pass; the first two are unreachable.
     return snap(
-        chargers, states, sessions, prices, budget=32.0, threshold=40.0, price_cap=0.0
+        chargers,
+        states,
+        sessions,
+        PriceSeries(intervals, NOW),
+        budget=budget,
+        threshold=budget + 10.0,
+        price_cap=0.45,
+        min_block_quarters=4,
     )
 
 
-def test_ten_chargers_and_a_48_hour_series_decide_in_under_100_ms() -> None:
-    snapshot = large_snapshot()
-    durations = []
-    for _ in range(5):
+@pytest.mark.parametrize("count", [3, 7, 10])
+def test_the_a5_tier_bound_holds_for_every_benchmark_seed(count: int) -> None:
+    for seed in range(1, 6):
+        snapshot = benchmark_snapshot(seed, count, TIER_BUDGETS[count])
+
         started = clock.perf_counter()
         result = decide(snapshot)
-        durations.append(clock.perf_counter() - started)
+        elapsed = clock.perf_counter() - started
 
-    assert len(result.chargers) == 10
-    assert EventKind.TARGET_UNREACHABLE in kinds(result)
-    assert EventKind.PRICE_CAP_EXCEEDED in kinds(result)
-    assert min(durations) < 0.1
+        assert len(result.chargers) == count
+        assert elapsed < TIER_SECONDS[count], f"seed {seed}: {elapsed:.1f} s"
+
+
+def test_the_benchmark_decision_is_equal_on_a_repeated_call() -> None:
+    snapshot = benchmark_snapshot(1, 3, 35.0)
+
+    assert decide(snapshot) == decide(snapshot)
 
 
 # --- T17: invariants for any input ---------------------------------------------
@@ -2349,6 +2418,70 @@ def assert_invariants(snapshot: Snapshot, result: Decision) -> None:
             assert given <= bound + TOLERANCE
         assert 0.0 <= result.available.get(phase) <= cfg.phase_budget + TOLERANCE
 
+    # A3 (tier precedence on the leftover): a charger of a lower tier never holds
+    # current that a runnable charger of a higher tier, sharing one of its phases,
+    # could have had. Tiers: smart charging off, charge now (1), planned (2), spare (3).
+    def tier_of(c: Charger) -> int:
+        session = sessions.get(c.id)
+        if session is not None and not session.smart_charging:
+            return 0
+        priority = decisions[c.id].priority
+        return {1: 1, 2: 2, 3: 3}.get(priority if priority is not None else 9, 9)
+
+    def floor_of(c: Charger) -> float:
+        if c.kind is ChargerKind.ADJUSTABLE:
+            assert c.min_current is not None
+            return float(c.min_current)
+        return c.assumed_current or 0.0
+
+    def can_run(c: Charger) -> bool:
+        session = sessions.get(c.id)
+        if reserved(c) or session is None or not states[c.id].car_connected:
+            return False
+        limit = session.user_current_limit
+        return limit is None or floor_of(c) <= limit + TOLERANCE
+
+    phase_room: dict[Phase, float] = {}
+    for phase in Phase:
+        on_phase = [c for c in snapshot.chargers if phase in c.phases]
+        held = sum(decisions[c.id].allocation for c in on_phase if reserved(c))
+        room = max(0.0, cfg.phase_budget - held)
+        measured_now = pc.get(phase) if fresh and pc is not None else None
+        if measured_now is not None:
+            set_to = sum(
+                decisions[c.id].allocation
+                if reserved(c)
+                else (
+                    0.0
+                    if states[c.id].paused or not states[c.id].car_connected
+                    else present_current(c, states[c.id])
+                )
+                for c in on_phase
+            )
+            room = min(
+                room, max(0.0, cfg.phase_threshold - (measured_now - set_to) - held)
+            )
+        phase_room[phase] = room
+    for y in snapshot.chargers:
+        if tier_of(y) > 1 or not can_run(y) or decisions[y.id].allocation > 0:
+            continue
+        for z in snapshot.chargers:
+            if z is y or reserved(z) or tier_of(z) <= tier_of(y):
+                continue
+            if decisions[z.id].allocation <= 0 or not y.phases & z.phases:
+                continue
+            blocked = any(
+                phase_room[p]
+                - sum(
+                    decisions[o.id].allocation
+                    for o in snapshot.chargers
+                    if p in o.phases and not reserved(o) and o is not z and o is not y
+                )
+                < floor_of(y) - TOLERANCE
+                for p in y.phases
+            )
+            assert blocked, f"{z.id} holds current that {y.id} could use"
+
     served = {
         decisions[c.id].priority
         for c in snapshot.chargers
@@ -2356,7 +2489,6 @@ def assert_invariants(snapshot: Snapshot, result: Decision) -> None:
         and decisions[c.id].allocation > 0
         and decisions[c.id].priority is not None
     }
-    assert len(served) <= 1
     assert served <= {1, 2, 3}
 
     expected: set[tuple[str, ActionKind, float]] = set()
@@ -2767,6 +2899,7 @@ ROUND_1_ALL = {
     "Session",
     "Settings",
     "Snapshot",
+    "SolverError",
     "Stage",
     "Status",
     "decide",
@@ -2777,7 +2910,7 @@ ROUND_1_ALL = {
 }
 
 
-def test_the_package_exports_exactly_round_ones_names() -> None:
+def test_the_package_exports_round_ones_names_and_solver_error() -> None:
     import energy_optimization.ev as ev
 
     assert set(ev.__all__) == ROUND_1_ALL
@@ -2803,6 +2936,10 @@ def test_the_round_two_modules_are_gone(module: str) -> None:
         ("codec", "memory_from_dict"),
         ("result", "GuardLevel"),
         ("allocation", "settling"),
+        ("planning", "plan_sessions"),
+        ("planning", "PlanRequest"),
+        ("allocation", "share"),
+        ("allocation", "Claim"),
     ],
 )
 def test_the_round_two_names_are_gone(module: str, name: str) -> None:
@@ -2843,19 +2980,21 @@ def test_the_round_two_names_are_gone(module: str, name: str) -> None:
         ),
         (Decision, ("actions", "chargers", "available", "status", "events")),
         (
-            PlanRequest,
+            Demand,
             (
                 "charger_id",
                 "phases",
+                "tier",
                 "min_current",
                 "max_current",
+                "now_max_current",
                 "need_kwh",
                 "deadline",
             ),
         ),
     ],
 )
-def test_the_dataclass_fields_are_round_ones(
+def test_the_dataclass_fields_are_round_ones_and_the_demands(
     cls: type, fields: tuple[str, ...]
 ) -> None:
     assert tuple(f.name for f in dataclasses.fields(cls)) == fields
@@ -2865,12 +3004,13 @@ def test_the_dataclass_fields_are_round_ones(
     ("function", "names"),
     [
         (
-            plan_sessions,
+            optimize,
             [
-                "requests",
+                "demands",
                 "now",
                 "prices",
                 "capacity",
+                "now_capacity",
                 "voltage",
                 "min_block_quarters",
                 "price_cap",
@@ -2880,7 +3020,7 @@ def test_the_dataclass_fields_are_round_ones(
         (phase_capacity, ["snapshot", "fresh"]),
     ],
 )
-def test_the_planner_and_capacity_signatures_are_round_ones(
+def test_the_optimiser_and_capacity_signatures(
     function: object, names: list[str]
 ) -> None:
     parameters = inspect.signature(function).parameters  # type: ignore[arg-type]  # parametrized callables
