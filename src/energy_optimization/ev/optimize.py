@@ -9,7 +9,10 @@ solved on small quarter-0 models before and after the planning model, which is e
 because their variables meet the later quarters only through capacity.
 
 All time arithmetic is in UTC. The solver is deterministic: one thread, a fixed node
-budget per solve (`NODE_LIMIT`) and never a wall-clock limit.
+budget per solve (`NODE_LIMIT`) and never a wall-clock limit. A solve that HiGHS
+reports infeasible, or stops without a point, is retried once with presolve toggled
+(the answer is the same model's, so it is as deterministic); only a second failure
+raises `SolverError`.
 """
 
 import math
@@ -406,8 +409,9 @@ def _stage_now(
 ) -> dict[str, float]:
     """Decide the first quarter of demands that exist only in the first quarter.
 
-    Inclusion at the minimum in ranking order, then max-min-fair 1 A steps, then the
-    remainder in ranking order (levels S1 to S3).
+    Inclusion at the minimum in ranking order (S1), then max-min-fair 1 A steps with the
+    leftover going one amp at a time to the lowest, ties in ranking order (S2): round
+    1's `share`.
     """
     if not demands:
         return {}
@@ -901,8 +905,9 @@ def optimize(
     checks below.
 
     Raises:
-        SolverError: If HiGHS reports an error or finds no solution in any level solve
-            (carrying its status and message), or if rounding leaves a current outside
+        SolverError: If HiGHS reports an error or finds no solution in any solve, and
+            again when the solve is retried once with presolve toggled (carrying the
+            status and message of the last attempt), or if rounding leaves a current outside
             its limits or a phase over its capacity (carrying status 0, the solver's
             "optimal", with a message naming the charger or phase).
         ValueError: If `now` is naive or a charger id is repeated.

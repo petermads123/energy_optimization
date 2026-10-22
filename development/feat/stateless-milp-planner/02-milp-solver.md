@@ -1,6 +1,6 @@
 # MILP solver
 
-<!-- claude-plan step=3 status=active -->
+<!-- claude-plan step=4 status=active -->
 
 
 | Field | Value |
@@ -16,7 +16,7 @@
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
-| 3 | Implement | `/implement` | in `/build` | in progress (sent back at step 6, second run) |
+| 3 | Implement | `/implement` | in `/build` | done (re-run after the second step-6 halt) |
 | 4 | Verify | `/verify` | in `/build` | pending (re-run) |
 | 5 | Test | `/test` | in `/build` | pending (re-run) |
 | 6 | Concept check | `/concept-check` | in `/build` | pending (re-run) |
@@ -312,8 +312,8 @@ size.
 | # | Solve | Meaning |
 |---|---|---|
 | S1 | Maximise `Σ 2^(m−1−r_d)·x_{d,0}` with `i_{d,0} = min_current·x_{d,0}`, then fix `x_{·,0}` | Ranking-order inclusion at the minimum: each demand is in if it fits after those ranked above. This is round 1's 0/min selection |
-| S2 | Progressive filling over the included demands. Repeatedly maximise an integer `f` with `i_{d,0} ≥ min(f, hi_{d,0})` for the unsaturated ones, holding every earlier result. After each round, mark saturated every demand that is at its `hi` or on a phase with no room left at `f + 1`. Stop when all are saturated | Max-min-fair 1 A steps, as round 1's `share` |
-| S3 | Maximise `Σ (m − r_d)·i_{d,0}` with everything above held | The remainder goes in ranking order |
+| S2 | Progressive filling over the included demands. Repeatedly maximise an integer `f` with `i_{d,0} ≥ min(f, hi_{d,0})` for the unsaturated ones, holding every earlier result. The demands at the level cannot all rise together, so (deviation 23) each, in ranking order, takes one more amp if it fits on all its phases in what is left, and one that does not fit is saturated for good, as is every demand at its `hi`. Stop when all are saturated | Max-min-fair 1 A steps, the leftover one amp at a time to the lowest with ties in ranking order: round 1's `share` exactly (7 / 7 / 6 for three 6–16 A cars on 20 A; 2 / 2 / 1 for minimums 2, 1, 1 on 5 A) |
+| S3 | Removed (deviation 23): once S2 has saturated every demand there is no remainder left to give. It used to hand the leftover to the best-ranked car, which is what produced 8 / 6 / 6 | — |
 
 **Planning stage**, for the `PLANNED` demands, on the room both stages above left:
 
@@ -324,10 +324,10 @@ size.
 | P3 | `Σ e_d·i_{d,t}` over `t` priced above `price_cap` | Use the cap only to meet the need |
 | P4 | `Σ w_{d,t}` | Avoid runs shorter than the minimum block |
 | P5 | `Σ π_t·e_d·i_{d,t}` over priced `t`, held **exactly** when the prices lie on a grid and every current is whole (below); then, **when quarter 0 is unpriced**, minimise the first-quarter **energy** `Σ_d e_d·i_{d,0}` (kWh, not amps) and hold it (the latest-first rule fixes how much charging quarter 0 gets; amended at the step-6 halt, kWh in step 5, deviation 18); then maximise `Σ x_{d,0}`, then in ranking order each `x_{d,0}` (each car is on if that is still possible after those ranked above it), and fix `x_{·,0}` | Lowest price; among equally cheap plans, as many cars as possible on now, the better-ranked ones first (the ranking part is deviation 11). With quarter 0 unpriced its energy is held first, so the cars the need forces into quarter 0 are switched on and share it, without pulling unpriced charging earlier (deviation 9 superseded at the step-6 halt). Measured in kWh because A2 promises unpriced quarters "only when needed": amps would let a three-phase car put three times the energy into an unpriced quarter 0 that a single-phase one would. **Exact price hold** (deviation 19): when every price is a whole multiple of a tick of at least 1e-7 and every current is whole, the objective is written in whole ticks (`price/tick × |phases|` per amp-quarter) and held at its rounded optimum plus 0.5, so a quarter dearer by one tick is never bought; otherwise it is held to the numerical tolerance |
-| P6 | Progressive filling over the planned cars that are on now **and can still rise** (adjustable, with a first-quarter limit above the minimum; an on/off car, or one limited to its minimum, takes its current and is not part of the fill): repeatedly maximise an integer `f` with `i_{d,0} ≥ f` for the live cars, holding every earlier result; after each round mark saturated every car at its `hi`, or whose `i_{d,0}` cannot exceed `f` with everything held; stop when no car is live. **If a round saturates no car** (each could rise alone but not all together, e.g. three cars on 20 A) the loop ends and the remainder goes in ranking order, as S3 does (deviation 16). Runs whether quarter 0 is priced or not. Integer columns are rounded before they are compared, because HiGHS returns 7 as 6.9999995 (deviation 21) | Even split among the planned cars on now, as far as cost allows (8/11/11 for caps 8, 16, 16 on 30 A at equal prices; 8/8 for two forced cars in an unpriced quarter 0). Amended at the step-6 halt from a single max-min, and in step 5 to say what the code does |
+| P6 | Progressive filling over the planned cars that are on now **and can still rise** (adjustable, with a first-quarter limit above the minimum; an on/off car, or one limited to its minimum, takes its current and is not part of the fill): repeatedly maximise an integer `f` with `i_{d,0} ≥ f` for the live cars, holding every earlier result; after each round mark saturated every car at its `hi`, or whose `i_{d,0}` cannot exceed `f` with everything held; stop when no car is live. **If a round saturates no car** (each could rise alone but not all together, e.g. three cars on 20 A) the cars, in ranking order, each take one more amp if they still can with everything held (a solve that maximises the car and holds the row `i_{d,0} ≥ f + 1`), and a car that cannot drops out for good; the loop goes on with the cars that rose, as S2 does (deviation 23, which replaces deviation 16's exit). Runs whether quarter 0 is priced or not. Integer columns are rounded before they are compared, because HiGHS returns 7 as 6.9999995 (deviation 21) | Even split among the planned cars on now, as far as cost allows (8/11/11 for caps 8, 16, 16 on 30 A at equal prices; 8/8 for two forced cars in an unpriced quarter 0). Amended at the step-6 halt from a single max-min, and in step 5 to say what the code does |
 | P7 | `Σ τ_{d,t}·i_{d,t}`, with `τ = (t+1)·(n−r_d)` for priced `t` and `τ = (T−t)·(r_d+1)` for unpriced `t`; `r_d` is the position among the `PLANNED` demands and `n` their number | Earlier priced quarters first; unpriced quarters latest first, as in round 1; the better-ranked car gets the earlier quarter of either kind. `τ` is not separable, so swapping two cars between quarters changes it. A product is minimised by pairing its large factors with its small ones, so the rank factor is `n−r` (large for the better-ranked car) beside `t+1`, and `r+1` (large for the worse-ranked car) beside `T−t`. Corrected in step 5, deviation 10 |
 
-The full run is S1–S3 for `SMART_OFF`, S1–S3 for `CHARGE_NOW`, P1–P7, then S1–S3 for
+The full run is S1–S2 for `SMART_OFF`, S1–S2 for `CHARGE_NOW`, P1–P7, then S1–S2 for
 `SPARE`. Stages that have no demands are skipped.
 
 Holding a level: after level `k` returns a value `v`, its row becomes `objective ≤ v + tol`.
@@ -336,9 +336,10 @@ price ticks), and `1e-6 + 1e-9·|v|` otherwise (deviation 4; the first draft's `
 allowed two amp-quarters at a price step of 0.001).
 
 Every solve:
-- Options are `{"node_limit": NODE_LIMIT, "mip_rel_gap": 0.0, "presolve": True, "threads": 1}`.
+- Options are `{"node_limit": NODE_LIMIT, "mip_rel_gap": 0.0, "presolve": True, "threads": 1}`; the retry uses `"presolve": False`.
 - The `threads` warning is suppressed in a `warnings.catch_warnings()` filtered to that
   message only. There is never a `time_limit`.
+- A solve whose result is status 2 (infeasible), or has no `x`, is retried once with the same model and `presolve` toggled (deviation 24); the retry's result is the one judged below, and only its failure raises. No other status is retried.
 - `res.status == 0` is proven.
 - `res.x` present, with either `res.status == 1` or (`res.status == 4` and
   `res.mip_node_count >= NODE_LIMIT`), is the best found at the node budget, so
@@ -569,7 +570,7 @@ is built as planned.
 
 **Deviations from the plan** (the Public API table is unchanged by all of them):
 
-1. *S3 is sequential, not one weighted solve.* The plan's `max Σ (m − r_d)·i_{d,0}` ties when
+1. *S3 is sequential, not one weighted solve.* (S3 itself is gone: deviation 23.) The plan's `max Σ (m − r_d)·i_{d,0}` ties when
    one multi-phase car outweighs two single-phase ones (weights 3 against 2 + 1), so the
    "remainder in ranking order" was not strict. S3 now maximises each demand in ranking order,
    holding the earlier ones. The same for S1, which the plan already described as inclusion in
@@ -942,6 +943,130 @@ snapshots with prices rounded to 5, 3, 5 and 2 decimals in turn, and 500 planned
 first quarter): 0 `SolverError`s and 0 invariant failures in both; the planned-heavy set had 6
 node-budget stops (a not-proven event, every limit kept), as the step-4 code did on the same
 500 snapshots (6; worst 19.9 s then, 18.6 s now).
+
+### Step-3 re-run after the second step-6 halt (2026-10-22)
+
+Both changes are in `src/energy_optimization/ev/optimize.py`; the Public API table is
+unchanged. Section 2's S2/S3 and P6 rows and its "Every solve" status rules are amended.
+
+**Red runs, before the fix** (committed as `WIP step 3: reproductions, red`):
+
+- `test_optimize_the_leftover_goes_one_amp_at_a_time_to_the_lowest_in_every_tier`
+  (three 6 to 16 A cars on 20 A, minimums 2 / 1 / 1 on 5 A, 19 A, four 1 A cars on 7 A, in
+  each of the four tiers): `{'a': 8.0, 'b': 6.0, 'c': 6.0} == {'a': 7.0, 'b': 7.0, 'c': 6.0}`
+  for 20 A, and 3 / 1 / 1 against 2 / 2 / 1 for minimums 2 / 1 / 1 (16 cases, 12 red; the
+  four 19 A ones were already `share`'s answer, since one spare amp has only one taker).
+- `test_optimize_the_quarter_zero_tiers_equal_round_ones_share_on_generated_claims`
+  (a restatement of round 1's `share` as the reference, 60 generated claim sets per tier):
+  red for `SMART_OFF`, `CHARGE_NOW` and `SPARE`.
+- `test_optimize_planned_cars_that_cannot_all_rise_share_the_remainder_one_amp_at_a_time`
+  (the old 8 / 6 / 6 test, expectation changed to 7 / 7 / 6): `{'a': 8.0, 'b': 6.0, 'c': 6.0}`.
+- `test_optimize_a_probe_stopped_at_the_node_budget_is_not_proven`: its expectation, 8 / 6 / 6,
+  changed with the rule to 7 / 7 / 6.
+- `test_optimize_tiny_instances_highs_calls_infeasible_are_solved_by_the_retry[1931]` and
+  `[5662]` (step 6's tiny-set seeds, written out as literals): `SolverError: HiGHS status 2:
+  The problem is infeasible. (HiGHS Status 8: model_status is Infeasible; primal_status is
+  None)`.
+
+All green after the fix.
+
+23. *The leftover goes one amp at a time to the lowest, ties in ranking order (round 1's
+    `share`), in every tier.* Answer of the user at the second step-6 halt. Deviation 16's
+    exit ("the remainder goes in ranking order") is replaced, and S3 is removed.
+    - *S2 (smart-off, charge-now, spare).* The progressive fill still finds the highest
+      level `f` that every unsaturated demand can reach together, with a solve. The old
+      freeze rule (`left < max(1, cars at the level)`) and S3 then handed the rest to the
+      best-ranked car. Now, at that level, each unsaturated demand in ranking order takes
+      one more amp if it fits on all its phases in what is left, and one that does not fit
+      is saturated for good (the room only shrinks), as is one at its maximum. The loop goes
+      on from the demands that rose. This is `share` level by level: a pass at one level is
+      `share`'s rule, because every demand at the lowest value is a candidate in ranking
+      order. S3 has nothing left to give and is deleted (one fewer solve per tier).
+      `_stage_now` no longer builds its last problem.
+    - *P6 (`_fill_now`).* When a round saturates no car, each live car in ranking order is
+      asked, with everything held, whether it can reach `f + 1` (a new `_Problem.raise_to`:
+      one solve that maximises the car, keeps its solution as the problem's witness and
+      adds the row `i >= f + 1` when it can). Cars that can stay live; the others drop out.
+      The old exit maximised each car in turn and so gave everything to the first.
+    - *Evidence.* Round 1's `share` against the quarter-0 tiers, step 6's
+      `sharediff.py` (3,000 generated claim sets, 1 to 8 A minimums, mixed phases): 0
+      differences for `CHARGE_NOW` (it was 29), and 0 for `SMART_OFF` and `SPARE` (the same
+      script with the tier changed). Step 6's planned-tier brute force over 6,000 instances
+      each, `leximin.py` and `leximin_lv.py`: 0 mismatches and 0 errors (it was 5 and 2).
+      The wider range, seeds 6,000 to 16,000, also 0 mismatches and 0 errors in both scripts
+      (so 0 of 16,000; step 6 had 22).
+    - *Tests changed because of it.* `test_optimize_planned_cars_that_cannot_all_rise_share_the_remainder_in_ranking_order`
+      (8 / 6 / 6) is replaced by `..._one_amp_at_a_time` (7 / 7 / 6), and the expectation in
+      `test_optimize_a_probe_stopped_at_the_node_budget_is_not_proven` changed the same way.
+      No other test pinned 8 / 6 / 6 or 3 / 1 / 1. Added: the four-tier table above, and the
+      generated comparison against the restated `share`.
+24. *A solve HiGHS reports infeasible, or that stops without a point, is retried once with
+    presolve toggled (A6 as amended).* `_Problem._solve` calls HiGHS (now in `_Problem._milp`)
+    with `presolve = True` as before; when the result is status 2 or has no `x`, it calls
+    again, same model, same node budget, `presolve = False`, and judges only that result: it
+    is proven on status 0, not proven on a node-budget stop with a point, and a second failure
+    raises `SolverError` with the retry's status and message. Statuses 3, and 4 below the node
+    limit with a point, are not retried. Deterministic (the same two calls every run), no
+    wall-clock limit. The retry applies to every solve, probes included.
+    - *Evidence.* Seeds 1931 and 5662: `SolverError` status 2 before, solved by the retry now
+      (the retry's solve is the one that succeeds; `trace1931.py` had shown the previous
+      solution satisfies every row). Tests added: the retry for each of four failures (status
+      2, status 2 with a point, status 4 and status 1 without a point), a retry that stops at
+      the node budget being not proven, the second failure raising for each status with the
+      number of calls, and the two seeds.
+    - *Existing tests.* `test_decide_raises_solver_error_for_every_failure_status`,
+      `test_optimize_a_probe_failure_raises_solver_error` and the rest of the failure
+      stubs return the same failure on every call, so they still raise, after two calls.
+      None had to change.
+
+**Planned-heavy #78 (the status 4 since `d7c8e77`): root cause.** Traced with
+`trace78.py` and a wrapper on `_Problem._milp` (columns, rows, presolve, status, nodes,
+seconds) on the snapshot in step 6's set. Of nine solves, eight finish; the seventh, the
+ranking level of P5 (maximise `x` of one car, 594 columns and 842 rows, one objective
+column) with `presolve = True`, stops at 8,000 nodes with status 4 and no point after
+15.4 s. The same model with `presolve = False` is optimal in 201 nodes and 1.4 s. The level
+asks whether one more car can be on now at the same cost; the answer is no, and HiGHS has to
+prove it. What changed in step 5 is the row it has to prove it against: deviation 19's exact
+price hold, a single dense integer row with coefficients up to 2,667 ticks held at `round(v) + 0.5`,
+is a knapsack that presolved branch-and-bound does not close within the budget. With the tick
+hold switched off (`_price_ticks` returning `None`) the same level is optimal with presolve
+after 1,913 nodes and 3.9 s, and the level before it takes 3,620 nodes instead of 2,368. So it
+is not a defect in the tick hold's logic (it holds a level exactly, and A2 needs that) but a
+search that stalls on one model under one setting, which is the thing the retry is for.
+With the retry `decide` returns on #78 (27 s whole, 15 s of it the failed first attempt; the
+snapshot is four chargers at 16 A, off the A5 grid). No code beyond the retry is changed
+for it, and #78 is not added as a regression test (27 s); the retry's mechanism is pinned
+by the stubbed tests above.
+
+**Benchmark, re-timed (guide item 8, fifth run).** `r2b_bench.py`: whole `decide`,
+`benchmark_snapshot` (mixed phases, 40 h series with an unpriced tail, `min_block_quarters
+= 4`, price cap 0.45, 3-decimal prices), 4 cores, one thread, `NODE_LIMIT = 8000`, seconds,
+nothing else running; seeds 1 to 8 on the four named cells (3 @ 35, 5 @ 50, 7 @ 70, 10 @ 70),
+1 to 5 on the others. No `PLAN_NOT_PROVEN_OPTIMAL` anywhere.
+
+| Cell | Tier | Times (seeds in order) | Worst |
+|---|---|---|---|
+| 1 @ 35 A | 10 s | 0.12 0.10 0.14 0.04 0.06 | 0.14 |
+| 2 @ 35 A | 10 s | 0.23 0.14 0.29 0.13 0.14 | 0.29 |
+| 3 @ 35 A | 10 s | 0.65 0.18 0.55 0.40 1.09 0.39 0.40 0.34 | 1.09 |
+| 2 @ 50 A | 10 s | 0.24 0.14 0.33 0.12 0.13 | 0.33 |
+| 3 @ 50 A | 10 s | 0.37 0.19 0.39 0.33 0.32 | 0.39 |
+| 5 @ 50 A | 60 s | 1.83 1.26 2.48 1.38 2.94 0.77 1.21 0.91 | 2.94 |
+| 3 @ 70 A | 10 s | 0.40 0.20 0.45 0.33 0.32 | 0.45 |
+| 5 @ 70 A | 60 s | 0.89 0.56 1.34 0.86 0.63 | 1.34 |
+| 7 @ 70 A | 60 s | 4.19 7.82 2.47 1.96 1.66 1.75 2.50 2.64 | 7.82 |
+| 10 @ 70 A | 120 s | 7.19 6.03 11.30 2.30 46.70 1.91 6.32 32.28 | **46.70** (seed 5) |
+
+Every tier holds; the 10-charger worst case is 46.7 s of 120 s (46.1 s before this pass:
+the one-amp passes add no measurable time; seed 8 went from 23.7 s to 32.3 s, seed 7 and
+the rest within noise). The same three named cells with 5-decimal prices (seeds 1 to 5, 10 @
+70 A seeds 1 to 8): 3 @ 35 A worst 0.48, 7 @ 70 A worst 15.86, 10 @ 70 A worst 23.38. Risk 1
+does not trigger. `NODE_LIMIT` stays 8000.
+
+**Gates at the end of this re-run.** `ruff check .`, `ruff format --check .`, `mypy`: clean.
+`pytest`: 1407 passed in 144.5 s (1377 at step 6's second run; the difference is the tests added
+above). Every module showcase exits 0. `STRUCTURE.md`'s `optimize.py` purpose paragraph and
+row, and the `test_ev_optimize.py` entry, are updated for the leftover rule and the retry.
 
 
 ## 4. Verification log
@@ -1486,3 +1611,7 @@ row, 1e-6 EUR).
    Deterministic, no wall-clock limit. A6 amended to say so. #78's node-budget miss since step
    5's first change (d7c8e77) is to be investigated in the same pass.
 `/build` resumes at step 3, then steps 4 to 6 run again and the A5 grid is re-timed.
+
+**Resolved (2026-10-22, step 3 fifth run):** the leftover goes one amp at a time to the lowest in
+every tier (deviation 23), a failed solve is retried once with presolve toggled (deviation 24),
+#78's cause is recorded in section 3, and the A5 grid is re-timed; steps 4 to 6 run again.

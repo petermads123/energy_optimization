@@ -176,9 +176,9 @@ The optimiser: one mixed-integer program solved by HiGHS through `scipy.optimize
 level by level (lexicographically). It plans every quarter from now to each car's ready
 time and shares quarter 0 tier by tier on what the tiers above leave: smart charging off,
 charge now, planned cars, then spare capacity. Quarter-0-only tiers are solved on small
-models before and after the planning model. Within the planning model the cost level is held exactly in whole ticks of the price grid when every price is a whole multiple of a tick of at least 1e-7 and every current is whole, and to a tolerance otherwise. As many planned cars as possible are on now, the better-ranked first, and they share the first quarter by progressive filling (the remainder, when no car can be saturated, goes in ranking order). An unpriced first quarter carries only the energy the need forces. Deterministic: one thread, a fixed node budget
+models before and after the planning model. Within the planning model the cost level is held exactly in whole ticks of the price grid when every price is a whole multiple of a tick of at least 1e-7 and every current is whole, and to a tolerance otherwise. As many planned cars as possible are on now, the better-ranked first, and they share the first quarter by progressive filling in every tier (when no car can rise with the others, the leftover goes one amp at a time to the lowest, ties in ranking order: round 1's `share`). An unpriced first quarter carries only the energy the need forces. Deterministic: one thread, a fixed node budget
 per solve (`NODE_LIMIT`), never a wall-clock limit; all time arithmetic in UTC. No greedy
-fallback: a solve that ends without a point raises `SolverError`.
+fallback: a solve that reports infeasible or ends without a point is retried once with presolve toggled, and a second failure raises `SolverError`.
 
 | Signature | Description |
 |---|---|
@@ -187,7 +187,7 @@ fallback: a solve that ends without a point raises `SolverError`.
 | `class Tier(IntEnum)`: `SMART_OFF = 0`, `CHARGE_NOW = 1`, `PLANNED = 2`, `SPARE = 3` | Which precedence stage a demand belongs to. |
 | `Demand(charger_id: str, phases: frozenset[Phase], tier: Tier, min_current: float, max_current: float, now_max_current: float, need_kwh: float = 0.0, deadline: datetime \| None = None)` | One charger asking for current, given in ranking order. `min_current == max_current` is on/off at exactly that current in every tier; otherwise it runs in whole amps, so a fractional `min_current` is refused unless both maxima are below it (off in every quarter). A maximum below `min_current` means off in those quarters. Validates itself with `ValueError` naming the field (`tier` must be a `Tier`; `deadline` must be aware and is required for `PLANNED`). |
 | `Outcome(allocations: dict[str, float], plans: dict[str, SessionPlan], proven: bool)` | Quarter-0 current of every demand, a plan per `PLANNED` demand. `proven` is False when any solve (a level, or a probe that decides a level) stopped at the node budget with a point. |
-| `optimize(demands: Sequence[Demand], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], now_capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str) -> Outcome` | Solve the lexicographic model; `SolverError` on failure, `ValueError` for a naive `now` or a repeated charger id, `ZoneInfoNotFoundError` for an unknown `timezone`; empty `demands` returns before those checks; a limit broken by rounding raises `SolverError` with status 0. |
+| `optimize(demands: Sequence[Demand], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], now_capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str) -> Outcome` | Solve the lexicographic model; `SolverError` when a solve fails twice (it is retried once with presolve toggled), `ValueError` for a naive `now` or a repeated charger id, `ZoneInfoNotFoundError` for an unknown `timezone`; empty `demands` returns before those checks; a limit broken by rounding raises `SolverError` with status 0. |
 | `main() -> None` | Showcase: a charge-now car, two planned cars and a spare-capacity car on one phase, then a phase with no room. |
 
 ### `src/energy_optimization/ev/decide.py`
@@ -272,12 +272,12 @@ leftover for every pair; smart-off held to `capacity` in later quarters; `Demand
 validation naming each field (including `tier`), `Outcome`, `SolverError` and `NODE_LIMIT`;
 the `Raises:` branches, the empty-demands early return and negative or absent capacity; the
 rounding checks that raise with status 0; the solver call spied for no `time_limit`, one
-thread, the node budget, a zero gap and presolve on; a node-budget stop with a point being not proven and a status 4
+thread, the node budget, a zero gap and presolve on; the retry (a failed solve retried once with presolve off, the retry's answer proven or not, a second failure raising, seeds 1931 and 5662 of step 6's tiny set solved); a node-budget stop with a point being not proven and a status 4
 below the limit failing; a `hypothesis` property that no limit is ever broken (T1) and one
 that the level-by-level tuple equals a brute-force enumeration (T2); and the planned tier's
 full progressive fill (8 / 11 / 11 on 30 A, 8 / 8 for two cars forced into an unpriced first
-quarter, an unpriced first quarter not filled beyond what the need forces, the ranking
-remainder when no car can be saturated, 8 / 8 / 8 on mixed phases; cars tied at a cap, one
+quarter, an unpriced first quarter not filled beyond what the need forces, the leftover one amp
+at a time to the lowest (7 / 7 / 6 on 20 A, 2 / 2 / 1 for minimums 2, 1, 1 on 5 A, in every tier, and equal to a restatement of `share` on generated claims), 8 / 8 / 8 on mixed phases; cars tied at a cap, one
 binding phase, on/off and fractional on/off cars, unequal minimums, a car off now, a
 need-limited car found by a probe, a forced dear first quarter split evenly, the cheaper
 quarter never given up for a dearer one by a price tick, the forced unpriced energy held in
