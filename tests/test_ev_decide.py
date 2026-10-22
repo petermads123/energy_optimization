@@ -2276,6 +2276,10 @@ def assert_invariants(snapshot: Snapshot, result: Decision) -> None:
     assert_plans_fit(snapshot, result)
     for decision in result.chargers:
         assert (decision.reaches_target is None) == (decision.deadline is None)
+        if decision.plan and decision.expected_finish is not None:
+            # compared as instants: the wall times of the fall-back hour repeat
+            first = decision.plan[0].start.astimezone(UTC)
+            assert decision.expected_finish.astimezone(UTC) > first
 
     for c in snapshot.chargers:
         state, decision = states[c.id], decisions[c.id]
@@ -2524,6 +2528,60 @@ def test_reaches_target_compares_instants_across_the_fold(
     assert item.expected_finish is not None
     assert item.expected_finish.isoformat() == "2026-10-25T02:30:00+01:00"
     assert item.reaches_target is reaches
+
+
+@pytest.mark.parametrize(
+    ("cheap_start", "plan_starts", "finish_utc", "finish_local"),
+    [
+        # D1: the plan ends with the quarter at 01:00Z; the finish is 01:15Z
+        (
+            datetime(2026, 10, 25, 0, 45, tzinfo=UTC),
+            ["2026-10-25T00:45:00+00:00", "2026-10-25T01:00:00+00:00"],
+            "2026-10-25T01:15:00+00:00",
+            "2026-10-25T02:15:00+01:00",
+        ),
+        # D2: the plan ends with the quarter at 00:45Z; the finish is 01:00Z
+        (
+            datetime(2026, 10, 25, 0, 30, tzinfo=UTC),
+            ["2026-10-25T00:30:00+00:00", "2026-10-25T00:45:00+00:00"],
+            "2026-10-25T01:00:00+00:00",
+            "2026-10-25T02:00:00+01:00",
+        ),
+    ],
+    ids=["d1-ends-in-the-repeated-hour", "d2-ends-at-the-repeated-hour"],
+)
+def test_a_planned_finish_adds_its_quarter_in_utc_on_the_fall_back_night(
+    cheap_start: datetime,
+    plan_starts: list[str],
+    finish_utc: str,
+    finish_local: str,
+) -> None:
+    now = datetime(2026, 10, 24, 22, 0, tzinfo=UTC)
+    intervals = tuple(
+        PriceInterval(
+            now + QUARTER * i,
+            now + QUARTER * (i + 1),
+            0.01
+            if (now + QUARTER * i) in (cheap_start, cheap_start + QUARTER)
+            else 0.30,
+        )
+        for i in range(32)
+    )
+    snapshot = snap(
+        [adj()],
+        sessions=[sess(need=1.84)],
+        prices=PriceSeries(intervals, now),
+        now=now,
+    )
+
+    item = decide(snapshot).chargers[0]
+
+    assert [q.start.astimezone(UTC).isoformat() for q in item.plan] == plan_starts
+    assert item.expected_finish is not None
+    assert item.expected_finish.astimezone(UTC).isoformat() == finish_utc
+    assert item.expected_finish.isoformat() == finish_local
+    assert item.expected_finish.astimezone(UTC) > item.plan[0].start.astimezone(UTC)
+    assert item.reaches_target is True
 
 
 TRICKLE_NOW = datetime(2026, 10, 22, 1, 30, tzinfo=ZONE)

@@ -288,7 +288,8 @@ def _expected_finish(item: _Item, ctx: _Context) -> datetime | None:
         for quarter in item.plan.quarters:
             total += energy_per_quarter_kwh(quarter.current, phase_count, voltage)
             if total >= need - _EPS:
-                return (quarter.start + QUARTER).astimezone(ctx.zone)
+                # the quarter's end is added on the UTC instant, never on a zone-aware start
+                return (quarter.start.astimezone(UTC) + QUARTER).astimezone(ctx.zone)
         return None
     if item.allocation > 0:
         hours = need * 1000 / (voltage * item.allocation * phase_count)
