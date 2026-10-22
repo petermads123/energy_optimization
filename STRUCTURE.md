@@ -267,9 +267,10 @@ the same decision; the invariants include a plan-fit oracle keyed in UTC and
 `expected_finish` after the first planned quarter, compared as instants. Also the
 stateless-core tests: the unplanned expected finish added in UTC across both 2026 DST
 nights, a planned expected finish ending in or at the repeated hour of the fall-back
-night, `reaches_target` across the fold, a trickle of current giving `None`, no state
+night, `reaches_target` across the fold, a trickle of current (including a reserved
+charger's tiny measured draw) giving `None` and surviving the codec round trip, no state
 between interleaved snapshots, and the public surface equal to round 1's (exports, removed
-modules and names, dataclass fields, signatures); and the `main` showcase.
+modules and names, dataclass fields, signatures, enum members); and the `main` showcase.
 
 ### `tests/test_ev_codec.py`
 

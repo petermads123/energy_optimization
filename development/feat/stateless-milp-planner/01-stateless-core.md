@@ -1,6 +1,6 @@
 # Stateless core
 
-<!-- claude-plan step=6 status=active -->
+<!-- claude-plan step=5 status=active -->
 
 | Field | Value |
 |---|---|
@@ -17,7 +17,7 @@
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | done |
-| 5 | Test | `/test` | in `/build` | done |
+| 5 | Test | `/test` | in `/build` | in progress |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
@@ -447,9 +447,37 @@ Edge cases considered and deliberately skipped, with reasons:
 
 | # | Criterion | Met | Evidence |
 |---|---|---|---|
-| A1 | | | |
+| A1 | Stateless; public surface equals round 1's | yes | `git diff 982a494 -- src` is `decide.py` only (13+/3-, `_expected_finish`, `_reaches`); `model`/`result`/`planning`/`allocation`/`codec`/`__init__`/`quarters` are byte-identical to round 1, so no memory type, round-2 setting or enum member exists. Pinned by `test_the_package_exports_exactly_round_ones_names`, `test_the_dataclass_fields_are_round_ones`, `test_the_planner_and_capacity_signatures_are_round_ones`, `test_the_enums_carry_no_round_two_members`, `test_a_decision_does_not_depend_on_the_snapshots_decided_before_it`; differential vs `origin/main` (below) shows `decide` agrees with the round-2 code wherever its memory rules do nothing |
+| A2 | Round 2 removed cleanly | yes | `git ls-files` has no `guard.py`, `regulation.py`, `test_ev_guard.py`, `test_ev_regulation.py`; no `settling`, `first`, `skip_current` in the sources (signature test above); `STRUCTURE.md` reconciled by the `structure-auditor` (all 23 `.py` files, signatures match); `ev.__all__` pinned by `test_the_package_exports_exactly_round_ones_names`; `test_the_round_two_modules_are_gone` |
+| A3 | Behaves like round 1, except listed fixes, each pinned | partially | Differential vs `982a494` over 6000 generated snapshots (below): every difference is in `expected_finish`/`reaches_target` only and matches an independent UTC oracle. All pinned, except one shape: a **planned** finish whose quarter end lands in the spring-forward gap (seed 4135: same instant, old renders the nonexistent `02:00+01:00`, new `03:00+02:00`; the two `Decision`s are unequal because ZoneInfo datetimes compare by wall clock). `test_a_planned_finish_adds_its_quarter_in_utc_on_the_fall_back_night` covers only the fall-back night for the planned branch. Unmet as worded ("each difference ... with the test that pins it"); send back to step 5 for one spring-forward planned row (and optionally one unplanned row whose finish lands in the gap: 65 such cases in the differential, same line, instant-equal) |
+| A4 | Every round-1 guarantee holds; round-1 suite passes unchanged | yes | Edits to the restored test files vs `982a494` are additions only (`git diff 982a494 -- tests`: +74/-1, +502/-2, +171/-0; the only removed lines are three import lines rewritten to carry extra names); no warm-memory helper in the tree; `pytest` 1219 passed, ruff, ruff format, mypy clean; all seven `python -m energy_optimization.ev.<module>` showcases exit 0. See the earlier-rounds table |
+| A5 | Round-1-shaped codec | yes | `codec.py` identical to `982a494`; `test_snapshot_to_dict_has_exactly_round_1_keys`, `test_decision_to_dict_has_exactly_round_1_keys`, `test_a_real_decisions_keys_are_round_1_too`, `test_snapshot_from_dict_rejects_memory_naming_the_field` (3), `test_snapshot_from_dict_rejects_each_round_2_setting` (16), `test_decision_from_dict_rejects_round_2_keys` (6) |
+| A6 | All time arithmetic in UTC; outputs presented in the settings zone | yes | Sweep re-done against the code (`decide.py`: `_expected_finish` planned/unplanned, `_reaches`, `decide`, `_classify`; `planning.py`; `allocation.py`; `quarters.py`; `model.py`): every addition, subtraction, comparison and dict key is on `.astimezone(UTC)` values; the one wall-time comparison is `next_occurrence`'s gap/fold detector, by design. Tests D1/D2 (2 rows) red on `982a494` and green now; unplanned (5 rows), instant (3), `reaches_target` (2) tests too |
+
+**Differential 1, against `982a494`** (scratch copy via `git archive` under `.../scratchpad/old1`, never in the tree; driver `drv/gen.py` builds 6000 snapshots from the suite's own `random_snapshot`, a third with `now` re-expressed as `ZoneInfo("Europe/Copenhagen")`; compared as `decision_to_dict` JSON). Two runs: (a) pickled snapshots with ZoneInfo `now` (4000 of 6000): 1276 differ; (b) the same snapshots through the dict codec (fixed-offset `now`): 11 differ. No run raised in either version. Every differing field is `chargers[].expected_finish` (plus `reaches_target` on 52 in (a), which follows from the finish). Classified against an independent oracle (`drv/oracle.py`: `now.astimezone(UTC) + hours` for unplanned, last planned quarter start in UTC + 15 min for planned): new code equals the oracle in all of them, old differs in all except the representation-only cases:
+
+| Class | Count (a) | Count (b) | Pinned by |
+|---|---|---|---|
+| unplanned, instant differs, fall-back night | 1135 + 33 with `reaches_target` False to True | 0 | `test_an_unplanned_expected_finish_adds_the_hours_in_utc_across_dst`, `test_the_unplanned_finish_*`, `test_reaches_target_compares_instants_across_the_fold` |
+| unplanned, instant differs, spring-forward night | 434 + 19 with `reaches_target` True to False | 0 | same tests (rows 4, 5) |
+| unplanned, finish months out (06-20) | 1 | 0 | same line |
+| unplanned, same instant, old renders a nonexistent gap time | 65 | 0 | **not pinned directly** (same line as the rows above) |
+| planned, fall-back night | 10 | 10 | `test_a_planned_finish_adds_its_quarter_in_utc_on_the_fall_back_night` (D1/D2) |
+| planned, same instant, old renders a nonexistent gap time (spring) | 1 | 1 | **not pinned** |
+
+The `OverflowError` to `None` fix did not occur in the generated snapshots; it is pinned by `test_a_trickle_*` (5), `test_a_reserved_charger_with_a_tiny_measured_draw_gives_no_finish` (2), `test_a_trickle_decision_survives_the_codec_round_trip` (2).
+
+**Red on `982a494`, green now:** the repo's current `tests/test_ev_decide.py` run against `982a494`'s `src` (scratch copy `.../scratchpad/redrun`): 19 failed, 195 passed, and the failures are exactly the T3/D1/D2 groups: unplanned across DST (4 rows), wall-clock now, same-instant (row 1), `reaches_target` fold (2), planned D1 and D2, trickle (4), tiny measured draw (2), codec round trip of a trickle (2). On the current tree the whole file passes (1219 passed in the suite). The earlier note in section 5 said 17 of 212 (before the last rows were added).
+
+**Differential 2, against `origin/main`** (round-2 code, `git archive origin/main` under `.../scratchpad/main`): the same 6000 snapshots through the dict codec, `Snapshot.memory` set to a warm `Memory(saved_at=now-1min, green_since=now-1h)` (no charger entries), round-2 settings at defaults. Main's own `guard_level` was green or `None` (stale/missing measurements) with no `memory_reset` or `phase_guard_intervened` event in 4492 cases (the other 1508 are red/yellow guard, where round 2 acts, excluded). In 4486 of the 4492 the decisions are equal apart from the round-2 fields (`memory`, `guard_level`, `next_check`). The other 6 differ in `expected_finish` only (seeds 244, 1490, 1977, 3687, 4135, 5998): all are the planned-branch A6 cases above, which main never fixed. No round-1 fix that the survey missed.
 
 Drift found, and what was done about it:
+
+- **Out of scope**: nothing built: no solver, scipy or numpy (`test_the_package_imports_only_the_standard_library_and_itself` green), no timing or command-handling code.
+- **Surface**: no public name added; `STRUCTURE.md` matches the code.
+- **Showcase**: all seven `ev` showcases run and read as round 1's.
+- **Structure**: `structure-auditor` item 1 (`decide.py` entry) was already on disk with equivalent wording (UTC throughout, planned and unplanned branches, `None` on trickle), so rebutted, not applied again. Item 2 (`test_ev_decide.py` entry) applied: the reserved-charger tiny draw, codec round trip and enum-member tests are now named.
+- **Gap (A3, sent back to step 5)**: no test pins the spring-forward gap rendering of a planned (or, directly, an unplanned) finish. The production code is correct; only a test is missing. One new row in `test_a_planned_finish_adds_its_quarter_in_utc_on_the_fall_back_night`'s family (planned plan ending at the 01:00Z transition on 2026-03-29, expected `2026-03-29T03:00:00+02:00`, asserted through `isoformat()`; red on `982a494`) closes it.
 
 ### Earlier rounds still hold
 
@@ -458,8 +486,20 @@ Drift found, and what was done about it:
 > not sufficient — a criterion can be satisfied by tests that no longer describe what the
 > feature does.
 
+The earlier round is `feat/ev-charging-core` round 1 (`development/feat/ev-charging-core/01-decision-core.md`, section 1, read only). All of `src/` except `decide.py` is byte-identical to its head `982a494`, and `decide.py` differs only in the finish arithmetic, so each criterion holds by identity plus the restored suite, which passes unchanged.
+
 | Round | # | Criterion | Still met | Evidence |
 |---|---|---|---|---|
+| ev-charging-core 1 | A1 | Rejects invalid configuration naming the field | yes | `model.py`, `codec.py` identical to `982a494`; `tests/test_ev_model.py` identical, green; snapshot cross-links and naive timestamps covered there |
+| ev-charging-core 1 | A2 | Priorities 1 to 4, tiers, ranking, split, waiting for capacity | yes | `decide.py` identical outside the finish; `test_ev_decide.py` doc-scenario tests green, unchanged; both differentials show equal allocations, reasons and priorities |
+| ev-charging-core 1 | A3 | Respects amp limits (budget, phase headroom, mixed phases, on/off, reserved, smart-off) | yes | `allocation.py` identical; `test_ev_allocation.py` identical, green; `assert_invariants` in the generated-snapshot property checks budget and headroom independently; differentials equal in allocation |
+| ev-charging-core 1 | A4 | Plans the cheapest quarters before the ready time (92/100-quarter days, blocks, cap, unreachable, unpriced) | yes | `planning.py`, `quarters.py` identical; `test_ev_planning.py`, `test_ev_quarters.py` green with additions only; plan-fit oracle `assert_plans_fit` added and green |
+| ev-charging-core 1 | A5 | Falls back under doubt (stale measurements, stale prices) | yes | the fallback table tests in `test_ev_decide.py` green; both differentials equal on 6000 snapshots including stale ones (guard `None` cases) |
+| ev-charging-core 1 | A6 | Explainable, ordered output (down before up, absolute targets, reasons, plan, expected finish, `reaches_target`) | yes | `test_ev_decide.py` actions-order and reason tests; `assert_invariants` checks the action set and stages; the expected finish is the intentionally changed field (A3/A6 here) |
+| ev-charging-core 1 | A7 | Doc section 12 invariants under generated input | yes | `test_the_invariants_hold_for_generated_snapshots` (300 examples) green; the round-trip property (60) green |
+| ev-charging-core 1 | A8 | Deterministic and standard-library only | yes | `test_the_output_does_not_depend_on_the_hash_seed`, `test_the_package_imports_only_the_standard_library_and_itself` green |
+| ev-charging-core 1 | A9 | Round-trips plain dicts, rejects bad fields naming them | yes | `codec.py` identical; `test_ev_codec.py` green; the 6000-snapshot differentials went through the dict codec on both sides without error |
+| ev-charging-core 1 | A10 | Under 100 ms for 10 chargers and 48 h | yes | `test_ten_chargers_and_a_48_hour_series_decide_in_under_100_ms` green in the full run (11.3 s total suite) |
 
 ---
 
