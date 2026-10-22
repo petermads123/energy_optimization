@@ -1126,6 +1126,110 @@ def test_optimize_a_status_four_below_the_node_limit_is_a_failure(
     assert caught.value.status == 4
 
 
+# --- A6: a failed solve is retried once with presolve toggled ---------------------------
+
+
+def _first_attempt_fails(
+    monkeypatch: pytest.MonkeyPatch, status: int, x: object, nodes: int = 0
+) -> list[bool]:
+    """Make the first attempt of every solve fail; return the `presolve` flag of each call."""
+    real = optimize_module.milp
+    seen: list[bool] = []
+
+    def flaky(*args: object, **kwargs: object) -> object:
+        presolve = bool(kwargs["options"]["presolve"])  # type: ignore[index]  # a dict
+        seen.append(presolve)
+        if presolve:
+            return SimpleNamespace(
+                status=status, message="failed once", x=x, mip_node_count=nodes
+            )
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(optimize_module, "milp", flaky)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("status", "x", "nodes"),
+    [(2, None, 0), (2, np.array([1.0]), 0), (4, None, NODE_LIMIT), (1, None, 0)],
+    ids=[
+        "infeasible",
+        "infeasible-with-a-point",
+        "four-without-a-point",
+        "one-without",
+    ],
+)
+def test_optimize_a_failed_solve_is_retried_once_with_presolve_toggled(
+    monkeypatch: pytest.MonkeyPatch, status: int, x: object, nodes: int
+) -> None:
+    clean = run([planned()], priced(1, 2, 3, 4))
+    seen = _first_attempt_fails(monkeypatch, status, x, nodes)
+
+    outcome = run([planned()], priced(1, 2, 3, 4))
+
+    assert outcome == clean  # the retry's answer is a proven one
+    assert outcome.proven is True
+    assert seen[:2] == [True, False]
+    assert seen.count(True) == seen.count(False)  # one retry per solve, no more
+
+
+def test_optimize_a_retry_that_stops_at_the_node_budget_is_not_proven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = optimize_module.milp
+
+    def stopped(*args: object, **kwargs: object) -> object:
+        if kwargs["options"]["presolve"]:  # type: ignore[index]  # a dict
+            return SimpleNamespace(status=2, message="x", x=None, mip_node_count=0)
+        result = real(*args, **kwargs)
+        return SimpleNamespace(
+            status=4, message="limit", x=result.x, mip_node_count=NODE_LIMIT
+        )
+
+    monkeypatch.setattr(optimize_module, "milp", stopped)
+
+    outcome = run([planned()], priced(1, 2, 3, 4))
+
+    assert outcome.proven is False
+
+
+@pytest.mark.parametrize(
+    ("status", "x", "nodes", "calls"),
+    [
+        (2, None, 0, 2),
+        (4, None, NODE_LIMIT, 2),
+        (3, None, 0, 2),
+        (4, np.array([1.0]), NODE_LIMIT - 1, 1),  # a point: numerical trouble, no retry
+    ],
+    ids=[
+        "infeasible",
+        "four-without-a-point",
+        "three-without-a-point",
+        "four-with-a-point",
+    ],
+)
+def test_optimize_raises_only_when_the_retry_fails_too(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    x: object,
+    nodes: int,
+    calls: int,
+) -> None:
+    seen: list[bool] = []
+
+    def failing(*_args: object, **kwargs: object) -> SimpleNamespace:
+        seen.append(bool(kwargs["options"]["presolve"]))  # type: ignore[index]  # a dict
+        return SimpleNamespace(status=status, message="no", x=x, mip_node_count=nodes)
+
+    monkeypatch.setattr(optimize_module, "milp", failing)
+
+    with pytest.raises(SolverError) as caught:
+        run([Demand("a", L1, Tier.CHARGE_NOW, 6, 16, 16)])
+
+    assert caught.value.status == status
+    assert seen == [True, False][:calls]
+
+
 # --- T1: no limit is ever broken (property) ---------------------------------------------
 
 
@@ -1594,35 +1698,34 @@ def test_optimize_the_quarter_zero_tiers_equal_round_ones_share_on_generated_cla
 # Step 6's tiny-instance brute-force set: HiGHS called these feasible models infeasible
 # (seeds 1931 and 5662), with presolve off or on. Amps per car: (phases, low, high, now
 # high, need in amp-quarters); prices in cents, None for an unpriced quarter.
-_TINY_CASES = {
-    1931: dict(
-        cars=[
-            ("c0", "1", 1, 4, 4, 8),
-            ("c1", "1", 1, 4, 3, 8),
-            ("c2", "12", 2, 4, 4, 22),
-        ],
-        prices=[None, 10],
-        room_now=(9, 5),
-        room_later=(9, 4),
+_TINY_CASES: dict[
+    int,
+    tuple[
+        list[tuple[str, str, int, int, int, int]],
+        list[int | None],
+        tuple[int, int],
+        tuple[int, int],
+    ],
+] = {
+    1931: (
+        [("c0", "1", 1, 4, 4, 8), ("c1", "1", 1, 4, 3, 8), ("c2", "12", 2, 4, 4, 22)],
+        [None, 10],
+        (9, 5),
+        (9, 4),
     ),
-    5662: dict(
-        cars=[
-            ("c0", "12", 1, 4, 4, 22),
-            ("c1", "1", 2, 4, 2, 1),
-            ("c2", "12", 1, 3, 3, 11),
-        ],
-        prices=[10, 10],
-        room_now=(7, 3),
-        room_later=(5, 9),
+    5662: (
+        [("c0", "12", 1, 4, 4, 22), ("c1", "1", 2, 4, 2, 1), ("c2", "12", 1, 3, 3, 11)],
+        [10, 10],
+        (7, 3),
+        (5, 9),
     ),
 }
 
 
 def _tiny(seed: int) -> Outcome:
-    case = _TINY_CASES[seed]
+    cars, cents, room_now, room_later = _TINY_CASES[seed]
     phases = {"1": L1, "2": L2, "12": frozenset({Phase.L1, Phase.L2})}
-    quarters = len(case["prices"])
-    cars = [
+    demands = [
         Demand(
             name,
             phases[ph],
@@ -1631,14 +1734,12 @@ def _tiny(seed: int) -> Outcome:
             high,
             now_high,
             need_kwh=need * E1,
-            deadline=q(quarters),
+            deadline=q(len(cents)),
         )
-        for name, ph, low, high, now_high, need in case["cars"]
+        for name, ph, low, high, now_high, need in cars
     ]
-    prices = priced(*(None if c is None else c / 100 for c in case["prices"]))
-    now_room = caps(*case["room_now"], 0)
-    later_room = caps(*case["room_later"], 0)
-    return run(cars, prices, later_room, now_room)
+    prices = priced(*(None if c is None else c / 100 for c in cents))
+    return run(demands, prices, caps(*room_later, 0), caps(*room_now, 0))
 
 
 @pytest.mark.parametrize("seed", [1931, 5662])

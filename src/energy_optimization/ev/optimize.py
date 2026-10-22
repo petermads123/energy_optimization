@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.optimize import Bounds, LinearConstraint, milp
+from scipy.optimize import Bounds, LinearConstraint, OptimizeResult, milp
 from scipy.sparse import csr_array
 
 from .model import Phase
@@ -211,33 +211,12 @@ class _Problem:
                 witness that lets a later level be held without a solve. A probe that
                 is not followed by a hold must not keep it.
         """
-        count = len(self._lb)
-        constraints = None
-        if self._lo:
-            matrix = csr_array(
-                (self._vals, (self._ri, self._ci)), shape=(len(self._lo), count)
-            )
-            constraints = LinearConstraint(matrix, self._lo, self._hi)
-        options = {
-            "node_limit": NODE_LIMIT,
-            "mip_rel_gap": 0.0,
-            "presolve": True,
-            "threads": 1,
-        }
-        with warnings.catch_warnings():
-            # `threads` is not a documented milp option, but HiGHS honours it.
-            warnings.filterwarnings(
-                "ignore",
-                message="Unrecognized options detected",
-                category=RuntimeWarning,
-            )
-            result = milp(
-                c=objective,
-                constraints=constraints,
-                integrality=np.array(self._integer),
-                bounds=Bounds(self._lb, self._ub),
-                options=options,
-            )
+        result = self._milp(objective, presolve=True)
+        if _failed(result):
+            # HiGHS sometimes reports a feasible model infeasible, or stops without a
+            # point, under one presolve setting and solves it under the other. The retry
+            # is deterministic, and only a second failure raises.
+            result = self._milp(objective, presolve=False)
         status = int(result.status)
         message = str(result.message)
         solution = result.x
@@ -260,6 +239,36 @@ class _Problem:
             self.x = found
         return found
 
+    def _milp(self, objective: NDArray[np.float64], presolve: bool) -> OptimizeResult:
+        """Call HiGHS once on the problem as it stands."""
+        count = len(self._lb)
+        constraints = None
+        if self._lo:
+            matrix = csr_array(
+                (self._vals, (self._ri, self._ci)), shape=(len(self._lo), count)
+            )
+            constraints = LinearConstraint(matrix, self._lo, self._hi)
+        options = {
+            "node_limit": NODE_LIMIT,
+            "mip_rel_gap": 0.0,
+            "presolve": presolve,
+            "threads": 1,
+        }
+        with warnings.catch_warnings():
+            # `threads` is not a documented milp option, but HiGHS honours it.
+            warnings.filterwarnings(
+                "ignore",
+                message="Unrecognized options detected",
+                category=RuntimeWarning,
+            )
+            return milp(
+                c=objective,
+                constraints=constraints,
+                integrality=np.array(self._integer),
+                bounds=Bounds(self._lb, self._ub),
+                options=options,
+            )
+
     def probe(self, objective: Mapping[int, float]) -> float:
         """Minimise a level without holding it and without keeping the solution.
 
@@ -273,6 +282,26 @@ class _Problem:
         for col, value in objective.items():
             vector[col] = value
         return float(vector @ self._solve(vector, keep=False))
+
+    def raise_to(self, col: int, level: float) -> bool:
+        """Hold a column at `level` or more if it can reach that with every row so far.
+
+        The solution found stays the problem's last solution: it satisfies the new row
+        when the column can be raised, and the old rows when it cannot.
+
+        Args:
+            col: The column.
+            level: The value to hold it at or above.
+
+        Returns:
+            Whether it can reach `level`; the row is added only then.
+        """
+        vector = np.zeros(len(self._lb))
+        vector[col] = -1.0
+        if round(-float(vector @ self._solve(vector))) < level:
+            return False
+        self.row([(col, 1.0)], level, math.inf)
+        return True
 
     def set_known(self, col: int, value: float) -> None:
         """Record the value of a column the last solution did not have yet.
@@ -346,6 +375,11 @@ class _Problem:
         return self.x
 
 
+def _failed(result: OptimizeResult) -> bool:
+    """Whether a solve is worth one retry: infeasible, or stopped without a point."""
+    return int(result.status) == 2 or result.x is None
+
+
 def _hi(demand: Demand, first: bool) -> float:
     """Return the highest current of a demand in a quarter, 0 when it is off."""
     top = demand.now_max_current if first else demand.max_current
@@ -394,7 +428,7 @@ def _stage_now(
     included = [d for d in demands if solved[chosen[d.charger_id]] > 0.5]
     if not included:
         return {d.charger_id: 0.0 for d in demands}
-    # S2: progressive filling.
+    # S2: progressive filling, then the leftover one amp at a time (round 1's `share`).
     top = {d.charger_id: _hi(d, True) for d in included}
     value = {d.charger_id: d.min_current for d in included}
     frozen = {d.charger_id for d in included if top[d.charger_id] <= d.min_current}
@@ -423,47 +457,27 @@ def _stage_now(
         for d in included:
             for phase in d.phases:
                 left[phase] -= value[d.charger_id]
-        at_level = {phase: 0 for phase in Phase}
+        # The cars at the level cannot all rise together. As in `share`, each in ranking
+        # order takes one more amp if it still fits, and one that does not never will
+        # (the room only shrinks), so it is frozen; the rest go on from the next level.
+        moved = False
         for d in included:
-            if d.charger_id not in frozen and value[d.charger_id] <= reached:
-                for phase in d.phases:
-                    at_level[phase] += 1
-        done = {
-            d.charger_id
-            for d in included
-            if d.charger_id not in frozen
-            and (
-                value[d.charger_id] >= top[d.charger_id] - _EPS
-                or any(left[p] < max(1, at_level[p]) - _EPS for p in d.phases)
-            )
-        }
-        frozen |= done or {d.charger_id for d in included}
-    # S3: the remainder goes in ranking order.
-    last = _Problem(run)
-    cols = {
-        d.charger_id: last.var(
-            value[d.charger_id],
-            top[d.charger_id],
-            value[d.charger_id] < top[d.charger_id],
-        )
-        for d in included
-    }
-    for phase in Phase:
-        terms = [(cols[d.charger_id], 1.0) for d in included if phase in d.phases]
-        if terms:
-            last.row(terms, -math.inf, room[phase])
-    for d in included:
-        last.minimise(
-            {cols[d.charger_id]: -1.0}, integral=True, floor=-top[d.charger_id]
-        )
-    final = last.solution()
-    allocation = {d.charger_id: 0.0 for d in demands}
-    for d in included:
-        pinned = value[d.charger_id] >= top[d.charger_id]
-        allocation[d.charger_id] = (
-            value[d.charger_id] if pinned else float(round(final[cols[d.charger_id]]))
-        )
-    return allocation
+            key = d.charger_id
+            if key in frozen or value[key] > reached:
+                continue
+            if value[key] + 1 > top[key] + _EPS or any(
+                left[p] < 1 - _EPS for p in d.phases
+            ):
+                frozen.add(key)
+                moved = True
+                continue
+            value[key] += 1.0
+            moved = True
+            for phase in d.phases:
+                left[phase] -= 1.0
+        if not moved:
+            frozen |= {d.charger_id for d in included}
+    return {d.charger_id: value.get(d.charger_id, 0.0) for d in demands}
 
 
 @dataclass(frozen=True)
@@ -611,7 +625,8 @@ def _fill_now(
     first-quarter current of the cars not yet saturated as far as it goes, then
     saturate every car that is at its maximum or cannot exceed that level, holding
     everything found. When no car is saturated by a level (they could each exceed it,
-    just not all at once) the rest goes in ranking order.
+    just not all at once) the cars in ranking order take one more amp each while they
+    can, as in the first-quarter tiers (round 1's `share`).
     """
     top = {n: _hi(demands[n], True) for n in on_now}
     value = {n: demands[n].min_current for n in on_now}
@@ -648,10 +663,16 @@ def _fill_now(
             if at_top or not free:
                 stuck.append(n)
         if not stuck:
+            # Each car could rise alone but not all together. As in `share`, each in
+            # ranking order takes one more amp if it still can with everything held, and
+            # one that cannot never will (the room only shrinks), so it drops out.
+            rising = []
             for n in live:
-                col = columns[n].i[0]
-                problem.minimise({col: -1.0}, integral=True, floor=-top[n])
-            return
+                if problem.raise_to(columns[n].i[0], reached + 1):
+                    value[n] = float(reached + 1)
+                    rising.append(n)
+            live = rising
+            continue
         live = [n for n in live if n not in stuck]
 
 
