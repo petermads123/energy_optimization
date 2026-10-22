@@ -1,6 +1,6 @@
 # Stateless core
 
-<!-- claude-plan step=8 status=active -->
+<!-- claude-plan step=8 status=done -->
 
 | Field | Value |
 |---|---|
@@ -20,7 +20,7 @@
 | 5 | Test | `/test` | in `/build` | done |
 | 6 | Concept check | `/concept-check` | in `/build` | done |
 | 7 | Ship | `/ship` | in `/build` | done |
-| 8 | Recommend | `/recommend` | with the user | pending |
+| 8 | Recommend | `/recommend` | with the user | done |
 | 9 | Pull request | `/create-pr` | with the user | pending |
 | 10 | Review | `/watch-pr` | on the pull request | pending |
 
@@ -539,7 +539,9 @@ The earlier round is `feat/ev-charging-core` round 1 (`development/feat/ev-charg
 
 | # | Recommendation | Why it is critical | Effort | Decision |
 |---|---|---|---|---|
-| R1 | | | | |
+| R1 | Round 2: replace the greedy planner and current-quarter sharing with the HiGHS MILP (`scipy.optimize.milp`), as recorded under **Explicitly out of scope** | Not a defect: the branch's own second half, agreed with the user before this round opened ("One branch, two rounds"). Without it the branch does not deliver what it was opened for | large | `next round` — decided by the user at this round's step 1; opened as `02-milp-solver.md` |
+
+No other critical follow-up. The designers' contradictions (section 5) are round-1 behaviour or docstrings and are noted in `DEVELOPMENT.md`; the planned-finish DST defect found at step 5 was fixed in this round under A6.
 
 Decisions: `deferred`, `rejected`, or `next round` — a new numbered file in this folder,
 taken back through steps 1 to 7 on the same branch.

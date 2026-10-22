@@ -35,3 +35,11 @@ timestamp and the core should distrust an old one.
 - A `plugged_in_at` later than `now` (clock skew) moves the deadline a full day when the ready time falls in between; section 1 does not decide it. Next step: reject or clamp a future `plugged_in_at` once a real caller shows whether it happens.
 - Planning credits a part-used quarter (the one holding `now`, or the last one before an off-grid ready time) as a whole quarter; the error is at most one quarter and self-corrects on the next call. Next step: revisit if ready times off the 15-minute grid matter in practice.
 - `LIMITED_BY_PHASE` is chosen when any phase of a short charger has its guard below the budget, even when another phase binds; the status is informational. Next step: attribute per binding phase if the status is ever acted on.
+
+## `feat/stateless-milp-planner` round 1 notes
+
+2026-10-22, from round 1's step 5 records (`development/feat/stateless-milp-planner/01-stateless-core.md`, section 5). Round-1 behaviour, unchanged; round 2 rewrites the planner and may settle some of them.
+
+- `reaches_target` is `False` for a need already met once the deadline has passed (`_reaches` requires `deadline > now`), so a finished session reads "will not reach target" after its ready time. Next step: decide whether a covered need reports `True`.
+- A fixed or unavailable charger with a session gets `expected_finish` from its reservation, an assumed level rather than measured delivery. Next step: decide whether such a finish should be `None`.
+- Docstrings lag the code: `ChargerDecision` says the session fields are `None` "without a session", but a session with no car also gives `None`; `_expected_finish` does not say a trickle gives `None`; `plan_sessions` documents `ValueError` for a naive `now`, which with no requests never fires. Next step: reword when the round touching them lands.
