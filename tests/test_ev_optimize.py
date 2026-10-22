@@ -1374,3 +1374,45 @@ def _lex_less(a: tuple[float, ...], b: tuple[float, ...]) -> bool:
         if abs(x - y) > 1e-6:
             return x < y
     return False
+
+
+# --- the planned tier's even first quarter (A3, amended at the step-6 halt) ------------
+
+
+def test_optimize_three_planned_cars_fill_the_first_quarter_evenly_up_to_each_limit() -> (
+    None
+):
+    # A is limited to 8 A, B and C reach 16 A, 30 A on the phase, equal prices and
+    # needs: the first quarter is 8 / 11 / 11, not 8 / 14 / 8 (a single max-min made
+    # only the smallest allocation as large as possible).
+    cars = [
+        planned("a", need=1.84, high=8),
+        planned("b", need=1.84),
+        planned("c", need=1.84),
+    ]
+
+    outcome = run(cars, priced(0.2, 0.2, 0.2, 0.2), caps(30, 30, 30), caps(30, 30, 30))
+
+    assert outcome.allocations == {"a": 8.0, "b": 11.0, "c": 11.0}
+
+
+def test_optimize_two_planned_cars_forced_into_an_unpriced_first_quarter_share_it() -> (
+    None
+):
+    # No prices at all and a need that only fits if both cars run in every quarter:
+    # the forced first quarter is split 8 / 8, not 16 / 0.
+    cars = [planned("a", need=1.84), planned("b", need=1.84)]
+
+    outcome = run(cars, {})
+
+    assert outcome.allocations == {"a": 8.0, "b": 8.0}
+
+
+def test_optimize_an_unpriced_first_quarter_is_not_filled_beyond_what_the_need_forces() -> (
+    None
+):
+    # Latest-first still rules: with room to spare, only the quarters the need forces
+    # are used, and none is pulled into the unpriced first quarter.
+    outcome = run([planned("a", need=E16)], {})
+
+    assert outcome.allocations == {"a": 0.0}

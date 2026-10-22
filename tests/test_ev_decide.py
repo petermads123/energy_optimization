@@ -3612,3 +3612,327 @@ def test_stale_prices_share_spare_capacity_evenly_with_no_plans() -> None:
     assert all(c.plan == () for c in result.chargers)
     assert result.status is Status.PRICES_STALE
     assert kinds(result) == [EventKind.PRICES_STALE]
+
+
+# --- presolve regressions (step-6 halt): feasible models HiGHS called infeasible ---------
+#
+# Two planned-heavy snapshots from the concept check's generated set. With
+# `presolve = False` HiGHS reported status 2 (infeasible) in the cars-on-now level of
+# P5 although the previous level's point satisfied every row.
+
+
+def _hourly(start: str, updated_at: str, prices: list[float]) -> dict[str, object]:
+    first = datetime.fromisoformat(start)
+    return {
+        "intervals": [
+            {
+                "start": (first + timedelta(hours=h)).isoformat(),
+                "end": (first + timedelta(hours=h + 1)).isoformat(),
+                "price": price,
+            }
+            for h, price in enumerate(prices)
+        ],
+        "updated_at": updated_at,
+    }
+
+
+_PRESOLVE_SNAPSHOT_40: dict[str, object] = {
+    "now": "2026-10-21T20:16:00+00:00",
+    "settings": {
+        "phase_budget": 10.0,
+        "phase_threshold": 20.0,
+        "fallback_current": 6,
+        "timezone": "Europe/Copenhagen",
+        "voltage": 230.0,
+        "min_block_quarters": 1,
+        "price_cap": None,
+        "default_energy_need_kwh": 30.0,
+        "max_price_age": 3600.0,
+        "max_measurement_age": 60.0,
+    },
+    "chargers": [
+        {
+            "id": "c0",
+            "phases": ["L1", "L2"],
+            "kind": "adjustable",
+            "min_current": 7,
+            "max_current": 19,
+            "assumed_current": None,
+            "fallback_current": None,
+        },
+        {
+            "id": "c1",
+            "phases": ["L1", "L2", "L3"],
+            "kind": "on_off",
+            "min_current": None,
+            "max_current": None,
+            "assumed_current": 10.0,
+            "fallback_current": None,
+        },
+    ],
+    "states": [
+        {
+            "charger_id": "c0",
+            "car_connected": True,
+            "current_setting": 0.0,
+            "paused": True,
+            "measured_power_w": None,
+            "available": True,
+        },
+        {
+            "charger_id": "c1",
+            "car_connected": True,
+            "current_setting": 0.0,
+            "paused": True,
+            "measured_power_w": None,
+            "available": True,
+        },
+    ],
+    "sessions": [
+        {
+            "charger_id": "c0",
+            "ready_time": "07:45:00",
+            "energy_need_kwh": 6.759948162315475,
+            "soc_percent": None,
+            "target_soc_percent": None,
+            "battery_capacity_kwh": None,
+            "delivered_kwh": 0.0,
+            "charge_now": False,
+            "smart_charging": True,
+            "user_current_limit": 14,
+            "plugged_in_at": None,
+        },
+        {
+            "charger_id": "c1",
+            "ready_time": "11:00:00",
+            "energy_need_kwh": 9.101894710714443,
+            "soc_percent": None,
+            "target_soc_percent": None,
+            "battery_capacity_kwh": None,
+            "delivered_kwh": 0.0,
+            "charge_now": False,
+            "smart_charging": True,
+            "user_current_limit": 15,
+            "plugged_in_at": None,
+        },
+    ],
+    "phase_currents": {
+        "measured_at": "2026-10-21T20:16:00+00:00",
+        "l1": 6.0979607487759475,
+        "l2": 6.007630124661385,
+        "l3": 7.4724749177166565,
+    },
+    "prices": _hourly(
+        "2026-10-21T20:15:00+00:00",
+        "2026-10-21T20:16:00+00:00",
+        [
+            0.548,
+            0.644,
+            0.08,
+            0.58,
+            0.385,
+            0.335,
+            0.636,
+            0.239,
+            0.249,
+            0.32,
+            0.578,
+            0.688,
+            0.549,
+            0.202,
+        ],
+    ),
+}
+
+_PRESOLVE_SNAPSHOT_246: dict[str, object] = {
+    "now": "2026-10-21T20:32:00+00:00",
+    "settings": {
+        "phase_budget": 10.0,
+        "phase_threshold": 20.0,
+        "fallback_current": 6,
+        "timezone": "Europe/Copenhagen",
+        "voltage": 230.0,
+        "min_block_quarters": 1,
+        "price_cap": 0.30649750483544524,
+        "default_energy_need_kwh": 30.0,
+        "max_price_age": 3600.0,
+        "max_measurement_age": 60.0,
+    },
+    "chargers": [
+        {
+            "id": "c0",
+            "phases": ["L1", "L2", "L3"],
+            "kind": "adjustable",
+            "min_current": 6,
+            "max_current": 19,
+            "assumed_current": None,
+            "fallback_current": None,
+        },
+        {
+            "id": "c1",
+            "phases": ["L1"],
+            "kind": "adjustable",
+            "min_current": 8,
+            "max_current": 14,
+            "assumed_current": None,
+            "fallback_current": None,
+        },
+        {
+            "id": "c2",
+            "phases": ["L1", "L2"],
+            "kind": "on_off",
+            "min_current": None,
+            "max_current": None,
+            "assumed_current": 6.0,
+            "fallback_current": None,
+        },
+        {
+            "id": "c3",
+            "phases": ["L1"],
+            "kind": "on_off",
+            "min_current": None,
+            "max_current": None,
+            "assumed_current": 10.0,
+            "fallback_current": None,
+        },
+    ],
+    "states": [
+        {
+            "charger_id": "c0",
+            "car_connected": True,
+            "current_setting": 0.0,
+            "paused": True,
+            "measured_power_w": None,
+            "available": True,
+        },
+        {
+            "charger_id": "c1",
+            "car_connected": True,
+            "current_setting": 0.0,
+            "paused": True,
+            "measured_power_w": None,
+            "available": True,
+        },
+        {
+            "charger_id": "c2",
+            "car_connected": True,
+            "current_setting": 0.0,
+            "paused": True,
+            "measured_power_w": None,
+            "available": True,
+        },
+        {
+            "charger_id": "c3",
+            "car_connected": True,
+            "current_setting": 0.0,
+            "paused": True,
+            "measured_power_w": None,
+            "available": True,
+        },
+    ],
+    "sessions": [
+        {
+            "charger_id": "c0",
+            "ready_time": "01:00:00",
+            "energy_need_kwh": 22.991044950214995,
+            "soc_percent": None,
+            "target_soc_percent": None,
+            "battery_capacity_kwh": None,
+            "delivered_kwh": 0.0,
+            "charge_now": False,
+            "smart_charging": True,
+            "user_current_limit": None,
+            "plugged_in_at": None,
+        },
+        {
+            "charger_id": "c1",
+            "ready_time": "13:30:00",
+            "energy_need_kwh": 26.88878068721529,
+            "soc_percent": None,
+            "target_soc_percent": None,
+            "battery_capacity_kwh": None,
+            "delivered_kwh": 0.0,
+            "charge_now": False,
+            "smart_charging": True,
+            "user_current_limit": None,
+            "plugged_in_at": None,
+        },
+        {
+            "charger_id": "c2",
+            "ready_time": "15:45:00",
+            "energy_need_kwh": 33.50024190701247,
+            "soc_percent": None,
+            "target_soc_percent": None,
+            "battery_capacity_kwh": None,
+            "delivered_kwh": 0.0,
+            "charge_now": False,
+            "smart_charging": True,
+            "user_current_limit": 12,
+            "plugged_in_at": None,
+        },
+        {
+            "charger_id": "c3",
+            "ready_time": "06:45:00",
+            "energy_need_kwh": 19.98297469908214,
+            "soc_percent": None,
+            "target_soc_percent": None,
+            "battery_capacity_kwh": None,
+            "delivered_kwh": 0.0,
+            "charge_now": False,
+            "smart_charging": True,
+            "user_current_limit": None,
+            "plugged_in_at": None,
+        },
+    ],
+    "phase_currents": {
+        "measured_at": "2026-10-21T20:32:00+00:00",
+        "l1": 5.200379492977508,
+        "l2": 1.280053551788372,
+        "l3": 2.7846031154684594,
+    },
+    "prices": _hourly(
+        "2026-10-21T20:30:00+00:00",
+        "2026-10-21T20:32:00+00:00",
+        [
+            0.343,
+            0.076,
+            0.818,
+            0.745,
+            0.514,
+            0.196,
+            0.772,
+            0.146,
+            0.454,
+            0.176,
+            0.681,
+            0.55,
+            0.654,
+            0.51,
+            0.221,
+            0.187,
+            0.567,
+            0.863,
+            0.321,
+            0.551,
+            0.217,
+            0.176,
+            0.205,
+        ],
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "data",
+    [_PRESOLVE_SNAPSHOT_40, _PRESOLVE_SNAPSHOT_246],
+    ids=["two chargers at 10 A", "four chargers at 10 A"],
+)
+def test_decide_solves_snapshots_highs_called_infeasible_without_presolve(
+    data: dict[str, object],
+) -> None:
+    snapshot = snapshot_from_dict(data)
+
+    result = decide(snapshot)
+
+    assert len(result.chargers) == len(snapshot.chargers)
+    assert all(c.allocation >= 0.0 for c in result.chargers)
