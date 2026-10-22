@@ -19,7 +19,7 @@
 | 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | done |
-| 6 | Concept check | `/concept-check` | in `/build` | pending |
+| 6 | Concept check | `/concept-check` | in `/build` | in progress (halted) |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
 | 9 | Pull request | `/create-pr` | with the user | pending |
@@ -859,11 +859,93 @@ Edge cases considered and deliberately skipped, with reasons:
 > Written in step 6, against section 1 — not against section 2. The question is whether
 > the thing built is the thing agreed, not whether it matches the plan.
 
+Method. Round 1 of this branch (`2646e7c`) was extracted with `git archive` into the session
+scratchpad (never into the tree) and run beside the working tree over two generated sets:
+600 snapshots from the suite's own `random_snapshot` generator (mixed kinds, stale and
+fresh data) and 500 planned-heavy snapshots (2 to 4 chargers, shared phases, fresh prices
+and measurements). Each decision was compared field by field, every new plan was checked
+against the new model's limits by a separate script, and every changed plan was re-scored
+on the model's own levels (shortfall, unpriced kWh, above-cap kWh, short runs, price).
+
 | # | Criterion | Met | Evidence |
 |---|---|---|---|
-| A1 | | | |
+| A1 | Plans and allocates within every limit | yes | `test_optimize_never_breaks_a_limit` and `test_the_invariants_hold_for_generated_snapshots` pass. Independently, a separate script (not the module's helpers) checked all 1,100 generated decisions from both sets: every allocation is 0 or within min..min(max, user limit, fallback), whole amps for adjustable and exactly the assumed current for on/off, the sum of non-reserved first-quarter currents is within the budget less reservations and within `available`, every planned quarter is in `[quarter of now, deadline)`, the allocation equals the plan's first-quarter current, and every later quarter (plans + reservations + smart-off) is within the budget. 0 violations. A further check of the new plans of all 427 differing decisions against the new model's limits (including the overfill bound) found 0 violations. |
+| A2 | Optimal for the stated precedence | yes, with notes | `test_optimize_matches_a_brute_force_enumeration_level_by_level` computes the P1 to P7 tuple independently: `level_tuple` and `_feasible` in the test file re-derive every level from the plan grid and never call into `optimize.py` (they share only `energy_per_quarter_kwh` and `quarter_starts`). I re-ran it with 600 examples (10 times the suite's 60) on the real module: passes. Mutation checks on a scratch copy of the module: removing P1 fails the test at the suite's 60 examples; removing P4 (the minimum-block level) passes at 60 and fails at 600, so the suite's example count is too low to bite P4 (the hand-checked block tests cover it, see step 8 note). The doc scenarios (cheapest quarters, cap, unreachable with reachable kWh, unpriced latest first) are the T3 tests, all green. In the differential (427 differing decisions, 343 with a changed plan), no old plan that is feasible in the new model beats the new plan on any level: 0 of 427. Note: constraint 4's upper bound (a car is never over-filled by more than one quarter at its top current, so negative prices cannot overfill) comes from section 2, not section 1; round 1's greedy plans broke it in 12 charger plans of the 427 differing decisions (see the A8 row). |
+| A3 | Serves the tiers in order on the leftover; quarter 0 split as evenly as cost allows | partially (see Halted) | Tier order and leftover: `test_a_lower_tier_gets_what_a_higher_tier_leaves`, `test_a_lower_tier_never_takes_current_a_higher_tier_could_use`, `test_optimize_a_lower_tier_takes_only_what_a_higher_tier_leaves` (all six tier pairs), and in the differential 61 snapshots where a spare car gains current at an unchanged priority while no higher tier loses any. Even split holds for two cars on equal terms (`test_optimize_two_planned_cars_at_equal_prices_run_now_evenly`, round 1 16/0 becomes 8/8 in my own probe) and for the quarter-0-only tiers (S1 to S3 reproduce `share`). It does **not** hold in two cases, both reproduced: (1) with three planned cars on one phase (30 A, A limited to 8 A, B and C to 16 A, equal prices, equal needs, nothing forcing an uneven Q0) `optimize` returns 8 / 14 / 8 A although 8 / 8 / 8 costs the same on every level above; P6 maximises only the smallest allocation (section 2 critique 1, "a single max-min"), and the rest follows the earlier-first tie-break; round 1 gave 8 / 11 / 11. (2) With the first quarter unpriced (deviation 9), P5's cars-on-now and P6 are skipped, so two planned cars that are forced into quarter 0 get 16 / 0 although 8 / 8 is free (probe: two 6 to 16 A cars, 16 A, empty fresh price series, each needing 1.84 kWh in 1 h: `a` 16 A, `b` 0 A; the same snapshot with prices gives 8 / 8). |
+| A4 | Keeps the stale-price rule | yes | `test_stale_prices_share_spare_capacity_evenly_with_no_plans`, `test_stale_prices_make_a_smart_session_priority_three`, `test_stale_prices_never_mark_a_session_starved` pass; in both generated sets every decision with status `prices_stale` has no plan (0 plans), and `optimize` gets `prices={}` for stale series (decide.py:581). |
+| A5 | Deterministic and bounded | yes on the promised grid | Whole `decide`, this machine (4 cores), seeds 1 to 5, `benchmark_snapshot`: 3 chargers at 35 A `[0.64, 0.26, 1.41, 0.63, 0.59]` s (worst 1.41, tier 10 s); 7 at 70 A `[3.99, 2.71, 2.41, 3.89, 3.25]` (worst 3.99, tier 60 s); 10 at 70 A `[6.62, 4.80, 10.07, 5.75, 42.66]` (worst 42.66, tier 120 s). No `PLAN_NOT_PROVEN_OPTIMAL` in any run. Determinism: the decisions of 8 snapshots (3 benchmark seeds and 5 generated ones) hashed under `PYTHONHASHSEED` 0, 1 and 12345 give one identical SHA-256; repeated-call equality is a test. Options in `optimize.py:196-202` are `node_limit` (`NODE_LIMIT = 8000`), `mip_rel_gap = 0`, `presolve = False`, `threads = 1`; there is no `time_limit` anywhere in `src/` (grep), and two tests spy the `milp` call to assert it. Node-budget stop with a point gives the event (stubbed and real tests). **Defect found**, see the drift list: with `presolve = False`, HiGHS reports "infeasible" for feasible models. |
+| A6 | Raises instead of guessing | yes as worded, with a defect | Every failure status raises `SolverError(status, message)` with no partial or greedy decision (`test_decide_raises_solver_error_for_every_failure_status` and the rest of T7). But in the 500 planned-heavy snapshots, 3 raised: #40 and #246 "HiGHS status 2: infeasible" on a model that is feasible (the previous solve's point satisfies every row with 0.0 violation) and #111 "status 4" at the node budget without a point after 40.7 s. With `presolve = True` #40 and #246 return normally in 0.1 s and 0.5 s and #111 in 17.4 s. The concept says the shortfall slack keeps the problem always feasible, so a status 2 is a defect of the build, not the HiGHS error A6 is about. |
+| A7 | Removes the greedy planner and declares its dependencies | yes | `PlanRequest`, `plan_sessions`, `Claim`, `share` absent from the package and `__all__`; `planning.py` keeps `NeedSource`, `remaining_need_kwh`, `energy_per_quarter_kwh`, `SessionPlan`; `allocation.py` keeps the five unchanged functions. Imports across `src/`: standard library, `numpy`, `scipy.optimize`, `scipy.sparse` only. `pyproject.toml` `dependencies = ["numpy>=2.2,<3", "scipy>=1.15,<2"]`. `STRUCTURE.md` checked by the structure-auditor (no drift) and by hand. Tests `test_the_round_two_names_are_gone`, `test_the_package_imports_only_the_standard_library_numpy_scipy_and_itself`, `test_the_package_uses_numpy_and_scipy_and_pyproject_declares_them`. |
+| A8 | Changes nothing else | yes | `model.py`, `quarters.py` and `codec.py` are byte-identical to `2646e7c` (`git diff --stat`); in both sets the decision dict has exactly round 1's top-level and per-charger keys. `result.py` only gains `PLAN_NOT_PROVEN_OPTIMAL`. Differential, below. |
+
+**The A8 differential (round 1 `2646e7c` against the working tree).**
+
+| Set | Snapshots | Identical | Differ | Fit no kind | Errors old / new |
+|---|---|---|---|---|---|
+| `random_snapshot`, seeds `7919 k + 13` | 600 | 527 | 73 | 0 | 0 / 0 |
+| planned-heavy | 500 | 143 | 354 (and 3 where the new code raised) | 0 | 0 / 3 |
+
+Every difference falls in one of the three kinds. The method for the plan kind: the changed
+plan is re-scored on the model's levels (shortfall, unpriced kWh, above-cap kWh, short runs,
+price) and the old plan is tested for feasibility in the new model.
+
+| Kind | What was seen | Pinning test |
+|---|---|---|
+| Optimality | Changed plan, with its consequences: priority 2 and 4 swapping, `IN_PLAN` and `PLANNED_LATER`, a planned car's first-quarter allocation now the plan's current, `expected_finish`, `reaches_target`, events and status. Of the 427 differing decisions, none had an old plan that fits the new model and beats the new plan; 258 had a strictly better new plan, 88 an equal-level one (a different plan or no plan change), and 81 an old plan the new model forbids: its first quarter above the fallback or user limit or above the first quarter's room (guard, charge-now, smart-off), or an overfill past one quarter at the top current (A1 and the plan's constraint 4). Ties (equal levels, different plan) go to the better-ranked car being on now (ranking order). | `test_a_planned_charger_without_room_now_is_planned_later_and_a_starved_one_waits`, `test_charge_now_takes_the_first_quarter_and_the_plan_starts_after_it`, `test_smart_off_allocations_shrink_the_capacity_planned_for_smart_sessions`, `test_reserved_chargers_shrink_the_capacity_planned_for_smart_sessions`, `test_decide_a_planned_car_ranked_first_charges_first_on_equal_prices`, `test_optimize_gives_the_better_ranked_car_the_earlier_cheap_quarter` |
+| Leftover | A priority-3 car gaining current beside a higher tier (61 snapshots), a priority-2 car gaining what a charge-now car leaves; reason codes `WAITING_FOR_CAPACITY` and `WAITING_FOR_HIGHER_PRIORITY` swapping (the new test is "a higher-precedence charger on a shared phase actually took current"); `_status` and `capped_by` counting a waiting lower-tier car (112, 286, 303, 387, 576 in the first set change status with no allocation change). | `test_a_lower_tier_gets_what_a_higher_tier_leaves`, `test_a_lower_tier_never_takes_current_a_higher_tier_could_use`, `test_smart_charging_off_is_served_before_smart_chargers`, `test_a_spare_car_behind_a_planned_car_waits_for_higher_priority`; the status-only consequence has no dedicated test (noted for step 8) |
+| Even split | Two or more planned cars sharing a phase now both on in quarter 0, where round 1's plan gave one of them everything (e.g. 16 / 0 becomes 8 / 8, three cars 0 / 9 / 9 becomes 6 / 6 / 6). | `test_two_unreachable_planned_cars_split_a_shared_phase_evenly_now`, `test_optimize_two_planned_cars_at_equal_prices_run_now_evenly` |
+
+No difference fitted none. The A3 shortfall above is a property of the new behaviour, not a
+differential finding.
+
+**Deviations 1 to 15 (section 3) against section 1.**
+
+| # | Verdict |
+|---|---|
+| 1 S3 sequential | pass: gives the "remainder in ranking order" A3 asks for. |
+| 2 aggregated block rows | pass: same meaning for A2's minimum block (a run the deadline cuts short is free). |
+| 3 level shortcuts | pass: same optimum, fewer solves. |
+| 4 hold tolerance | pass for the promise; but it is not the cause of the infeasibility found (the previous point satisfies every row). |
+| 5 `presolve = False` | **defect**: not a criterion, but HiGHS then reports infeasible for feasible models (A6 row). |
+| 6 `_fit_now` / `_even_now` bounds | pass: shortcuts only. |
+| 7 reverted catch-and-hold | pass: A6 as amended. |
+| 8 fractional on/off in the quarter-0 stage | pass: A1 "exactly their assumed current". |
+| 9 P5 / P6 only when the first quarter is priced | **halt**: narrows A3's "split as evenly as cost allows" (A3 row, case 2). The deviation says the concept decided the case in A2, but A2 only names the doc's unpriced scenario (latest first); it does not say whether an even split gives way to latest-first when a car is forced into an unpriced quarter 0. |
+| 10 P7 priced weight | pass: tie-break only (A2's earlier-first). |
+| 11 P5 ranking part | pass: ranking order within the tier, as A3 says for remainders. |
+| 12 fractional on/off in the plan | pass: A1. |
+| 13 smart-off held to the smaller room | pass: A1. |
+| 14 not-proven rule | pass: A5 and A6 as worded. |
+| 15 validation and docs | pass. |
+
+**Out of scope.** Nothing from the exclusion list was built (no other loads, no greedy
+fallback, no threads, no warm start). Connections: `decide.py` calls `optimize` once and
+reads allocations and plans back; `planning.py` and `allocation.py` only keep what is still
+used. Showcases: all eight modules exit 0; `optimize.main` reads as a worked example.
+`ruff check`, `ruff format --check` and `mypy` are clean. `STRUCTURE.md`: the
+structure-auditor's one suggestion is applied (the `test_ev_decide.py` entry now lists the
+step 5 tests, including that the mid-quarter ready time test is "pinned, not endorsed").
 
 Drift found, and what was done about it:
+
+1. **A3, quarter-0 evenness of the planned tier (halt).** Two gaps, described in the A3 row:
+   P6 is a single max-min, and deviation 9 skips it when the first quarter is unpriced. Both
+   need a user decision: see Halted.
+2. **HiGHS reports "infeasible" for feasible models with `presolve = False` (code wrong,
+   send back to step 3 once the halt is answered).** 2 of 500 planned-heavy snapshots
+   (#40: two chargers, 10 A budget; #246: four chargers, 10 A budget) raise `SolverError`
+   status 2 in the cars-on-now level of P5. The previous point satisfies every row exactly
+   (checked), and `presolve = True` solves both in under a second. `presolve = True` also
+   solves #111 (a status 4 without a point after 40.7 s) in 17.4 s and #431 in 14.2 s instead
+   of 30.6 s. The `presolve = False` choice was made on one benchmark seed (deviation 5). The
+   fix must re-time the A5 cells; a retry with `presolve = True` after a status 2 would keep
+   the 120 s tier, but that is for step 3 to measure.
+3. **Notes for step 8, not defects:** (a) the overfill bound is a plan decision that
+   changes round 1's behaviour at negative prices (12 charger plans across the two sets); (b) the brute
+   force at 60 examples does not bite the minimum-block level; (c) the status consequence of
+   the leftover rule has no dedicated test; (d) HiGHS writes
+   `HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();` lines to
+   standard output or error during some solves.
 
 ### Earlier rounds still hold
 
@@ -874,6 +956,22 @@ Drift found, and what was done about it:
 
 | Round | # | Criterion | Still met | Evidence |
 |---|---|---|---|---|
+| 1 (`01-stateless-core.md`) | A1 | Stateless | yes | `decide` takes only the snapshot; the only module-level values are constants (`NODE_LIMIT`, tolerances); equal decisions on repeated calls and across three hash seeds (A5 row); the public additions (`SolverError`, `PLAN_NOT_PROVEN_OPTIMAL`, `optimize` and its types) are this round's agreed additions, and `test_the_public_surface_*` pins round 1's names plus them. |
+| 1 | A2 | Round 2 removed cleanly | yes | `ls ev/`: no `guard.py`, no `regulation.py`; grep finds no `settling`, `skip_current`, `next_check` or `memory` outside the codec's rejection. |
+| 1 | A3 | Behaves like round 1 | yes, in the amended form | Superseded by this round's A8 differential, above: every difference is one of the three kinds. Time arithmetic code (`quarters.py`) untouched. |
+| 1 | A4 | Keeps every round-1 guarantee | see the next group | |
+| 1 | A5 | Round-1-shaped codec | yes | `codec.py` and `model.py` are byte-identical to `2646e7c`; top-level and per-charger decision keys equal round 1's in 1,100 decisions; the `memory` and round-2 setting rejections are in `test_ev_codec.py` and pass; a not-proven decision round-trips. |
+| 1 | A6 | UTC arithmetic | yes | `optimize.py` converts every input with `astimezone(UTC)` before use (`_verify`, `quarter_starts`, `floor_to_quarter`) and presents `PlannedQuarter.start` in the zone at the end; `decide._expected_finish` unchanged; the DST finish tests pass; the fall-back night is tested in `optimize` directly. |
+| ev-charging-core 1 | A1 | Rejects invalid configuration | yes | `model.py` unchanged; its suite passes. |
+| ev-charging-core 1 | A2 (amended: tiers 1 to 4, ranking, 0 or min, user limit; the top-tier-only rule and equal split are now A3) | partially | Classification, ranking (`_rank_key`) and the 0-or-min and user-limit rules are unchanged and hold in the invariants check; the equal split now rides on this round's A3, which has the gaps above. |
+| ev-charging-core 1 | A3 | Respects amp limits | yes | Per-phase budget, guard in the first quarter (`available`), reservations and on/off exactness in the 1,100-decision check; smart-off is served first and cut last. |
+| ev-charging-core 1 | A4 (amended: now this round's A2) | Plans the cheapest quarters | yes | Horizon and 92 and 100 quarter days (`quarters.py` untouched, tests), minimum block, cap only to meet the need with the event, unreachable plan with the reachable kWh, unpriced quarters latest first and flagged, all in the T3 tests. |
+| ev-charging-core 1 | A5 | Falls back under doubt | yes | `_set_limits` and `phase_capacity` unchanged; fallback caps only the first planned quarter (test); stale prices give no plan. |
+| ev-charging-core 1 | A6 | Explainable, ordered output | yes | `_actions` unchanged (down before up); differential shows `actions` change only with allocation changes. |
+| ev-charging-core 1 | A7 | Doc section 12 invariants | yes | The suite's property test and my independent check, 0 violations in 1,100 decisions. |
+| ev-charging-core 1 | A8 (amended: now this round's A7) | Deterministic; dependencies | yes | A7 row. |
+| ev-charging-core 1 | A9 | Round-trips plain dicts | yes | `codec.py` unchanged; the codec suite passes. |
+| ev-charging-core 1 | A10 (amended: now this round's A5) | Fast | yes | A5 row. |
 
 ---
 
@@ -1006,3 +1104,45 @@ items 7 and 9.
 
 **Resolved (2026-10-22, step 3 third run):** deviation 7 reverted, the grid run and
 `NODE_LIMIT` fixed at 8000 (section 3), tests and `STRUCTURE.md` done.
+
+### Step 6, 2026-10-22
+
+Halted by the concept check on A3 (rule 1: a deviation that narrows what a criterion promises,
+and a case the concept never decided). Section 6 has the evidence.
+
+A3 promises that within a tier quarter 0 is "split as evenly as cost allows". For the planned
+tier the code does less than that, in two ways that I reproduced:
+
+1. **Only the smallest allocation is made as large as possible.** Level P6 is a single
+   max-min (section 2, critique 1: "accepted as stated"). Three planned cars on one phase, 30 A
+   per phase, car A limited to 8 A, B and C 6 to 16 A, equal prices, equal needs, nothing
+   forcing an uneven first quarter: `optimize` gives 8 / 14 / 8 A where 8 / 8 / 8 (or round 1's
+   8 / 11 / 11) costs the same on every level above P6. The rest of the first quarter then
+   follows the earlier-first tie-break.
+2. **Nothing is split when the first quarter is unpriced** (deviation 9). Two 6 to 16 A cars on
+   16 A, empty fresh price series, 1 h to the ready time, each needing 1.84 kWh, so both must
+   run in quarter 0: `a` 16 A and `b` 0 A, where 8 / 8 is free. With a priced series the same
+   snapshot gives 8 / 8. Deviation 9 says A2 decided this; A2 only names the doc's unpriced
+   scenario (latest first) and does not say whether the even split gives way to latest-first
+   when a car is forced into an unpriced first quarter.
+
+Question for the user: what does A3 promise for the planned tier?
+
+1. **Keep A3 as written and fix the model.** Make P6 a full progressive fill (several levels,
+   as S2 does for the other tiers) and, for an unpriced first quarter, apply the split among the
+   cars the need forces on. This costs solves in the planning stage, so the A5 cells must be
+   re-timed (10 chargers at 70 A is at 42.7 s of its 120 s tier, 7 at 70 A 4.0 s of 60 s).
+2. **Amend A3 to what is built:** for the planned tier, "the smallest first-quarter allocation
+   is as large as possible, and only when the first quarter is priced"; later quarters and the
+   rest follow the earlier-first tie-break. The two cases above then become documented behaviour.
+3. **Middle:** full evenness when the first quarter is priced (keep deviation 9 for the unpriced
+   one, where latest-first wins and the amended A3 says so).
+
+Also found, and not a question: HiGHS reports "infeasible" for feasible models with
+`presolve = False` (2 of 500 planned-heavy snapshots raised `SolverError` status 2; both solve
+in under a second with `presolve = True`; section 6, drift item 2). This is a code defect and
+goes back to step 3 together with whatever the answer above changes; the A5 cells must be
+re-timed either way.
+
+What exists is committed. On the answer `/build` resumes at step 3.
+
