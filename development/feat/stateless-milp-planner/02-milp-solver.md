@@ -1,6 +1,6 @@
 # MILP solver
 
-<!-- claude-plan step=6 status=active -->
+<!-- claude-plan step=3 status=active -->
 
 
 | Field | Value |
@@ -16,10 +16,10 @@
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
-| 3 | Implement | `/implement` | in `/build` | done (re-run after the step-6 halt) |
-| 4 | Verify | `/verify` | in `/build` | done (re-run after the step-6 halt) |
-| 5 | Test | `/test` | in `/build` | done (re-run after the step-6 halt) |
-| 6 | Concept check | `/concept-check` | in `/build` | halted (re-run: A3 and A6 unmet again) |
+| 3 | Implement | `/implement` | in `/build` | in progress (sent back at step 6, second run) |
+| 4 | Verify | `/verify` | in `/build` | pending (re-run) |
+| 5 | Test | `/test` | in `/build` | pending (re-run) |
+| 6 | Concept check | `/concept-check` | in `/build` | pending (re-run) |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
 | 9 | Pull request | `/create-pr` | with the user | pending |
@@ -122,7 +122,7 @@ dependencies. `STRUCTURE.md` and the tests follow.
 | A3 | **Serves the tiers in order on the leftover.** Charge-now first, then cars planned to charge now, then spare-capacity charging; each tier gets what the tiers above leave, and a lower tier never takes current a higher tier could use. Within a tier, quarter 0 is split as evenly as cost allows. Replaces `feat/ev-charging-core` A2's top-tier-only rule and equal split. |
 | A4 | **Keeps the stale-price rule.** With stale prices there is no plan; smart sessions are served in quarter 0 at spare-capacity priority, with round 1's status and event. |
 | A5 | **Is deterministic and bounded.** The same snapshot gives an equal decision across runs and hash seeds; the solve uses a single thread and a fixed node budget, never a wall-clock limit; every call with a 48-hour price series returns, in total on the development machine, within 10 s for up to 3 chargers, 60 s for up to 7 and 120 s for up to 10 (amended at the step-3 halt, 2026-10-22), measured with a per-phase budget of 35 A for 1–3 chargers, 50 A for 2–5 and 70 A for 3–10 (the worst case defined at the second step-3 halt); a tighter grid still works but carries no time promise; a solve stopped by the node budget returns its best plan with an event saying it is not proven optimal. |
-| A6 | **Raises instead of guessing.** When HiGHS reports an error or finds no solution — in any level solve, including a later level the node budget stops before it finds a point — `decide` raises `SolverError` naming the solver status, never a partial or greedy decision (decided at the second step-3 halt). |
+| A6 | **Raises instead of guessing.** When HiGHS reports an error or finds no solution — in any level solve, including a later level the node budget stops before it finds a point — `decide` raises `SolverError` naming the solver status, never a partial or greedy decision (decided at the second step-3 halt). A solve that reports infeasible, or stops without a point, is retried once with presolve toggled, and only a second failure raises (decided at the second step-6 halt). |
 | A7 | **Removes the greedy planner and declares its dependencies.** The greedy planning and sharing code is gone from the package and its public API; scipy and numpy are runtime dependencies, and nothing else outside the standard library is imported; `STRUCTURE.md` matches. |
 | A8 | **Changes nothing else.** The snapshot and decision dict keys, statelessness, UTC arithmetic and input validation are unchanged. Round 1's scenarios still pass, except where optimality, the leftover rule or the even split gives a different answer; a differential against round 1 of this branch (commit `2646e7c`) over generated snapshots shows every difference is one of those, each kind pinned by a test. |
 
@@ -1474,3 +1474,15 @@ My recommendation is 1 and 1; the decision is yours. On the answer `/build` resu
 then 4 to 6 again. Also found, for step 8 whatever is chosen: the exact price hold switches
 off for the whole planned set when one on/off demand has a fractional current (section 6, A2
 row, 1e-6 EUR).
+
+**Answer (user, 2026-10-22):**
+1. A3 remainder: "1 A at a time to lowest" — A3 stays as written. In every quarter-0 split
+   (S2/S3 for smart-off, charge-now and spare, and P6 for the planned tier), when no car can
+   rise with the others the leftover goes one amp at a time to the lowest car, ties in ranking
+   order, exactly round 1's `share` rule (three 6–16 A cars on 20 A give 7/7/6; minimums
+   2/1/1 on 5 A give 2/2/1). Deviation 16's exit is replaced.
+2. A6: "Retry with presolve off" — a solve that returns status 2, or stops without a point,
+   is retried once with presolve toggled; `SolverError` is raised only if the retry fails too.
+   Deterministic, no wall-clock limit. A6 amended to say so. #78's node-budget miss since step
+   5's first change (d7c8e77) is to be investigated in the same pass.
+`/build` resumes at step 3, then steps 4 to 6 run again and the A5 grid is re-timed.
