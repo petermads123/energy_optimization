@@ -806,14 +806,44 @@ def test_demand_rejects_each_invalid_field_naming_it(
         lambda: Demand("a", L1, Tier.PLANNED, 6, 4, 0, deadline=NOW),
         lambda: Demand("a", L1, Tier.CHARGE_NOW, 6, 0, 16),
         lambda: Demand("a", L1, Tier.CHARGE_NOW, 6, 16, 16, deadline=NOW),
-        lambda: Demand("a", L1, Tier.CHARGE_NOW, 6.5, 16.0, 16.0),
+        lambda: Demand("a", L1, Tier.CHARGE_NOW, 7.5, 7.5, 16.0),
     ],
-    ids=["all-zero", "max-below-min", "max-zero", "deadline-ignored", "fractional-min"],
+    ids=[
+        "all-zero",
+        "max-below-min",
+        "max-zero",
+        "deadline-ignored",
+        "fractional-on-off",
+    ],
 )
 def test_demand_accepts_zero_and_a_maximum_below_the_minimum(
     demand: Callable[[], Demand],
 ) -> None:
     assert demand().charger_id == "a"
+
+
+@pytest.mark.parametrize(
+    ("low", "high"),
+    [(6.5, 16.0), (7.5, 4.0), (0.5, 16.0), (6.000001, 16.0)],
+    ids=["above", "inverted", "below-one", "just-fractional"],
+)
+@pytest.mark.parametrize("tier", list(Tier))
+def test_demand_rejects_a_fractional_minimum_on_an_adjustable_charger(
+    tier: Tier, low: float, high: float
+) -> None:
+    # An adjustable charger runs in whole amps, so 7.5 A as a minimum would really mean
+    # 8 A while the fit tests count it at 7.5 A and the solve could not be satisfied.
+    deadline = NOW if tier is Tier.PLANNED else None
+
+    with pytest.raises(ValueError, match=r"^min_current.*whole"):
+        Demand("a", L1, tier, low, high, 16.0, deadline=deadline)
+
+
+def test_demand_accepts_a_whole_minimum_given_as_a_float_and_an_equal_fraction() -> (
+    None
+):
+    assert Demand("a", L1, Tier.CHARGE_NOW, 6.0, 16.0, 16.0).min_current == 6.0
+    assert Demand("a", L1, Tier.CHARGE_NOW, 7.5, 7.5, 7.5).min_current == 7.5
 
 
 def test_demand_is_frozen() -> None:
@@ -1077,8 +1107,11 @@ def _random_demands(rng: random.Random, now: datetime) -> list[Demand]:
     demands: list[Demand] = []
     for index in range(rng.randint(1, 4)):
         tier = rng.choice(list(Tier))
-        low = rng.choice([0, 1, 6, 6, 7.5, 10])
         kind = rng.choice(["adjustable", "adjustable", "on-off", "inverted"])
+        # A fractional minimum is only valid as an on/off current.
+        low = rng.choice(
+            [0, 1, 6, 6, 7.5, 10] if kind == "on-off" else [0, 1, 6, 6, 10]
+        )
         high = {
             "adjustable": rng.choice([low, 8, 16, 16]),
             "on-off": low,
@@ -1794,3 +1827,120 @@ def test_optimize_the_fill_is_robust_to_solver_integrality_noise(
 
     assert clean.allocations == {"a": 8.0, "b": 7.0}
     assert outcome.allocations == clean.allocations
+
+
+def _only_probes(
+    monkeypatch: pytest.MonkeyPatch,
+    stub: Callable[[Callable[..., object]], Callable[..., object]],
+) -> list[bool]:
+    """Replace `milp` by `stub(real)` for probe solves only; return the `keep` flags seen."""
+    seen: list[bool] = []
+    real_solve = optimize_module._Problem._solve
+    real_milp = optimize_module.milp
+
+    def solve(
+        self: optimize_module._Problem, objective: object, keep: bool = True
+    ) -> object:
+        seen.append(keep)
+        if keep:
+            return real_solve(self, objective, keep)  # type: ignore[arg-type]  # a vector
+        monkeypatch.setattr(optimize_module, "milp", stub(real_milp))
+        try:
+            return real_solve(self, objective, keep)  # type: ignore[arg-type]  # a vector
+        finally:
+            monkeypatch.setattr(optimize_module, "milp", real_milp)
+
+    monkeypatch.setattr(optimize_module._Problem, "_solve", solve)
+    return seen
+
+
+def _probe_case() -> Outcome:
+    # Three cars that cannot all rise at once on 20 A: the fill must probe each car.
+    cars = [planned(name, need=1.84) for name in "abc"]
+    room = caps(20, 20, 20)
+    return run(cars, priced(0.2, 0.2, 0.2, 0.2), room, room)
+
+
+def test_optimize_a_probe_failure_raises_solver_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing(_real: Callable[..., object]) -> Callable[..., object]:
+        def milp(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                status=2, message="infeasible", x=None, mip_node_count=0
+            )
+
+        return milp
+
+    seen = _only_probes(monkeypatch, failing)
+
+    with pytest.raises(SolverError) as caught:
+        _probe_case()
+
+    assert False in seen  # the failure came from a probe, not a level
+    assert caught.value.status == 2
+
+
+def test_optimize_a_probe_stopped_at_the_node_budget_is_not_proven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def stopped(real: Callable[..., object]) -> Callable[..., object]:
+        def milp(*args: object, **kwargs: object) -> SimpleNamespace:
+            result = real(*args, **kwargs)
+            return SimpleNamespace(
+                status=1,
+                message="Iteration or time limit reached",
+                x=result.x,  # type: ignore[attr-defined]  # scipy's OptimizeResult
+                mip_node_count=NODE_LIMIT,
+            )
+
+        return milp
+
+    seen = _only_probes(monkeypatch, stopped)
+
+    outcome = _probe_case()
+
+    assert False in seen
+    assert outcome.proven is False
+    assert outcome.allocations == {"a": 8.0, "b": 6.0, "c": 6.0}
+
+
+def test_optimize_the_fill_issues_the_same_solver_calls_every_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = optimize_module.milp
+    calls: list[list[tuple[int, tuple[int, ...], tuple[float, ...]]]] = [[]]
+
+    def spy(*args: object, **kwargs: object) -> object:
+        c = np.asarray(kwargs["c"])
+        used = np.flatnonzero(c)
+        calls[-1].append(
+            (len(c), tuple(int(i) for i in used), tuple(float(v) for v in c[used]))
+        )
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(optimize_module, "milp", spy)
+    cars = [planned(name, need=1.84) for name in "abc"]
+    wide = [
+        planned("a", need=1.84, high=8),
+        planned("b", need=1.84),
+        planned("c", need=1.84),
+    ]
+
+    outcomes = []
+    for demands, room in ((cars, 20), (wide, 30)):
+        for _ in range(2):
+            calls.append([])
+            outcomes.append(
+                run(
+                    demands,
+                    priced(0.2, 0.2, 0.2, 0.2),
+                    caps(room, room, room),
+                    caps(room, room, room),
+                )
+            )
+
+    assert calls[1] == calls[2] and calls[1]
+    assert calls[3] == calls[4] and calls[3]
+    assert outcomes[0] == outcomes[1]
+    assert outcomes[2] == outcomes[3]

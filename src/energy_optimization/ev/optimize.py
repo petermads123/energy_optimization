@@ -89,7 +89,8 @@ class Demand:
         tier: Which precedence stage it belongs to.
         min_current: Lowest non-zero current in A; equal to `max_current` means
             all-or-nothing (on/off) at exactly this current, in every tier, even when
-            `now_max_current` is higher.
+            `now_max_current` is higher. Otherwise the charger is adjustable in whole
+            amps, so the minimum must be a whole number.
         max_current: Highest current in A in quarters after the first. Below
             `min_current` means off in those quarters.
         now_max_current: Highest current in A in the first quarter (user limit,
@@ -98,8 +99,9 @@ class Demand:
         deadline: The moment the energy is needed by, aware, `PLANNED` only.
 
     Raises:
-        ValueError: If a field is invalid (including a `tier` that is not a `Tier`);
-            the message starts with the field name.
+        ValueError: If a field is invalid (including a `tier` that is not a `Tier`,
+            and a fractional `min_current` that differs from `max_current`); the
+            message starts with the field name.
     """
 
     charger_id: str
@@ -119,6 +121,15 @@ class Demand:
             raise _bad("phases", "must not be empty")
         for name in ("min_current", "max_current", "now_max_current", "need_kwh"):
             _check_current(name, getattr(self, name))
+        if (
+            self.min_current != self.max_current
+            and not float(self.min_current).is_integer()
+        ):
+            raise _bad(
+                "min_current",
+                "must be a whole number of amps unless equal to max_current "
+                f"(an on/off current), got {self.min_current}",
+            )
         if self.deadline is not None and self.deadline.utcoffset() is None:
             raise _bad("deadline", f"must be timezone-aware, got {self.deadline}")
         if self.tier is Tier.PLANNED and self.deadline is None:
@@ -132,7 +143,8 @@ class Outcome:
     Attributes:
         allocations: The quarter-0 current of every demand, by charger id.
         plans: A plan for every `PLANNED` demand, by charger id.
-        proven: False when any level stopped at the node budget.
+        proven: False when any solve (a level, or a probe that decides a level) stopped
+            at the node budget.
     """
 
     allocations: dict[str, float]
@@ -856,7 +868,7 @@ def optimize(
 
     Returns:
         The first-quarter current of every demand, a plan for every `PLANNED` demand
-        and whether every level was solved to proven optimality.
+        and whether every solve (levels and probes) was proven optimal.
 
     With no demands it returns `Outcome({}, {}, True)` at once, before any of the
     checks below.

@@ -3463,8 +3463,8 @@ def test_a_real_node_budget_stop_returns_a_plan_within_every_limit(
     monkeypatch.setattr(optimize_module, "NODE_LIMIT", 1)
     not_proven = 0
     raised = 0
-    for seed in range(4, 7):
-        snapshot = benchmark_snapshot(seed, 4, 20.0)
+    for count, budget, seed in ((3, 16.0, 4), (3, 16.0, 6), (4, 20.0, 6)):
+        snapshot = benchmark_snapshot(seed, count, budget)
         try:
             result = decide(snapshot)
         except SolverError as error:
@@ -3936,3 +3936,77 @@ def test_decide_solves_snapshots_highs_called_infeasible_without_presolve(
 
     assert len(result.chargers) == len(snapshot.chargers)
     assert all(c.allocation >= 0.0 for c in result.chargers)
+
+
+# --- step 5 (re-run after the step-6 halt): the planned tier's even first quarter -----------
+
+
+def test_decide_planned_cars_tied_at_a_user_limit_leave_the_rest_to_the_other() -> None:
+    # `a` is limited to 10 A by its user, so it reaches its ceiling in the first round of
+    # the fill; `b` carries on alone and takes what the budget leaves.
+    sessions = [sess("a", need=40.0, user_current_limit=10), sess("b", need=40.0)]
+
+    result = decide(
+        snap(
+            [adj("a"), adj("b")],
+            sessions=sessions,
+            prices=hourly([0.2] * 12),
+            budget=22.0,
+            threshold=60.0,
+        )
+    )
+
+    first, second = by_id(result)["a"], by_id(result)["b"]
+    assert (first.priority, first.allocation) == (2, 10.0)
+    assert (second.priority, second.allocation) == (2, 12.0)
+    assert first.reason.code is second.reason.code is ReasonCode.IN_PLAN
+    assert result.status is Status.LIMITED_BY_BUDGET
+
+
+def test_decide_two_cars_forced_into_an_unpriced_current_quarter_share_it_in_plan() -> (
+    None
+):
+    # The prices start with the next quarter, so the current one is unpriced. One hour to
+    # the ready time leaves 48 A-quarters beyond it against 64 needed: 16 A are forced
+    # into the current quarter, and the two cars share them.
+    sessions = [
+        sess("a", need=1.84, ready=time(23, 0)),
+        sess("b", need=1.84, ready=time(23, 0)),
+    ]
+    prices = hourly([0.2] * 6, start=NOW + QUARTER, updated_at=NOW)
+
+    result = decide(
+        snap(
+            [adj("a"), adj("b")],
+            sessions=sessions,
+            prices=prices,
+            budget=16.0,
+            threshold=60.0,
+        )
+    )
+
+    for charger in result.chargers:
+        assert charger.allocation == 8.0
+        assert charger.reason.code is ReasonCode.IN_PLAN
+        assert charger.plan[0].price is None
+        assert charger.plan[0].current == 8.0
+
+
+def test_the_output_does_not_depend_on_the_hash_seed_through_the_planned_fill() -> None:
+    sessions = [sess(name, need=40.0, ready=time(8, 0)) for name in "abc"]
+    snapshot = snap(
+        [adj("a", L1, 6, 8), adj("b"), adj("c")],
+        sessions=sessions,
+        prices=hourly([0.2, 0.2, 0.3, 0.1] * 3),
+        budget=30.0,
+        threshold=60.0,
+    )
+    payload = json.dumps(snapshot_to_dict(snapshot))
+
+    outputs = {run_with_hash_seed(seed, payload) for seed in ("0", "1", "12345")}
+
+    assert len(outputs) == 1
+    first_quarter = {
+        c["charger_id"]: c["allocation"] for c in json.loads(outputs.pop())["chargers"]
+    }
+    assert first_quarter == {"a": 8.0, "b": 11.0, "c": 11.0}
