@@ -134,46 +134,314 @@ None.
 
 ## 2. Plan
 
-> Written in step 2, accepted by the user before step 3 starts. Concrete enough that
-> step 3 is transcription, not invention.
+Accepted by the user in advance, 2026-10-22: "when the plan and plan critique is done just
+start the implementation straight away". Step 3 opens once the `plan-critic` findings below
+are applied.
+
+### Survey
+
+- `decide.py` classifies every charger and serves them in this order:
+  - reservations (`allocation.reserved_current`);
+  - smart-off chargers through `allocation.share`;
+  - tier-2/4 candidates planned by `planning.plan_sessions` against `plan_cap` (the budget
+    minus reservations and smart-off, the same in every quarter);
+  - then **only the highest occupied tier** shares quarter 0 through `share` against `cap`
+    (the budget ∩ the phase guard or fallback, minus reservations and smart-off).
+- In round 1 a tier-2 charger's quarter-0 allocation is its `share`, up to `eff_max`. It is
+  not the plan's quarter-0 current.
+- Charge-now (tier 1) and spare-capacity (tier 3) sessions have no plan.
+- `planning.py`:
+  - `remaining_need_kwh`, `energy_per_quarter_kwh`, `NeedSource` and `SessionPlan` are not
+    greedy and stay.
+  - `PlanRequest`, `plan_sessions` and the private block selection are greedy and go.
+- `allocation.py`: `Claim` and `share` are greedy and go. `measurements_fresh`,
+  `reserved_current`, `present_draw` and `phase_capacity` stay.
+- `quarters.py`: everything is reused. `quarter_starts` gives the horizon and
+  `quarter_prices` the UTC-keyed prices.
+- `codec.py`: untouched. A new `EventKind` member encodes by value.
+- `pyproject.toml`: `dependencies = []`. Mypy already has `ignore_missing_imports = true`,
+  so scipy needs no stubs.
+- Spike (scratch venv, scipy 1.18.1):
+  - `scipy.optimize.milp` accepts `node_limit`, `mip_rel_gap`, `presolve` and
+    `time_limit`.
+  - Any other key, `threads` included, is passed to HiGHS verbatim with a `RuntimeWarning`
+    ("Unrecognized options detected"). So `threads=1` is reachable through the public API.
+  - There is no `random_seed` key; HiGHS's default seed is fixed.
 
 ### Approach
 
-One paragraph on the chosen approach, and one on what was rejected and why.
+**Chosen: one new module, `optimize.py`, holding one model with a lexicographic objective.**
+`decide` keeps everything before the solve and after it. In between it hands one list of
+demands to `optimize`, one per charger the solver may give current to, and reads back
+allocations and plans.
+
+The concept's precedence is a strict order of eleven preferences:
+1. smart-off amps;
+2. smart-off even split;
+3. charge-now amps;
+4. charge-now even split;
+5. shortfall;
+6. unpriced energy;
+7. energy above the cap;
+8. short runs;
+9. price;
+10. planned-tier even split;
+11. tie-break.
+
+The spare-capacity tier's amps, even split and ranking come last.
+
+That order is solved **lexicographically**: each level is minimised with every earlier
+level held at its optimum. A single weighted sum would have to span the whole order with
+weight gaps large enough that each level dominates everything after it. That needs
+coefficients around 10²⁰ apart, which HiGHS's 10⁻⁷ tolerances and 10⁻⁴ default gap cannot
+honour.
+
+The quarter-0-only tiers (smart-off, charge-now, spare) touch only their own quarter-0
+variables. So their levels are solved on a small quarter-0 model before and after the
+planning model, with the results fixed between stages. This is the same lexicographic
+optimum, found more cheaply.
+
+**Rejected:**
+- *Weighted single solve.* Numerically unsound, for the reason above. It would also make
+  A2's "optimal for the stated precedence" unprovable.
+- *Keeping `share` for quarter 0 and using the MILP only for planning.* The user chose
+  "planning plus current-quarter allocation" and the fair-then-cost split, and A7 removes
+  the greedy sharing.
+- *Using `highspy` directly for `threads` and `random_seed`.* That adds a third dependency
+  the concept did not agree, when the public `milp` already reaches both.
 
 ### Modules
 
 | Path | New or changed | Purpose |
 |---|---|---|
+| `src/energy_optimization/ev/optimize.py` | new | The MILP: demands in, allocations and plans out; lexicographic levels; node budget; `SolverError` (A1–A3, A5, A6) |
+| `src/energy_optimization/ev/decide.py` | changed | Builds demands from the classification, calls `optimize`, maps the outcome to priorities, reasons, status and events; leftover rule (A3, A4, A8) |
+| `src/energy_optimization/ev/planning.py` | changed | Greedy planner removed; keeps `NeedSource`, `remaining_need_kwh`, `energy_per_quarter_kwh`, `SessionPlan` (A7) |
+| `src/energy_optimization/ev/allocation.py` | changed | `Claim` and `share` removed; the rest unchanged (A7) |
+| `src/energy_optimization/ev/result.py` | changed | `EventKind.PLAN_NOT_PROVEN_OPTIMAL` (A5) |
+| `src/energy_optimization/ev/__init__.py` | changed | Re-exports `SolverError` (A6) |
+| `pyproject.toml` | changed | `dependencies = ["numpy>=2.2,<3", "scipy>=1.15,<2"]` (A7) |
+| `tests/test_ev_optimize.py` | new | The model against brute force, every limit, levels, budget, failure (A1, A2, A5, A6) |
+| `tests/test_ev_decide.py`, `test_ev_planning.py`, `test_ev_allocation.py`, `test_ev_result.py` | changed | Greedy and `share` tests removed with their code; round-1 scenarios kept, with every changed expectation listed in section 5 with its A8 kind; the stdlib AST scan and 100 ms test amended (A7, A5, A8) |
+| `STRUCTURE.md`, `README.md` | changed | New module, removed names, the dependency note ("standard library only" becomes "standard library plus numpy and scipy"); README install line if it says stdlib only (A7) |
 
 ### Public API
 
-> Every public class and function, with its full signature as it will be written.
-> `Covers` links back to the acceptance criteria above.
+New, in `optimize.py`:
 
 | Signature | Module | Purpose | Covers |
 |---|---|---|---|
+| `class SolverError(RuntimeError)`; `__init__(self, status: int, message: str) -> None`; attributes `status`, `message`; `str(err) == f"HiGHS status {status}: {message}"` | `optimize` | The solver failed; carries scipy's `milp` status and message | A6 |
+| `NODE_LIMIT: int` | `optimize` | Branch-and-bound nodes allowed per level solve. Fixed by step 3's benchmark as the largest power-of-two multiple of 1000 that keeps the A5 worst case under 10 s, with the measurement recorded in section 3 | A5 |
+| `class Tier(IntEnum)`: `SMART_OFF = 0`, `CHARGE_NOW = 1`, `PLANNED = 2`, `SPARE = 3` | `optimize` | Which precedence stage a demand belongs to | A3 |
+| `Demand(charger_id: str, phases: frozenset[Phase], tier: Tier, min_current: float, max_current: float, now_max_current: float, need_kwh: float = 0.0, deadline: datetime \| None = None)` | `optimize` | One charger asking for current, given in ranking order. `min_current == max_current` is all-or-nothing (on/off). `now_max_current` caps quarter 0 (user limit, fallback), `max_current` the later quarters. Quarter-0-only tiers ignore `need_kwh`, `deadline` and `max_current`. `PLANNED` requires an aware `deadline`. Validates itself in `__post_init__`, raising `ValueError` naming the field | A1, A3 |
+| `Outcome(allocations: dict[str, float], plans: dict[str, SessionPlan], proven: bool)` | `optimize` | Quarter-0 current for every demand; a plan for every `PLANNED` demand; `proven` False when any level stopped at the node budget | A1, A5 |
+| `optimize(demands: Sequence[Demand], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], now_capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str) -> Outcome` | `optimize` | Solve the lexicographic model below. `capacity` holds per phase in quarters 1 onward, before `SMART_OFF` demands, which keep their quarter-0 current there. `now_capacity` holds in quarter 0. Prices are keyed by UTC quarter start, and a missing quarter is unpriced. Raises `SolverError` (A6), and `ValueError` for a naive `now` or an unknown charger id repeated | A1–A3, A5, A6 |
+| `main() -> None` | `optimize` | Showcase: two planned cars on a shared phase, a charge-now car taking quarter 0 first, then a spare-capacity car on the leftover | — |
+
+Added to `result.py`: `EventKind.PLAN_NOT_PROVEN_OPTIMAL = "plan_not_proven_optimal"`
+(A5). Added to `ev.__all__`: `SolverError`.
+
+Removed: `PlanRequest` and `plan_sessions` from `planning.py`, and `Claim` and `share` from
+`allocation.py` (A7).
+
+#### The model (what `optimize` solves; step 3 transcribes it)
+
+Notation:
+- Let `Q` be the UTC quarter starts from `floor_to_quarter(now)`.
+- For a `PLANNED` demand `d`, the window `W_d` is the quarters before its `deadline`
+  (`quarter_starts(now, deadline)`). For every other tier, `W_d = {0}`.
+- `e_d = voltage · |phases_d| / 4000` is kWh per amp-quarter.
+- `hi_{d,0} = now_max_current` and `hi_{d,t≥1} = max_current`. Where `hi_{d,t} < min_current`
+  the charger is off in that quarter.
+
+Variables for every `d` and every `t ∈ W_d`:
+- `x_{d,t} ∈ {0,1}`.
+- `i_{d,t}`: an integer when `min_current < max_current`, otherwise fixed to
+  `min_current · x_{d,t}`.
+- `PLANNED` demands also get a shortfall `s_d ≥ 0` and a start `y_{d,t} ∈ [0,1]`.
+- `z_k ≥ 0` is one even-split variable per quarter-0 tier `k`.
+
+Constraints:
+1. `min_current · x ≤ i ≤ hi · x`.
+2. Per phase `p` and quarter `t ≥ 1`: the sum of `i_{d,t}` over `PLANNED` demands on `p`,
+   plus the sum of `i_{d,0}` over `SMART_OFF` demands on `p`, is at most `capacity[p]`.
+3. Per phase `p` in quarter 0: the sum of `i_{d,0}` over every demand on `p` is at most
+   `now_capacity[p]`.
+4. For each `PLANNED` demand: `Σ_t e_d·i_{d,t} + s_d ≥ need_kwh`, and
+   `Σ_t e_d·i_{d,t} ≤ need_kwh + e_d·max_current`, so negative prices never overfill a car
+   by more than one quarter.
+5. Starts and minimum block: `y_{d,t} ≥ x_{d,t} − x_{d,t−1}` (with `x_{d,−1} = 0`), and
+   `x_{d,t+k} + w_{d,t} ≥ y_{d,t}` for `k = 1..L−1` while `t+k ∈ W_d`, with `w_{d,t} ≥ 0`.
+   The block is soft. A run that the deadline cuts short is not penalised.
+6. Even split within tier `k`: `z_k ≤ i_{d,0} + hi_{d,0}·(1 − x_{d,0})` for every `d` in
+   that tier.
+
+Levels, each minimised, with every earlier level held at its optimum. A level with no
+non-zero coefficient is skipped. Levels 1–4 run on the quarter-0 model for `SMART_OFF` and
+`CHARGE_NOW`. Levels 5–11 run on the planning model, with the earlier results fixed into
+`now_capacity` and `capacity`. Levels 12–14 run on the quarter-0 model for `SPARE`, on what
+is left.
+
+| # | Minimise | Meaning |
+|---|---|---|
+| 1 | `−Σ i_{d,0}`, `SMART_OFF` | Serve smart-off first |
+| 2 | `−z_0` | Even split among smart-off |
+| 3 | `−Σ i_{d,0}`, `CHARGE_NOW` | Then charge-now |
+| 4 | `−z_1` | Even split among charge-now |
+| 5 | `Σ s_d` | Meet each need |
+| 6 | `Σ e_d·i_{d,t}` over unpriced `t` | Avoid unpriced quarters |
+| 7 | `Σ e_d·i_{d,t}` over `t` priced above `price_cap` | Avoid the cap |
+| 8 | `Σ w_{d,t}` | Avoid runs shorter than the minimum block |
+| 9 | `Σ π_t·e_d·i_{d,t}` over priced `t` | Lowest price |
+| 10 | `−z_2` | Even split among planned cars in quarter 0 |
+| 11 | `Σ τ_{d,t}·i_{d,t}`, with `τ = t·(n+1) + r_d` for priced `t` and `τ = (T−1−t)·(n+1) + r_d` for unpriced `t`; `r_d` is the demand's index and `n` the number of demands | Earlier priced quarters first; unpriced quarters latest first, as in round 1; remainder in ranking order |
+| 12 | `−Σ i_{d,0}`, `SPARE` | Spare capacity, last |
+| 13 | `−z_3` | Even split among spare |
+| 14 | `Σ r_d·i_{d,0}` over the quarter-0 tiers, applied per stage after its split | Remainder in ranking order |
+
+Level 14 is the ranking tie-break of each quarter-0 stage. It runs right after that
+stage's split level, so the stages above read 1, 2, 14; 3, 4, 14; 12, 13, 14.
+
+Holding a level: after level `k` returns a value `v`, its row becomes `objective ≤ v + tol`
+with `tol = 1e-6·max(1, |v|)`.
+
+Every solve:
+- Options are `{"node_limit": NODE_LIMIT, "mip_rel_gap": 0.0, "presolve": True, "threads": 1}`.
+- The `threads` warning is suppressed in a `warnings.catch_warnings()` filtered to that
+  message only. There is never a `time_limit`.
+- `res.status == 0` is proven.
+- `res.status == 1` with `res.x` present is the best found, so `proven = False`.
+- Any other status, or `x` missing, raises `SolverError(res.status, res.message)`.
+- Reading back, currents are rounded to the nearest whole amp for integer variables and
+  taken as exact for fixed ones.
+- `SessionPlan` is built from the solution:
+  - quarters with `i > 0`, starts converted to `timezone`, each with its price (None when
+    unpriced) and its current;
+  - `planned_kwh = Σ e·i`;
+  - `reachable = s_d ≤ 1e-6`;
+  - `price_cap_exceeded` = any planned quarter priced above the cap;
+  - `uses_unpriced` = any planned quarter unpriced.
 
 ### Implementation guide
 
-Ordered. Each entry small enough to finish and check.
-
-1.
-2.
+1. `pyproject.toml`: add the runtime dependencies, then
+   `.venv/bin/pip install -e ".[dev]"`. Check `python -c "import scipy"`.
+2. `result.py`: add `EventKind.PLAN_NOT_PROVEN_OPTIMAL` and update its docstring.
+3. `optimize.py`:
+   - `SolverError`, `NODE_LIMIT` (provisional 4000, fixed at item 8), `Tier`, `Demand`
+     with validation, `Outcome`.
+   - A private model builder, one per stage, using `scipy.sparse` for the constraint
+     matrix.
+   - A private lexicographic driver: a list of objective vectors, held rows appended as it
+     goes.
+   - The read-back into `Outcome`, then `optimize`, then `main`.
+   - Phases are iterated in `Phase` order and demands in the order given, so the matrix is
+     built identically every call (A5).
+4. `decide.py`, in place of the `share` / `plan_sessions` / tier block:
+   - Build demands in ranking order (`_rank_key`):
+     - `SMART_OFF` from smart-off chargers that can run;
+     - `CHARGE_NOW` from priority-1 items that can run;
+     - `PLANNED` from priority-None smart items with need > 0 and a deadline after now,
+       even when they cannot run in quarter 0 (`now_max_current = eff_max`, which may be
+       below the minimum, so quarter 0 is off);
+     - `SPARE` from priority-3 items that can run.
+   - `capacity` is `plan_cap` after reservations only (smart-off is now inside the model).
+     `now_capacity` is `cap` after reservations.
+   - Call `optimize` with `quarter_prices(snapshot.prices)` only when prices are fresh. With
+     stale prices there are no `PLANNED` demands, because classification already makes
+     those items priority 3 (A4).
+   - Allocation is the outcome's quarter-0 current. A `PLANNED` item is priority 2 when its
+     plan's first quarter is the current one with current > 0, otherwise priority 4.
+     `starved` is as in round 1.
+   - Final codes:
+     - `BELOW_MINIMUM` as now;
+     - `WAITING_FOR_CAPACITY` for starved items;
+     - `PLANNED_LATER` for priority 4;
+     - for a tier-1 or tier-3 item at 0 A, `WAITING_FOR_HIGHER_PRIORITY` if a
+       higher-precedence item (a smart-off charger or a lower tier number) on one of its
+       phases got current, otherwise `WAITING_FOR_CAPACITY`.
+   - `_status`:
+     - `active` is every can-run item of tiers 1–3;
+     - "short" means the allocation is below `eff_max` **and** quarter-0 room left on one of
+       its phases is under `max(1, min_current)` A. A planned car the plan deliberately runs
+       below its maximum is not "limited".
+     - The rest is unchanged.
+   - `_events`: add `PLAN_NOT_PROVEN_OPTIMAL` (no charger id) when `outcome.proven` is
+     False, after the existing events.
+   - Delete `_claim`, and `_plan_requests` if nothing still uses it.
+   - Update the module docstring.
+5. `planning.py` and `allocation.py`: delete the greedy code, its private helpers and its
+   showcase parts. Rewrite both `main()`s for what remains.
+6. `__init__.py`: export `SolverError`. Update its docstring.
+7. `tests/`:
+   - Delete the tests of the removed names.
+   - Make the restored suite pass.
+   - Where a round-1 expectation changes, change it and list it in section 3 with its kind:
+     optimality (including "quarter 0 is the plan's current"), leftover or even split.
+   - The stdlib AST scan allows exactly `numpy` and `scipy` besides the standard library.
+   - The 100 ms test becomes the A5 10 s test.
+8. Benchmark the A5 worst case: 10 chargers on mixed phases, a 48-hour series, a tight
+   budget, generated deterministically. Fix `NODE_LIMIT` and record the runs in section 3.
+9. `STRUCTURE.md` and `README.md`. Run the four gates and every showcase.
 
 ### Test intents
 
-> High-level: what a test must prove, not how it is written. Step 5 turns each of these
-> into concrete cases, including the edge cases.
-
 | # | Must prove | Covers |
 |---|---|---|
-| T1 | | |
+| T1 | `optimize` never breaks a limit. The property test over generated demands and capacities checks every quarter: 0 or min..hi in whole amps, on/off exact, per-phase `capacity` (with smart-off) and `now_capacity`, nothing at or after a deadline, the allocation equal to the plan's first-quarter current. The same invariants hold through `decide` on generated snapshots, computed independently of the module | A1 |
+| T2 | Brute force: on small instances (≤ 2 demands, ≤ 6 quarters, ≤ 3 current levels) the lexicographic tuple of every level equals an exhaustive enumeration's best tuple | A2 |
+| T3 | Hand-checked plans through `decide`: the cheapest quarters, the cap broken only for the ready time (with its event), an unreachable target (event with reachable kWh), unpriced quarters used only when needed and latest first, minimum blocks honoured unless the deadline cuts them | A2 |
+| T4 | The tiers on the leftover: smart-off, then charge-now, then planned, then spare. A lower tier gets current only from what is left, and never at a higher tier's cost (a case per pair of tiers). Within a tier the split is even where cost is indifferent, with the remainder going in ranking order. Reason codes `WAITING_FOR_HIGHER_PRIORITY` and `WAITING_FOR_CAPACITY` behave as defined above | A3 |
+| T5 | Stale prices: no plans, smart sessions served at priority 3 on quarter 0, round-1 status and event | A4 |
+| T6 | Determinism: equal decisions across repeated calls, `PYTHONHASHSEED` values and demand order permutations that keep the ranking. The A5 worst case returns within 10 s. A forced low node budget (monkeypatched `NODE_LIMIT`) gives a plan within every limit, `proven = False` and the `PLAN_NOT_PROVEN_OPTIMAL` event. No `time_limit` is ever passed (the solver call is spied) | A5 |
+| T7 | `SolverError`: a monkeypatched `milp` returning each failure status (2, 3, 4, and 1 without `x`) raises `SolverError` with that status and message from `decide`. The `str` form, and the re-export from `energy_optimization.ev` | A6 |
+| T8 | The removed names are gone (`plan_sessions`, `PlanRequest`, `share`, `Claim`). The AST scan finds only the standard library, numpy and scipy. `pyproject.toml` declares both | A7 |
+| T9 | Unchanged surface: the codec key sets, statelessness, UTC (the DST finish tests) and validation tests all still pass. The differential against `2646e7c` over generated snapshots puts every difference into optimality, leftover or even split, and each kind has a named pinning test (step 6 runs the differential; step 5 writes the pins) | A8 |
+
+**Coverage check.**
+- A1: `optimize`, `Demand`, `Outcome`; T1.
+- A2: `optimize`; T2 and T3.
+- A3: `Tier`, `Demand`, `optimize`; T4.
+- A4: `decide` (no new API); T5.
+- A5: `NODE_LIMIT`, `Outcome.proven`, `PLAN_NOT_PROVEN_OPTIMAL`; T6.
+- A6: `SolverError`; T7.
+- A7: the removals and dependencies; T8.
+- A8: the unchanged surface; T9.
+
+Every public entry has a criterion behind it, and every criterion has an entry and a test.
 
 ### Risks
 
-What could make this harder than it looks, and what the build should do if it does —
-including whether it should halt.
+1. **The 10 s worst case is not reachable with any node budget that still gives sensible
+   plans.** The cause would be the planning model, at 10 chargers × 192 quarters, with up
+   to 7 levels each spending its node budget. The build may then:
+   - lower `NODE_LIMIT`;
+   - skip empty levels;
+   - tighten the formulation, for example with the aggregated block constraint
+     `(L−1)·y ≤ Σ_k x + (L−1)·w`.
+
+   If the worst case still exceeds 10 s, **halt**: A5 would need amending. Do not add a
+   wall-clock limit (A5 forbids it).
+2. **Determinism.** If repeated runs differ even with `threads=1`, **halt**. That would be a
+   HiGHS property A5 cannot meet as written. Do not paper over it with a time limit or a
+   sort.
+3. **Rounding.** HiGHS returns integers as floats such as `15.9999999`. Round integer
+   variables, then re-check the limits in the read-back. A violated limit after rounding is
+   a bug to fix, not to clip.
+4. **Brute force disagrees on a tie.** The tie-break level makes the optimum unique by
+   construction. A tie the enumeration finds with a different plan means the levels are
+   incomplete. Fix the tie-break and record it in section 3. That is not a concept change,
+   since level 11 is the concept's "earlier-first".
+5. **Round-1 tests whose values change.** The categories are fixed by A8. A changed
+   expectation that fits none of optimality, leftover or even split is a halt, not an
+   edit.
+6. **Hypothesis property tests get slow with a solver in the loop.** Lower `max_examples`
+   on the `decide`-level properties to keep the suite under a minute, and record the count
+   in section 5. Do not drop a property.
+7. **Charge-now cars are not reserved in later quarters.** This is round-1 behaviour, and
+   the model keeps it: tier 1 lives only in quarter 0. It is listed in section 3 as kept,
+   not changed.
 
 ---
 
