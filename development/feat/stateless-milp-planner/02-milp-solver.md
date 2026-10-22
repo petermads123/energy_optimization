@@ -63,7 +63,7 @@ What is already on the branch that this round must not break:
 Agreed with the user on 2026-10-22 ("go ahead"), after these four decisions: lower tiers
 use what higher tiers leave; within a tier the current quarter is split evenly where cost
 allows; a solve stopped by the node budget returns its best plan with an event; every call
-returns within 10 s in total.
+returns within 10 s in total (amended at the step-3 halt: 10 s up to 3 chargers, 60 s up to 7, 120 s up to 10).
 
 ### What this is
 
@@ -121,7 +121,7 @@ dependencies. `STRUCTURE.md` and the tests follow.
 | A2 | **Is optimal for the stated precedence** — need, unpriced, price cap, minimum block, price, even split, earlier-first. On small generated instances every proven-optimal plan has the objective of a brute-force enumeration; the doc scenarios for cheapest quarters, price cap, unreachable target and unpriced quarters give the hand-checked plans; a shortfall gives the "target unreachable" event with the reachable kWh. |
 | A3 | **Serves the tiers in order on the leftover.** Charge-now first, then cars planned to charge now, then spare-capacity charging; each tier gets what the tiers above leave, and a lower tier never takes current a higher tier could use. Within a tier, quarter 0 is split as evenly as cost allows. Replaces `feat/ev-charging-core` A2's top-tier-only rule and equal split. |
 | A4 | **Keeps the stale-price rule.** With stale prices there is no plan; smart sessions are served in quarter 0 at spare-capacity priority, with round 1's status and event. |
-| A5 | **Is deterministic and bounded.** The same snapshot gives an equal decision across runs and hash seeds; the solve uses a single thread and a fixed node budget, never a wall-clock limit; every call with up to 10 chargers and a 48-hour price series returns within 10 s in total on the development machine; a solve stopped by the node budget returns its best plan with an event saying it is not proven optimal. |
+| A5 | **Is deterministic and bounded.** The same snapshot gives an equal decision across runs and hash seeds; the solve uses a single thread and a fixed node budget, never a wall-clock limit; every call with a 48-hour price series returns, in total on the development machine, within 10 s for up to 3 chargers, 60 s for up to 7 and 120 s for up to 10 (amended at the step-3 halt, 2026-10-22); a solve stopped by the node budget returns its best plan with an event saying it is not proven optimal. |
 | A6 | **Raises instead of guessing.** When HiGHS reports an error or finds no solution, `decide` raises `SolverError` naming the solver status, never a partial or greedy decision. |
 | A7 | **Removes the greedy planner and declares its dependencies.** The greedy planning and sharing code is gone from the package and its public API; scipy and numpy are runtime dependencies, and nothing else outside the standard library is imported; `STRUCTURE.md` matches. |
 | A8 | **Changes nothing else.** The snapshot and decision dict keys, statelessness, UTC arithmetic and input validation are unchanged. Round 1's scenarios still pass, except where optimality, the leftover rule or the even split gives a different answer; a differential against round 1 of this branch (commit `2646e7c`) over generated snapshots shows every difference is one of those, each kind pinned by a test. |
@@ -249,7 +249,7 @@ New, in `optimize.py`:
 | Signature | Module | Purpose | Covers |
 |---|---|---|---|
 | `class SolverError(RuntimeError)`; `__init__(self, status: int, message: str) -> None`; attributes `status`, `message`; `str(err) == f"HiGHS status {status}: {message}"` | `optimize` | The solver failed; carries scipy's `milp` status and message | A6 |
-| `NODE_LIMIT: int` | `optimize` | Branch-and-bound nodes allowed per level solve. Fixed by step 3's benchmark as the largest power-of-two multiple of 1000 that keeps the A5 worst case under 10 s, with the measurement recorded in section 3 | A5 |
+| `NODE_LIMIT: int` | `optimize` | Branch-and-bound nodes allowed per level solve. Fixed by step 3's benchmark as the largest power-of-two multiple of 1000 that keeps every A5 tier (3 chargers ≤ 10 s, 7 ≤ 60 s, 10 ≤ 120 s) inside its bound, with the measurement recorded in section 3 | A5 |
 | `class Tier(IntEnum)`: `SMART_OFF = 0`, `CHARGE_NOW = 1`, `PLANNED = 2`, `SPARE = 3` | `optimize` | Which precedence stage a demand belongs to | A3 |
 | `Demand(charger_id: str, phases: frozenset[Phase], tier: Tier, min_current: float, max_current: float, now_max_current: float, need_kwh: float = 0.0, deadline: datetime \| None = None)` | `optimize` | One charger asking for current, given in ranking order. `min_current == max_current` is all-or-nothing (on/off). `now_max_current` caps quarter 0 (user limit, fallback), `max_current` the later quarters. Quarter-0-only tiers ignore `need_kwh`, `deadline` and `max_current`. `PLANNED` requires an aware `deadline`. Validates itself in `__post_init__`, raising `ValueError` naming the field. Currents must be finite and ≥ 0. `max_current` or `now_max_current` below `min_current` is allowed and means off in those quarters, which keeps the `user_current_limit=0` regression and its `TARGET_UNREACHABLE`. `need_kwh` must be finite and ≥ 0. `PLANNED` requires an aware `deadline` | A1, A3 |
 | `Outcome(allocations: dict[str, float], plans: dict[str, SessionPlan], proven: bool)` | `optimize` | Quarter-0 current for every demand; a plan for every `PLANNED` demand; `proven` False when any level stopped at the node budget | A1, A5 |
@@ -429,8 +429,8 @@ Every solve:
        `test_the_planner_and_capacity_signatures_are_round_ones` (`PlanRequest` and
        `plan_sessions` removed).
    - The stdlib AST scan allows exactly `numpy` and `scipy` besides the standard library.
-   - The 100 ms test becomes the A5 10 s test.
-8. Benchmark the A5 worst case on a fixed set of seeds (at least 5): 10 chargers on mixed
+   - The 100 ms test becomes the A5 tier tests: 3 chargers within 10 s, 7 within 60 s, 10 within 120 s (the 7- and 10-charger cases may carry a `slow` marker if the repo has one; they are not skipped).
+8. Benchmark the A5 worst cases on a fixed set of seeds (at least 5) at 3, 7 and 10 chargers, each against its tier (10 s, 60 s, 120 s): chargers on mixed
    phases, a 48-hour series with an unpriced tail, `min_block_quarters = 4`, a price cap
    and a tight budget. Record the maximum time over the seeds. Fix `NODE_LIMIT` and record the runs in section 3.
 9. `STRUCTURE.md` and `README.md`. Run the four gates and every showcase.
@@ -452,7 +452,7 @@ Every solve:
 
 The quarter-0 tiers give `share`'s round-1 results on round 1's `share` test inputs | A3 |
 | T5 | Stale prices: no plans, smart sessions served at priority 3 on quarter 0, round-1 status and event | A4 |
-| T6 | Determinism: equal decisions across repeated calls and `PYTHONHASHSEED` values, and when `snapshot.chargers`, `states` and `sessions` are permuted through `decide` (`_rank_key` is a total order). Every one of the benchmark seeds (guide item 8) returns within 10 s. The not-proven path works two ways: a monkeypatched `milp` returning a node-limit result (status 4, `x` present, `mip_node_count == NODE_LIMIT`), and a real hard instance with `NODE_LIMIT` monkeypatched to 1. Each gives a plan within every limit, `proven = False` and the `PLAN_NOT_PROVEN_OPTIMAL` event. No `time_limit` is ever passed (the solver call is spied) | A5 |
+| T6 | Determinism: equal decisions across repeated calls and `PYTHONHASHSEED` values, and when `snapshot.chargers`, `states` and `sessions` are permuted through `decide` (`_rank_key` is a total order). Every one of the benchmark seeds (guide item 8) returns within its A5 tier: 3 chargers 10 s, 7 chargers 60 s, 10 chargers 120 s. The not-proven path works two ways: a monkeypatched `milp` returning a node-limit result (status 4, `x` present, `mip_node_count == NODE_LIMIT`), and a real hard instance with `NODE_LIMIT` monkeypatched to 1. Each gives a plan within every limit, `proven = False` and the `PLAN_NOT_PROVEN_OPTIMAL` event. No `time_limit` is ever passed (the solver call is spied) | A5 |
 | T7 | `SolverError`: a monkeypatched `milp` returning each failure status raises `SolverError` with that status and message from `decide`. The statuses are 2, 3, 4 below the node limit, 4 without `x`, and 1 without `x`. Negative capacities (a reservation above the budget) never raise; they give a decision with 0 A. The `str` form, and the re-export from `energy_optimization.ev` | A6 |
 | T8 | The removed names are gone (`plan_sessions`, `PlanRequest`, `share`, `Claim`). The AST scan finds only the standard library, numpy and scipy. `pyproject.toml` declares both | A7 |
 | T9 | Unchanged surface: the codec key sets, statelessness, UTC (the DST finish tests) and validation tests all still pass. The differential against `2646e7c` over generated snapshots puts every difference into optimality, leftover or even split, and each kind has a named pinning test (step 6 runs the differential; step 5 writes the pins) | A8 |
@@ -471,7 +471,7 @@ Every public entry has a criterion behind it, and every criterion has an entry a
 
 ### Risks
 
-1. **The 10 s worst case is not reachable with any node budget that still gives sensible
+1. **An A5 tier bound (3 chargers 10 s, 7 chargers 60 s, 10 chargers 120 s) is not reachable with any node budget that still gives sensible
    plans.** The cause would be the planning model, at 10 chargers × 192 quarters, with up
    to 7 levels each spending its node budget. The build may then:
    - lower `NODE_LIMIT`;
@@ -479,7 +479,7 @@ Every public entry has a criterion behind it, and every criterion has an entry a
    - tighten the formulation, for example with the aggregated block constraint
      `(L−1)·y ≤ Σ_k x + (L−1)·w`.
 
-   If the worst case still exceeds 10 s, **halt**: A5 would need amending. Do not add a
+   If a tier's worst case still exceeds its bound, **halt**: A5 would need amending. Do not add a
    wall-clock limit (A5 forbids it).
 2. **Determinism.** If repeated runs differ even with `threads=1`, **halt**. That would be a
    HiGHS property A5 cannot meet as written. Do not paper over it with a time limit or a
@@ -744,3 +744,9 @@ What exists is committed: `optimize.py`, `decide.py` wired to it, the greedy cod
 Tests (guide item 7), `STRUCTURE.md` and `README.md` (item 9) are not done and wait for the
 answer, because options 3 and 4 change what they test. On the answer, `/build` resumes from
 step 3 at item 7.
+
+**Answer (user, 2026-10-22):** "10 s for up to 3 chargers, 60 s for up to 7, 120 s for up to
+10". A5 amended in section 1 to those three tiers; section 2's `NODE_LIMIT` row, guide items
+7 and 8, T6 and Risk 1 follow (Risk 1's halt now applies to a tier bound). The model and the
+lexicographic order stay as built. `/build` resumes step 3 at guide item 7, after re-running
+the benchmark at 3, 7 and 10 chargers to fix `NODE_LIMIT`.
