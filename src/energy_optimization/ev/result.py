@@ -141,13 +141,18 @@ class Status(StrEnum):
 
 
 class EventKind(StrEnum):
-    """Notification-worthy events."""
+    """Notification-worthy events.
+
+    `PLAN_NOT_PROVEN_OPTIMAL` means the solver stopped at its node budget: the plan is
+    the best found, within every limit, but not proven optimal.
+    """
 
     TARGET_UNREACHABLE = "target_unreachable"
     PRICE_CAP_EXCEEDED = "price_cap_exceeded"
     CHARGE_NOW_NEED_COVERED = "charge_now_need_covered"
     PHASE_DATA_STALE = "phase_data_stale"
     PRICES_STALE = "prices_stale"
+    PLAN_NOT_PROVEN_OPTIMAL = "plan_not_proven_optimal"
 
 
 @dataclass(frozen=True)
