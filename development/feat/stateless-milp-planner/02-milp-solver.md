@@ -121,8 +121,8 @@ dependencies. `STRUCTURE.md` and the tests follow.
 | A2 | **Is optimal for the stated precedence** — need, unpriced, price cap, minimum block, price, even split, earlier-first. On small generated instances every proven-optimal plan has the objective of a brute-force enumeration; the doc scenarios for cheapest quarters, price cap, unreachable target and unpriced quarters give the hand-checked plans; a shortfall gives the "target unreachable" event with the reachable kWh. |
 | A3 | **Serves the tiers in order on the leftover.** Charge-now first, then cars planned to charge now, then spare-capacity charging; each tier gets what the tiers above leave, and a lower tier never takes current a higher tier could use. Within a tier, quarter 0 is split as evenly as cost allows. Replaces `feat/ev-charging-core` A2's top-tier-only rule and equal split. |
 | A4 | **Keeps the stale-price rule.** With stale prices there is no plan; smart sessions are served in quarter 0 at spare-capacity priority, with round 1's status and event. |
-| A5 | **Is deterministic and bounded.** The same snapshot gives an equal decision across runs and hash seeds; the solve uses a single thread and a fixed node budget, never a wall-clock limit; every call with a 48-hour price series returns, in total on the development machine, within 10 s for up to 3 chargers, 60 s for up to 7 and 120 s for up to 10 (amended at the step-3 halt, 2026-10-22); a solve stopped by the node budget returns its best plan with an event saying it is not proven optimal. |
-| A6 | **Raises instead of guessing.** When HiGHS reports an error or finds no solution, `decide` raises `SolverError` naming the solver status, never a partial or greedy decision. |
+| A5 | **Is deterministic and bounded.** The same snapshot gives an equal decision across runs and hash seeds; the solve uses a single thread and a fixed node budget, never a wall-clock limit; every call with a 48-hour price series returns, in total on the development machine, within 10 s for up to 3 chargers, 60 s for up to 7 and 120 s for up to 10 (amended at the step-3 halt, 2026-10-22), measured with a per-phase budget of 35 A for 1–3 chargers, 50 A for 2–5 and 70 A for 3–10 (the worst case defined at the second step-3 halt); a tighter grid still works but carries no time promise; a solve stopped by the node budget returns its best plan with an event saying it is not proven optimal. |
+| A6 | **Raises instead of guessing.** When HiGHS reports an error or finds no solution — in any level solve, including a later level the node budget stops before it finds a point — `decide` raises `SolverError` naming the solver status, never a partial or greedy decision (decided at the second step-3 halt). |
 | A7 | **Removes the greedy planner and declares its dependencies.** The greedy planning and sharing code is gone from the package and its public API; scipy and numpy are runtime dependencies, and nothing else outside the standard library is imported; `STRUCTURE.md` matches. |
 | A8 | **Changes nothing else.** The snapshot and decision dict keys, statelessness, UTC arithmetic and input validation are unchanged. Round 1's scenarios still pass, except where optimality, the leftover rule or the even split gives a different answer; a differential against round 1 of this branch (commit `2646e7c`) over generated snapshots shows every difference is one of those, each kind pinned by a test. |
 
@@ -808,3 +808,17 @@ Question for the user: which budget defines "tight" in A5's worst case?
    last planning levels, as option 3 of the first halt).
 
 What exists is committed. Tests (item 7), `STRUCTURE.md` and `README.md` (item 9) are not done.
+
+**Answer (user, 2026-10-22):**
+1. Worst case: "For the purpose of testing assume 35 A per phase for 1-3 chargers and 50 A
+   for 2-5 chargers and 70 A for 3-10 chargers". A5 now names those budgets. The benchmark
+   grid is every listed charger count at every listed budget, each against its time tier
+   (≤3 chargers 10 s, ≤7 60 s, ≤10 120 s). For example, 3 chargers at 35, 50 and 70 A
+   within 10 s, 5 chargers at 50 and 70 A within 60 s, and 10 chargers at 70 A within 120 s.
+   At least 5 seeds per cell. A grid tighter than those budgets is not timed.
+2. A later level stopped by the node budget with no point: "Raise SolverError". A6 is
+   amended to say so. Deviation 7's catch-and-hold (`_NoIncumbentError` held at the earlier
+   objective) is reverted: every level solve that ends without a point raises `SolverError`.
+   `PLAN_NOT_PROVEN_OPTIMAL` remains for a node-budget stop that returns a point.
+`/build` resumes step 3: revert deviation 7, re-run the grid, fix `NODE_LIMIT`, then guide
+items 7 and 9.
