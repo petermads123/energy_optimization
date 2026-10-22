@@ -236,8 +236,10 @@ Covers `src/energy_optimization/ev/planning.py` (T8-T10, T12): `remaining_need_k
 tables, the cheapest-block planner against a brute-force optimum on hand-checked series,
 the finishing rule, the price-cap precedence and boundary, unpriced quarters used last and
 latest first, shared capacity with the least-slack session first, whole-amp flooring, a
-zero `max_current` as unreachable, DST horizons, and a `hypothesis` property over generated
-requests; and the `main` showcase.
+zero `max_current` as unreachable, DST horizons, and two `hypothesis` properties over
+generated requests (the second on mixed phases and deadlines, checking no quarter books
+more than a phase holds); the `ValueError` for a naive deadline, `ZoneInfoNotFoundError`
+for an unknown zone and the empty-requests pin; and the `main` showcase.
 
 ### `tests/test_ev_allocation.py`
 
@@ -257,14 +259,20 @@ float-residue and `user_current_limit=0` regressions, determinism across hash se
 standard-library-only AST scan, the 100 ms performance check, and two `hypothesis`
 properties over generated snapshots: one (T17) whose invariants are computed independently of
 the module's helpers, and one that sends each snapshot through the dict round trip and gets
-the same decision; and the `main` showcase.
+the same decision; the invariants include a plan-fit oracle keyed in UTC. Also the
+stateless-core tests: the unplanned expected finish added in UTC across both 2026 DST
+nights, `reaches_target` across the fold, a trickle of current giving `None`, no state
+between interleaved snapshots, and the public surface equal to round 1's (exports, removed
+modules and names, dataclass fields, signatures); and the `main` showcase.
 
 ### `tests/test_ev_codec.py`
 
 Covers `src/energy_optimization/ev/codec.py` (T2, T19): JSON round trips of snapshots and decisions (negative
 prices, odd offsets, `None` measurements, every enum, parameter types kept), plain-type
 output, and rejection of missing, unknown, wrongly typed, huge, null-on-defaulted and
-invalid fields with the exact dotted path; and the `main` showcase.
+invalid fields with the exact dotted path; the literal round-1 key sets of snapshot and
+decision dicts; the rejection of `memory`, the 15 round-2 settings and the round-2
+decision keys, each naming that field; and the `main` showcase.
 
 ### `tests/test_guard_git.py`
 

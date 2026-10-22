@@ -3,7 +3,7 @@
 import itertools
 import math
 from datetime import UTC, datetime, time, timedelta
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytest
 from hypothesis import given, settings
@@ -841,6 +841,79 @@ def test_plan_invariants_hold_for_generated_inputs(
             sum(energy_per_quarter_kwh(q.current, 1, 230.0) for q in item.quarters)
         )
     assert all(total <= capacity + 1e-6 for total in per_quarter.values())
+
+
+# --- plan_sessions: shared capacity on mixed phases (T5) -----------------------
+
+MIXED_PHASES = [L1, L2, ALL]
+
+
+@settings(deadline=None, max_examples=100, derandomize=True)
+@given(
+    prices=st.lists(st.floats(-1, 2, allow_nan=False), min_size=0, max_size=24),
+    shapes=st.lists(
+        st.tuples(
+            st.sampled_from(MIXED_PHASES),
+            st.floats(0, 12),
+            st.integers(1, 20),
+            st.booleans(),
+        ),
+        min_size=1,
+        max_size=4,
+    ),
+    capacity=st.tuples(st.floats(0, 40), st.floats(0, 40), st.floats(0, 40)),
+    block=st.integers(1, 4),
+)
+def test_plan_never_books_more_than_a_phase_holds_on_mixed_phases(
+    prices: list[float],
+    shapes: list[tuple[frozenset[Phase], float, int, bool]],
+    capacity: tuple[float, float, float],
+    block: int,
+) -> None:
+    caps = dict(zip(Phase, capacity, strict=True))
+    requests = [
+        request(
+            f"c{i}",
+            phases,
+            16 if all_or_nothing else 6,
+            16,
+            need,
+            NOW + QUARTER * quarters,
+        )
+        for i, (phases, need, quarters, all_or_nothing) in enumerate(shapes)
+    ]
+
+    result = plan(requests, prices_from(prices), caps, block)
+
+    booked: dict[tuple[datetime, Phase], float] = {}
+    for req in requests:
+        for q in result[req.charger_id].quarters:
+            assert 6 <= q.current <= 16
+            for phase in req.phases:
+                key = (q.start.astimezone(UTC), phase)
+                booked[key] = booked.get(key, 0.0) + q.current
+    for (_, phase), total in booked.items():
+        assert total <= caps[phase] + 1e-6
+
+
+def test_plan_rejects_a_naive_deadline() -> None:
+    naive = datetime.fromisoformat("2026-10-21T22:00:00")
+
+    with pytest.raises(ValueError):
+        plan([request(deadline=naive)])
+
+
+def test_plan_rejects_an_unknown_timezone() -> None:
+    with pytest.raises(ZoneInfoNotFoundError):
+        plan_sessions([request()], NOW, {}, CAP16, 230.0, 2, None, "Mars/Olympus")
+
+
+def test_plan_with_no_requests_never_looks_at_a_naive_now() -> None:
+    # Pins current behaviour: the docstring says a naive `now` raises, but with nothing
+    # to plan the grid is never built (see section 5 of the plan file, for step 8).
+    naive_now = datetime.fromisoformat("2026-10-21T20:00:00")
+
+    assert plan_sessions([], naive_now, {}, CAP16, 230.0, 2, None, TZ) == {}
 
 
 def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:

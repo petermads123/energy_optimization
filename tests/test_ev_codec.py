@@ -962,6 +962,177 @@ def test_decision_from_dict_of_an_empty_decision() -> None:
     assert decision_round_trip(empty) == empty
 
 
+# --- T4: a round-1 shaped codec; round-2 keys are refused ------------------------
+
+ROUND_2_SETTINGS = [
+    ("emergency_threshold", 40.0),
+    ("emergency_threshold", None),
+    ("emergency_calm", 300),
+    ("yellow_margin", 2.0),
+    ("green_hold", 60),
+    ("deadband", 2.0),
+    ("ramp_step", 2),
+    ("ramp_period", 300),
+    ("under_use_period", 900),
+    ("reduction", "to_use"),
+    ("under_use_margin", 1.0),
+    ("min_pause", 900),
+    ("hysteresis", 1800),
+    ("resume_probe", 3600),
+    ("min_action_interval", 30),
+    ("max_memory_age", 1800),
+]
+
+
+@pytest.mark.parametrize("value", [None, {}, {"saved_at": "2026-10-21T20:00:00+00:00"}])
+def test_snapshot_from_dict_rejects_memory_naming_the_field(value: object) -> None:
+    data = edit(encoded(), ["memory"], value)
+
+    err = error_of(lambda: snapshot_from_dict(data))
+
+    assert err.field == "memory"
+    assert err.message == "unknown field"
+
+
+def test_snapshot_from_dict_has_fifteen_distinct_round_2_settings() -> None:
+    assert len({name for name, _ in ROUND_2_SETTINGS}) == 15
+
+
+@pytest.mark.parametrize(("key", "value"), ROUND_2_SETTINGS)
+def test_snapshot_from_dict_rejects_each_round_2_setting(
+    key: str, value: object
+) -> None:
+    data = edit(encoded(), ["settings", key], value)
+
+    err = error_of(lambda: snapshot_from_dict(data))
+
+    assert err.field == f"settings.{key}"
+
+
+def test_snapshot_from_dict_names_the_top_level_key_before_a_nested_one() -> None:
+    data = edit(edit(encoded(), ["memory"], None), ["settings", "deadband"], 1.0)
+
+    assert error_of(lambda: snapshot_from_dict(data)).field == "memory"
+
+
+def test_snapshot_from_dict_names_an_unknown_key_before_a_missing_one() -> None:
+    err = error_of(lambda: snapshot_from_dict({"memory": None}))
+
+    assert err.field == "memory"
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("memory", None),
+        ("memory", {}),
+        ("guard_level", "green"),
+        ("guard_level", None),
+        ("next_check", "2026-10-21T20:05:00+00:00"),
+        ("next_check", None),
+    ],
+)
+def test_decision_from_dict_rejects_round_2_keys(key: str, value: object) -> None:
+    data = decision_to_dict(full_decision())
+    data[key] = value
+
+    assert error_of(lambda: decision_from_dict(data)).field == key
+
+
+def test_snapshot_to_dict_has_exactly_round_1_keys() -> None:
+    data = snapshot_to_dict(base_snapshot())
+
+    assert set(data) == {
+        "now",
+        "settings",
+        "chargers",
+        "states",
+        "sessions",
+        "prices",
+        "phase_currents",
+    }
+    assert set(data["settings"]) == {  # type: ignore[call-overload]  # nested plain dict
+        "phase_budget",
+        "phase_threshold",
+        "fallback_current",
+        "timezone",
+        "voltage",
+        "min_block_quarters",
+        "price_cap",
+        "default_energy_need_kwh",
+        "max_price_age",
+        "max_measurement_age",
+    }
+    nested = json.loads(json.dumps(data))
+    assert set(nested["chargers"][0]) == {
+        "id",
+        "phases",
+        "kind",
+        "min_current",
+        "max_current",
+        "assumed_current",
+        "fallback_current",
+    }
+    assert set(nested["states"][0]) == {
+        "charger_id",
+        "car_connected",
+        "current_setting",
+        "paused",
+        "measured_power_w",
+        "available",
+    }
+    assert set(nested["sessions"][0]) == {
+        "charger_id",
+        "ready_time",
+        "energy_need_kwh",
+        "soc_percent",
+        "target_soc_percent",
+        "battery_capacity_kwh",
+        "delivered_kwh",
+        "charge_now",
+        "smart_charging",
+        "user_current_limit",
+        "plugged_in_at",
+    }
+    assert set(nested["prices"]) == {"intervals", "updated_at"}
+    assert set(nested["prices"]["intervals"][0]) == {"start", "end", "price"}
+    assert set(nested["phase_currents"]) == {"measured_at", "l1", "l2", "l3"}
+
+
+def test_decision_to_dict_has_exactly_round_1_keys() -> None:
+    data = json.loads(json.dumps(decision_to_dict(full_decision())))
+
+    assert set(data) == {"actions", "chargers", "available", "status", "events"}
+    assert set(data["actions"][0]) == {
+        "charger_id",
+        "kind",
+        "target_current",
+        "stage",
+    }
+    first = next(c for c in data["chargers"] if c["plan"])
+    assert set(first) == {
+        "charger_id",
+        "allocation",
+        "priority",
+        "reason",
+        "plan",
+        "remaining_need_kwh",
+        "deadline",
+        "expected_finish",
+        "reaches_target",
+    }
+    assert set(first["reason"]) == {"code", "text", "params"}
+    assert set(first["plan"][0]) == {"start", "price", "current"}
+    assert set(data["available"]) == {"l1", "l2", "l3"}
+    assert set(data["events"][0]) == {"kind", "text", "charger_id", "params"}
+
+
+def test_a_real_decisions_keys_are_round_1_too() -> None:
+    data = decision_to_dict(decide(base_snapshot()))
+
+    assert set(data) == {"actions", "chargers", "available", "status", "events"}
+
+
 def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:
     showcase()
 

@@ -17,7 +17,7 @@
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | done |
-| 5 | Test | `/test` | in `/build` | pending |
+| 5 | Test | `/test` | in `/build` | in progress |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
@@ -348,8 +348,55 @@ section deleted, AppDaemon entry rewritten. No test-file additions yet (T2-T5 ar
 
 | Intent | Test names | Result |
 |---|---|---|
+| T1 | `test_the_package_exports_exactly_round_ones_names`, `test_the_round_two_modules_are_gone`, `test_the_round_two_names_are_gone`, `test_the_dataclass_fields_are_round_ones`, `test_the_planner_and_capacity_signatures_are_round_ones`, `test_the_enums_carry_no_round_two_members` (all in `test_ev_decide.py`; the enum member sets are also pinned by the restored `test_ev_result.py`) | green |
+| T2 | the restored round-1 suite, unchanged expectations; `git diff 982a494 origin/main` on the other test files shows only memory-specific showcase assertions and memory/guard tests, nothing memory-free to port | green (1217 passed) |
+| T3 | `test_an_unplanned_expected_finish_adds_the_hours_in_utc_across_dst` (5 rows), `test_the_unplanned_finish_off_a_wall_clock_now_matches_its_utc_instant`, `test_the_unplanned_finish_is_the_same_instant_whatever_zone_now_is_in` (3), `test_reaches_target_compares_instants_across_the_fold` (2), `test_a_trickle_of_current_gives_no_finish_instead_of_overflowing` (5), `test_a_reserved_charger_with_a_tiny_measured_draw_gives_no_finish` (2), `test_a_trickle_decision_survives_the_codec_round_trip` (2) | green; 17 of 212 tests in the file fail on a scratch copy of `982a494`, all of them these |
+| T4 | `test_snapshot_from_dict_rejects_memory_naming_the_field` (3), `test_snapshot_from_dict_rejects_each_round_2_setting` (16 rows, 15 keys), `test_snapshot_from_dict_names_the_top_level_key_before_a_nested_one`, `test_snapshot_from_dict_names_an_unknown_key_before_a_missing_one`, `test_decision_from_dict_rejects_round_2_keys` (6), `test_snapshot_to_dict_has_exactly_round_1_keys`, `test_decision_to_dict_has_exactly_round_1_keys`, `test_a_real_decisions_keys_are_round_1_too` (all in `test_ev_codec.py`) | green |
+| T5 | `assert_plans_fit` in the `decide` invariant oracle (UTC-keyed), plus the `reaches_target is None` iff `deadline is None` invariant; `test_plan_never_books_more_than_a_phase_holds_on_mixed_phases` in `test_ev_planning.py`; `test_plan_rejects_a_naive_deadline`, `test_plan_rejects_an_unknown_timezone`, `test_plan_with_no_requests_never_looks_at_a_naive_now` | green |
+| T6 | the restored determinism-across-hash-seeds and AST-scan tests, plus `test_a_decision_does_not_depend_on_the_snapshots_decided_before_it` (interleaved snapshots) | green |
+
+**Finding, not fixed (halt):** the planned branch of `_expected_finish` does wall-clock
+arithmetic, `(quarter.start + QUARTER).astimezone(ctx.zone)`, on a quarter start stamped in
+the settings zone. Reproduced on the current code with a scratch script: now
+`2026-10-24T22:00Z`, one 16 A adjustable charger, 32 quarters at 0.30 with two cheap
+quarters, `energy_need_kwh=1.84`. (a) Cheap quarters at 00:45Z and 01:00Z: plan ends with
+the quarter at 01:00Z; expected finish 01:15Z = `2026-10-25T02:15:00+01:00`; actual
+`2026-10-25T02:15:00+02:00` (= 00:15Z, before the plan's own last quarter). (b) Cheap
+quarters at 00:30Z and 00:45Z: expected 01:00Z = `2026-10-25T02:00:00+01:00`; actual
+`2026-10-25T03:00:00+01:00` (= 02:00Z, an hour late). Proposed one-line fix:
+`(quarter.start.astimezone(UTC) + QUARTER).astimezone(ctx.zone)`. It is round-1 code that
+round 2 never fixed, so A3 does not list it; no production change and no test asserting
+the wrong value were made. After a decision to widen A3, the tests are the two cases above.
+
+Contradictions and suspicions from the designers, pinned or noted for step 8 (behaviour
+unchanged):
+
+- C2 `ChargerDecision` docstring says `remaining_need_kwh`, `deadline`, `reaches_target`
+  are `None` "without a session", but a session on a charger with no car also gives
+  `None` (`NO_CAR` returns before they are computed). Docstring is incomplete.
+- C3 `reaches_target` is `False` for a need already met once the deadline has passed
+  (`_reaches` requires `deadline > now`), so a finished session reads "will not reach
+  target" after its ready time. Not pinned by a test; for step 8.
+- C4 `plan_sessions` documents `ValueError` for a naive `now`, but with no requests it
+  returns `{}` (pinned by `test_plan_with_no_requests_never_looks_at_a_naive_now`).
+- Fixed or unavailable chargers with a session get `expected_finish` from their
+  reservation, an assumed level rather than delivery (round-1 behaviour).
+- `_expected_finish` docstring does not say it returns `None` for a trickle (only
+  `STRUCTURE.md` does).
 
 Edge cases considered and deliberately skipped, with reasons:
+
+- The `need <= 1e-9` boundary for the finish (input-space case 6): low value, covered by
+  the existing covered-need tests.
+- Adding a `expected_finish > plan[0].start` invariant to the generated-snapshot property
+  (contract D6): it is exactly the D1 defect on the fall-back night, which the `BASES` in
+  the generator reach, so it would fail until A3 is widened.
+- A planned-branch finish test across the fold (D1/D2): withheld pending the halt below.
+- Contract D7 (finish exactly at the deadline) and D8 (covered need after the ready
+  time): the first needs a long hand-built price series for a `<=` already covered by the
+  restored suite; the second is C3 above and is left for step 8.
+- Text, very long strings, purity of the codec and the planner: covered by the restored
+  suite.
 
 ---
 
@@ -422,3 +469,15 @@ taken back through steps 1 to 7 on the same branch.
 > step that halted, the question for the user — and, once answered, the answer and what
 > changed because of it. Never deleted; it is the record of where the plan was thinner
 > than the code needed.
+
+### Step 5, 2026-10-22
+
+Halted by the test step at the end of step 5, with the suite written and green (1217
+passed, ruff, ruff format and mypy clean) and committed. Reason: the planned branch of
+`_expected_finish` (D1/D2 above) is a round-1 defect in shared code that A3 does not list.
+Fixing it would change behaviour against `982a494`, which amends section 1.
+
+Question for the user: widen A3 to also allow this one-line fix,
+`(quarter.start.astimezone(UTC) + QUARTER).astimezone(ctx.zone)`, with the two reproduction
+cases added as tests (red on the current code, green after), or leave it as it is and note
+it in `DEVELOPMENT.md` for a later `/fix`?
