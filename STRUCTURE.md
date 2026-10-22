@@ -110,7 +110,7 @@ ints.
 
 ### `src/energy_optimization/ev/result.py`
 
-Output types. No logic beyond `PhaseAmps.get`.
+Output types. No logic beyond `PhaseAmps.get` and the tuple normalisation in `ChargerDecision` and `Decision`.
 
 | Signature | Description |
 |---|---|
@@ -254,9 +254,10 @@ Covers `src/energy_optimization/ev/decide.py` (T3, T5-T7, T9, T13-T18, T20): doc
 priority tiers and reason codes, reservations and smart charging off, the fallback table,
 actions and their order, events, expected finish and `reaches_target`, DST nights, the
 float-residue and `user_current_limit=0` regressions, determinism across hash seeds, the
-standard-library-only AST scan, the 100 ms performance check, and a `hypothesis` property
-(T17) whose invariants are computed independently of the module's helpers; and the `main`
-showcase.
+standard-library-only AST scan, the 100 ms performance check, and two `hypothesis`
+properties over generated snapshots: one (T17) whose invariants are computed independently of
+the module's helpers, and one that sends each snapshot through the dict round trip and gets
+the same decision; and the `main` showcase.
 
 ### `tests/test_ev_codec.py`
 

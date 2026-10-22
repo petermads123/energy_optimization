@@ -1,6 +1,6 @@
 # Stateless core
 
-<!-- claude-plan step=4 status=active -->
+<!-- claude-plan step=5 status=active -->
 
 | Field | Value |
 |---|---|
@@ -16,7 +16,7 @@
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done |
-| 4 | Verify | `/verify` | in `/build` | pending |
+| 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
@@ -324,6 +324,15 @@ section deleted, AppDaemon entry rewritten. No test-file additions yet (T2-T5 ar
 
 | Check | Result |
 |---|---|
+| `ruff check .` | `All checks passed!` |
+| `ruff format --check .` | `54 files already formatted` |
+| `mypy` | `Success: no issues found in 24 source files` |
+| `pytest` | `1141 passed in 11.12s` |
+| Plan completeness | Checked against `982a494`, not `01-decision-core.md`. `git diff 982a494 -- src/energy_optimization/ev/` is empty for `__init__`, `model`, `result`, `quarters`, `planning`, `allocation`, `codec`; `decide.py` differs only in `_expected_finish` (UTC arithmetic, `None` on `OverflowError`), so every signature matches. Missing: none. Deviation: none. Unplanned: none (no public name added) |
+| `STRUCTURE.md` | `structure-auditor` found 3 items. (1) `test_ev_decide.py` entry now names both `hypothesis` properties: applied. (2) `result.py` entry now mentions the tuple normalisation in `ChargerDecision` and `Decision`: applied. (3) `STEP_NAMES` / `STEP_SKILLS` undocumented in the hooks sections: rebutted, not applied; the hook sections are kept as on `main`, hooks are outside this round, and the gap pre-dates it |
+| `python -m energy_optimization.ev.<module>` | `model`, `result`, `quarters`, `planning`, `allocation`, `decide`, `codec` all exit 0 and print a readable showcase; the `RuntimeWarning` about `sys.modules` is the expected re-export one |
+
+---|---|
 | `ruff check .` | |
 | `ruff format --check .` | |
 | `mypy` | |
