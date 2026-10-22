@@ -1,6 +1,6 @@
 # MILP solver
 
-<!-- claude-plan step=8 status=active -->
+<!-- claude-plan step=9 status=active -->
 
 
 | Field | Value |
@@ -21,7 +21,7 @@
 | 5 | Test | `/test` | in `/build` | done (re-run after the second step-6 halt) |
 | 6 | Concept check | `/concept-check` | in `/build` | done (third run: A1 to A8 met) |
 | 7 | Ship | `/ship` | in `/build` | done |
-| 8 | Recommend | `/recommend` | with the user | pending |
+| 8 | Recommend | `/recommend` | with the user | done |
 | 9 | Pull request | `/create-pr` | with the user | pending |
 | 10 | Review | `/watch-pr` | on the pull request | pending |
 
@@ -1541,9 +1541,9 @@ Round commits:
 > section 1 promised, such as a class member it put out of scope, is a recommendation here,
 > and its round opens through `/fix`.
 
-| # | Recommendation | Why it is critical | Effort | Decision |
-|---|---|---|---|---|
-| R1 | | | | |
+None.
+
+The lesser findings of sections 5 and 6 are noted in `DEVELOPMENT.md` under "`feat/stateless-milp-planner` round 2 notes".
 
 Decisions: `deferred`, `rejected`, or `next round` — a new numbered file in this folder,
 taken back through steps 1 to 7 on the same branch.
