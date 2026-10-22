@@ -2,7 +2,6 @@
 
 import itertools
 import math
-from collections.abc import Sequence
 from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -61,7 +60,6 @@ def plan(
     block: int = 2,
     cap: float | None = None,
     now: datetime = NOW,
-    first: Sequence[str] = (),
 ) -> dict[str, SessionPlan]:
     return plan_sessions(
         requests,
@@ -72,7 +70,6 @@ def plan(
         block,
         cap,
         TZ,
-        first,
     )
 
 
@@ -613,220 +610,6 @@ def test_plan_the_least_slack_session_claims_the_cheap_quarters_first() -> None:
     assert result["b"].reachable is True
     assert slots(result["a"]) == [8, 9, 10, 11]
     assert result["a"].reachable is True
-
-
-def test_plan_a_session_named_first_keeps_only_the_current_quarter() -> None:
-    # Replaces `test_plan_a_session_named_first_claims_before_the_more_urgent_one`,
-    # which pinned "a session named first claims every one of its quarters before the
-    # more urgent one". That is the choice the step 5 re-run reversed: it let a
-    # keeper starve a more urgent session of quarters (round-1 A4), and A2 only asks
-    # for the keeper's place, which is the quarter being decided now.
-    prices = {NOW + QUARTER * i: (0.1 if i < 8 else 0.5) for i in range(32)}
-    relaxed = request("a", need=3.0, deadline=NOW + timedelta(hours=8))
-    urgent = request("b", need=7.0, deadline=NOW + timedelta(hours=2))
-
-    result = plan([relaxed, urgent], prices, first=("a",))
-
-    assert slots(result["a"]) == [0, 8, 9, 10]
-    assert result["a"].reachable is True
-    assert slots(result["b"]) == [1, 2, 3, 4, 5, 6, 7]
-    assert result["b"].reachable is False
-
-
-def test_plan_the_session_named_first_keeps_a_current_quarter_in_a_full_block() -> None:
-    one_quarter = request("a", need=E16 * 0.5)
-    prices = prices_from([0.1] * 8)
-
-    held = plan([one_quarter], prices, first=("a",))["a"]
-
-    assert slots(held) == [0, 1]
-    assert held == plan([one_quarter], prices)["a"]
-
-
-@pytest.mark.parametrize(
-    ("order", "winner", "loser"), [(("a", "b"), "a", "b"), (("b", "a"), "b", "a")]
-)
-def test_plan_the_sessions_named_first_contest_the_quarter_in_the_order_given(
-    order: tuple[str, str], winner: str, loser: str
-) -> None:
-    # Both want the cheap current quarter and the phase holds one of them.
-    prices = prices_from([0.1] * 4 + [0.5] * 12)
-    both = [
-        request("a", low=16, high=16, need=E16, deadline=NOW + QUARTER * 12),
-        request("b", low=16, high=16, need=E16, deadline=NOW + QUARTER * 12),
-    ]
-
-    result = plan(both, prices, first=order)
-
-    assert slots(result[winner])[0] == 0
-    assert 0 not in slots(result[loser])
-    assert result[loser].reachable is True
-
-
-def test_plan_the_order_of_first_beats_urgency_for_the_current_quarter() -> None:
-    prices = prices_from([0.1] * 8 + [0.5] * 24)
-    urgent = request("u", low=16, high=16, need=4 * E16, deadline=NOW + QUARTER * 4)
-    relaxed = request("r", low=16, high=16, need=E16, deadline=NOW + QUARTER * 20)
-
-    result = plan([urgent, relaxed], prices, first=("r", "u"))
-
-    assert slots(result["r"])[0] == 0
-    assert 0 not in slots(result["u"])
-    assert result["u"].reachable is False
-
-
-def test_plan_a_later_session_named_first_holds_what_the_earlier_ones_left() -> None:
-    both = [
-        request("a", phases=L1, low=8, high=8, need=E16),
-        request("b", phases=ALL, low=8, high=8, need=E16),
-    ]
-    capacity = {Phase.L1: 8.0, Phase.L2: 16.0, Phase.L3: 16.0}
-
-    result = plan(both, prices_from([0.1] * 8), capacity, first=("a", "b"))
-
-    assert slots(result["a"])[0] == 0
-    assert 0 not in slots(result["b"])
-
-
-@pytest.mark.parametrize("first", [("ghost",), (), []])
-def test_plan_a_first_that_holds_nothing_changes_no_plan(first: Sequence[str]) -> None:
-    prices = {NOW + QUARTER * i: (0.1 if i < 8 else 0.5) for i in range(32)}
-    reqs = [
-        request("a", need=3.0, deadline=NOW + timedelta(hours=8)),
-        request("b", need=7.0, deadline=NOW + timedelta(hours=2)),
-    ]
-
-    assert plan(reqs, prices, first=first) == plan(reqs, prices)
-
-
-def test_plan_a_session_whose_own_plan_skips_the_current_quarter_holds_nothing() -> (
-    None
-):
-    prices = prices_from([0.9] * 4 + [0.1] * 12)
-    cheap_later = request("a", need=E16 * 2, deadline=NOW + QUARTER * 16)
-    other = request("b", need=E16 * 2, deadline=NOW + QUARTER * 6)
-
-    result = plan([cheap_later, other], prices, first=("a",))
-
-    assert 0 not in slots(result["a"])
-    assert result == plan([cheap_later, other], prices)
-
-
-def test_plan_first_names_the_same_session_twice_as_once() -> None:
-    reqs = [
-        request("a", low=16, high=16, need=E16),
-        request("b", low=16, high=16, need=E16),
-    ]
-
-    assert plan(reqs, first=("b", "a", "b")) == plan(reqs, first=("b", "a"))
-
-
-def test_plan_first_given_as_a_bare_string_is_refused_not_read_as_characters() -> None:
-    reqs = [request("a"), request("b"), request("ab")]
-
-    with pytest.raises(TypeError, match="'ab'"):
-        plan(reqs, first="ab")
-
-
-def test_plan_first_accepts_a_list_and_a_tuple_alike() -> None:
-    reqs = [request("a", low=16, high=16), request("b", low=16, high=16)]
-
-    assert plan(reqs, first=["b"]) == plan(reqs, first=("b",))
-
-
-def test_plan_first_does_not_mutate_its_arguments() -> None:
-    first = ["b", "a"]
-    capacity = dict(CAP16)
-    prices = prices_from([0.1] * 8)
-    reqs = [request("a"), request("b")]
-
-    plan(reqs, prices, capacity, first=first)
-
-    assert first == ["b", "a"]
-    assert capacity == CAP16
-    assert prices == prices_from([0.1] * 8)
-
-
-def test_plan_a_session_closed_to_the_current_quarter_starts_with_the_next() -> None:
-    prices = prices_from([0.1] * 8)
-    closed = PlanRequest("a", L1, 6, 16, 1.84, NOW + QUARTER * 8, skip_current=True)
-
-    result = plan([closed], prices)["a"]
-
-    assert slots(result) == [1, 2]
-    assert result.reachable is True
-
-
-def test_plan_a_closed_session_leaves_the_current_quarter_to_the_others() -> None:
-    prices = prices_from([0.1] * 8)
-    closed = PlanRequest("a", L1, 16, 16, 2 * E16, NOW + QUARTER * 2, skip_current=True)
-    open_ = request("b", low=16, high=16, need=E16, deadline=NOW + QUARTER * 8)
-
-    result = plan([closed, open_], prices, block=1)
-
-    assert slots(result["b"]) == [0]
-    assert slots(result["a"]) == [1]
-    assert result["a"].reachable is False
-
-
-def test_plan_a_closed_session_with_no_quarter_left_plans_nothing() -> None:
-    closed = PlanRequest("a", L1, 6, 16, 1.84, NOW + QUARTER, skip_current=True)
-
-    result = plan([closed], prices_from([0.1] * 4))["a"]
-
-    assert result.quarters == ()
-    assert result.reachable is False
-
-
-@settings(deadline=None, max_examples=150, derandomize=True)
-@given(
-    data=st.data(),
-    capacity=st.fixed_dictionaries(
-        {phase: st.integers(0, 20).map(float) for phase in Phase}
-    ),
-    block=st.integers(1, 3),
-)
-def test_plan_sessions_that_hold_the_current_quarter_never_book_beyond_the_capacity(
-    data: st.DataObject, capacity: dict[Phase, float], block: int
-) -> None:
-    phase_sets = [L1, L2, frozenset({Phase.L1, Phase.L2}), ALL]
-    count = data.draw(st.integers(1, 4))
-    reqs = []
-    for index in range(count):
-        low = data.draw(st.sampled_from([6, 8, 10]))
-        high = data.draw(st.sampled_from([low, 16]))
-        reqs.append(
-            PlanRequest(
-                f"c{index}",
-                data.draw(st.sampled_from(phase_sets)),
-                low,
-                high,
-                data.draw(st.floats(0, 12)),
-                NOW + QUARTER * data.draw(st.integers(1, 24)),
-                skip_current=data.draw(st.booleans()),
-            )
-        )
-    prices = prices_from(
-        [data.draw(st.sampled_from([0.1, 0.2, 0.5])) for _ in range(24)]
-    )
-    ids = [r.charger_id for r in reqs]
-    held = data.draw(st.permutations(ids))[: data.draw(st.integers(0, count))]
-
-    result = plan(reqs, prices, capacity, block, first=held)
-
-    booked: dict[tuple[int, Phase], float] = {}
-    for item in reqs:
-        planned = result[item.charger_id]
-        assert slots(planned) == sorted(set(slots(planned)))
-        if item.skip_current:
-            assert 0 not in slots(planned)
-        for q in planned.quarters:
-            index = int((q.start.astimezone(UTC) - NOW) / QUARTER)
-            for phase in item.phases:
-                key = (index, phase)
-                booked[key] = booked.get(key, 0.0) + q.current
-    assert all(total <= capacity[phase] + 1e-6 for (_, phase), total in booked.items())
-    assert plan(list(reversed(reqs)), prices, capacity, block, first=held) == result
 
 
 def test_plan_urgency_does_not_depend_on_the_order_of_the_requests() -> None:
