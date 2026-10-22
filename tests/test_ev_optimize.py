@@ -31,6 +31,7 @@ from energy_optimization.ev.optimize import (
     SolverError,
     Tier,
     _current,
+    _price_ticks,
     _verify,
     optimize,
 )
@@ -823,27 +824,57 @@ def test_demand_accepts_zero_and_a_maximum_below_the_minimum(
 
 
 @pytest.mark.parametrize(
-    ("low", "high"),
-    [(6.5, 16.0), (7.5, 4.0), (0.5, 16.0), (6.000001, 16.0)],
-    ids=["above", "inverted", "below-one", "just-fractional"],
+    ("low", "high", "now_high"),
+    [
+        (6.5, 16.0, 16.0),
+        (7.5, 4.0, 16.0),
+        (7.5, 16.0, 4.0),
+        (0.5, 16.0, 16.0),
+        (6.000001, 16.0, 16.0),
+    ],
+    ids=[
+        "above",
+        "later-off-now-on",
+        "later-on-now-off",
+        "below-one",
+        "just-fractional",
+    ],
 )
 @pytest.mark.parametrize("tier", list(Tier))
-def test_demand_rejects_a_fractional_minimum_on_an_adjustable_charger(
-    tier: Tier, low: float, high: float
+def test_demand_rejects_a_fractional_minimum_on_a_charger_that_can_run_adjustably(
+    tier: Tier, low: float, high: float, now_high: float
 ) -> None:
     # An adjustable charger runs in whole amps, so 7.5 A as a minimum would really mean
     # 8 A while the fit tests count it at 7.5 A and the solve could not be satisfied.
     deadline = NOW if tier is Tier.PLANNED else None
 
     with pytest.raises(ValueError, match=r"^min_current.*whole"):
-        Demand("a", L1, tier, low, high, 16.0, deadline=deadline)
+        Demand("a", L1, tier, low, high, now_high, deadline=deadline)
 
 
-def test_demand_accepts_a_whole_minimum_given_as_a_float_and_an_equal_fraction() -> (
-    None
-):
-    assert Demand("a", L1, Tier.CHARGE_NOW, 6.0, 16.0, 16.0).min_current == 6.0
-    assert Demand("a", L1, Tier.CHARGE_NOW, 7.5, 7.5, 7.5).min_current == 7.5
+@pytest.mark.parametrize(
+    ("low", "high", "now_high"),
+    [
+        (7.5, 7.5, 7.5),
+        (7.5, 7.5, 16.0),
+        (7.5, 5.0, 5.0),
+        (7.5, 0.0, 0.0),
+        (6.0, 16.0, 16.0),
+    ],
+    ids=[
+        "on-off",
+        "on-off-high-now",
+        "user-limited-on-off",
+        "limited-to-zero",
+        "whole",
+    ],
+)
+def test_demand_accepts_a_fractional_minimum_only_when_it_can_never_run_adjustably(
+    low: float, high: float, now_high: float
+) -> None:
+    # `decide` builds the second and third shapes: an on/off pump at 7.5 A under a user
+    # limit of 5 A is off in every quarter, and that is not an error.
+    assert Demand("a", L1, Tier.CHARGE_NOW, low, high, now_high).min_current == low
 
 
 def test_demand_is_frozen() -> None:
@@ -1944,3 +1975,39 @@ def test_optimize_the_fill_issues_the_same_solver_calls_every_run(
     assert calls[3] == calls[4] and calls[3]
     assert outcomes[0] == outcomes[1]
     assert outcomes[2] == outcomes[3]
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        ([0.20001, 0.2], [20001, 20000]),
+        ([0.1, 0.2, 0.3], [1, 2, 3]),
+        ([0.5], [1]),
+        ([-0.2, 0.2, 0.0], [-1, 1, 0]),
+        ([0.25, 0.5, 0.75], [1, 2, 3]),
+        ([0.1 + 0.2, 0.3], [1, 1]),
+    ],
+    ids=[
+        "one tick apart",
+        "tenths",
+        "single",
+        "negative and zero",
+        "quarters",
+        "float noise",
+    ],
+)
+def test_price_ticks_finds_the_coarse_grid_of_the_prices(
+    values: list[float], expected: list[int]
+) -> None:
+    assert _price_ticks(values) == expected
+
+
+@pytest.mark.parametrize(
+    "values",
+    [[], [0.0, 0.0], [0.123456789, 0.2], [1e-8, 2e-8], [1000.0, 0.00001]],
+    ids=["none", "all zero", "grid finer than 1e-7", "tiny prices", "too many ticks"],
+)
+def test_price_ticks_gives_up_when_the_grid_is_too_fine_or_too_wide(
+    values: list[float],
+) -> None:
+    assert _price_ticks(values) is None

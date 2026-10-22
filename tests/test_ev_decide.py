@@ -2444,6 +2444,12 @@ def assert_invariants(snapshot: Snapshot, result: Decision) -> None:
         if reserved(c) or session is None or not states[c.id].car_connected:
             return False
         limit = session.user_current_limit
+        if not fresh:
+            # Stale measurements cap every charger at its fallback current.
+            cap = c.fallback_current
+            cap = cfg.fallback_current if cap is None else cap
+            if floor_of(c) > cap + TOLERANCE:
+                return False
         return limit is None or floor_of(c) <= limit + TOLERANCE
 
     phase_room: dict[Phase, float] = {}
@@ -4010,3 +4016,65 @@ def test_the_output_does_not_depend_on_the_hash_seed_through_the_planned_fill() 
         c["charger_id"]: c["allocation"] for c in json.loads(outputs.pop())["chargers"]
     }
     assert first_quarter == {"a": 8.0, "b": 11.0, "c": 11.0}
+
+
+@pytest.mark.parametrize(
+    ("limit", "now"),
+    [(5, False), (5, True), (0, False)],
+    ids=["planned", "charge-now", "limit-zero"],
+)
+def test_decide_a_fractional_on_off_charger_under_a_lower_user_limit_stays_off(
+    limit: int, now: bool
+) -> None:
+    # The optimiser refuses a fractional minimum on a charger that could run adjustably;
+    # a 7.5 A pump limited to 5 A is off in every quarter and must not trip that check.
+    result = decide(
+        snap(
+            [pump("p", assumed=7.5), adj("a")],
+            sessions=[
+                sess("p", need=5.0, user_current_limit=limit, charge_now=now),
+                sess("a", need=5.0),
+            ],
+            prices=hourly([0.2] * 12),
+        )
+    )
+
+    assert by_id(result)["p"].allocation == 0.0
+    assert by_id(result)["a"].allocation > 0.0
+
+
+def test_decide_a_fractional_on_off_charger_under_the_fallback_cap_stays_off() -> None:
+    result = decide(
+        snap(
+            [pump("p", assumed=7.5)],
+            sessions=[sess("p", need=5.0)],
+            prices=hourly([0.2] * 12),
+            currents=None,
+            fallback=6,
+        )
+    )
+
+    assert by_id(result)["p"].allocation == 0.0
+
+
+def test_the_tier_invariant_does_not_count_a_charger_the_fallback_cap_keeps_off() -> (
+    None
+):
+    # Found by a stress run over 600 generated snapshots (step 5 re-run): a smart-off
+    # charger with a 10 A minimum cannot run under a 4 A fallback cap, so the spare car
+    # beside it holding 4 A is correct, and the oracle must not call it a violation.
+    snapshot = snap(
+        [adj("x", L1, 10, 15), adj("y", L1, 1, 17)],
+        sessions=[
+            sess("x", need=20.0, smart_charging=False),
+            sess("y", need=0.0),
+        ],
+        prices=hourly([0.2] * 12),
+        currents=None,
+        fallback=4,
+    )
+
+    result = decide(snapshot)
+
+    assert allocations(result) == {"x": 0.0, "y": 4.0}
+    assert_invariants(snapshot, result)

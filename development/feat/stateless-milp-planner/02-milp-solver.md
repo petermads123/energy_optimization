@@ -1,6 +1,6 @@
 # MILP solver
 
-<!-- claude-plan step=5 status=active -->
+<!-- claude-plan step=6 status=active -->
 
 
 | Field | Value |
@@ -18,7 +18,7 @@
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done (re-run after the step-6 halt) |
 | 4 | Verify | `/verify` | in `/build` | done (re-run after the step-6 halt) |
-| 5 | Test | `/test` | in `/build` | pending (re-run) |
+| 5 | Test | `/test` | in `/build` | done (re-run after the step-6 halt) |
 | 6 | Concept check | `/concept-check` | in `/build` | pending (re-run) |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
@@ -251,7 +251,7 @@ New, in `optimize.py`:
 | `class SolverError(RuntimeError)`; `__init__(self, status: int, message: str) -> None`; attributes `status`, `message`; `str(err) == f"HiGHS status {status}: {message}"` | `optimize` | The solver failed; carries scipy's `milp` status and message | A6 |
 | `NODE_LIMIT: int` | `optimize` | Branch-and-bound nodes allowed per level solve. Fixed by step 3's benchmark as the largest power-of-two multiple of 1000 that keeps every A5 tier (3 chargers ≤ 10 s, 7 ≤ 60 s, 10 ≤ 120 s) inside its bound, with the measurement recorded in section 3 | A5 |
 | `class Tier(IntEnum)`: `SMART_OFF = 0`, `CHARGE_NOW = 1`, `PLANNED = 2`, `SPARE = 3` | `optimize` | Which precedence stage a demand belongs to | A3 |
-| `Demand(charger_id: str, phases: frozenset[Phase], tier: Tier, min_current: float, max_current: float, now_max_current: float, need_kwh: float = 0.0, deadline: datetime \| None = None)` | `optimize` | One charger asking for current, given in ranking order. `min_current == max_current` is all-or-nothing (on/off). `now_max_current` caps quarter 0 (user limit, fallback), `max_current` the later quarters. Quarter-0-only tiers ignore `need_kwh`, `deadline` and `max_current`. `PLANNED` requires an aware `deadline`. Validates itself in `__post_init__`, raising `ValueError` naming the field (`tier` must be a `Tier`, step 5). Currents must be finite and ≥ 0. `max_current` or `now_max_current` below `min_current` is allowed and means off in those quarters, which keeps the `user_current_limit=0` regression and its `TARGET_UNREACHABLE`. `need_kwh` must be finite and ≥ 0. `PLANNED` requires an aware `deadline` | A1, A3 |
+| `Demand(charger_id: str, phases: frozenset[Phase], tier: Tier, min_current: float, max_current: float, now_max_current: float, need_kwh: float = 0.0, deadline: datetime \| None = None)` | `optimize` | One charger asking for current, given in ranking order. `min_current == max_current` is all-or-nothing (on/off). `now_max_current` caps quarter 0 (user limit, fallback), `max_current` the later quarters. Quarter-0-only tiers ignore `need_kwh`, `deadline` and `max_current`. `PLANNED` requires an aware `deadline`. Validates itself in `__post_init__`, raising `ValueError` naming the field (`tier` must be a `Tier`, step 5). Currents must be finite and ≥ 0. A fractional `min_current` is refused with a `ValueError` naming `min_current` when the demand is neither on/off (`min_current == max_current`) nor always off (both `max_current` and `now_max_current` below it): an adjustable charger runs in whole amps (step 5, deviation 20). `max_current` or `now_max_current` below `min_current` is allowed and means off in those quarters, which keeps the `user_current_limit=0` regression and its `TARGET_UNREACHABLE`. `need_kwh` must be finite and ≥ 0. `PLANNED` requires an aware `deadline` | A1, A3 |
 | `Outcome(allocations: dict[str, float], plans: dict[str, SessionPlan], proven: bool)` | `optimize` | Quarter-0 current for every demand; a plan for every `PLANNED` demand; `proven` False when any level stopped at the node budget | A1, A5 |
 | `optimize(demands: Sequence[Demand], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], now_capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str) -> Outcome` | `optimize` | Solve the lexicographic model below. `capacity` holds per phase in quarters 1 onward, before `SMART_OFF` demands, which keep their quarter-0 current there. `now_capacity` holds in quarter 0. Prices are keyed by UTC quarter start, and a missing quarter is unpriced. Negative capacities count as 0. With no demands it returns `Outcome({}, {}, True)` without solving. Raises `SolverError` (A6), and `ValueError` for a naive `now` or a repeated charger id | A1–A3, A5, A6 |
 | `main() -> None` | `optimize` | Showcase: two planned cars on a shared phase, a charge-now car taking quarter 0 first, then a spare-capacity car on the leftover | — |
@@ -294,9 +294,12 @@ Constraints:
 5. Starts and minimum block: `y_{d,t} ≥ x_{d,t} − x_{d,t−1}` (with `x_{d,−1} = 0`), and
    `x_{d,t+k} + w_{d,t} ≥ y_{d,t}` for `k = 1..L−1` while `t+k ∈ W_d`, with `w_{d,t} ≥ 0`.
    The block is soft. A run that the deadline cuts short is not penalised.
-6. Planned even split (level P6 only): once level P5 has fixed `x_{·,0}`, add
-   `z ≤ i_{d,0}` for every `PLANNED` demand with `x_{d,0} = 1`. A car that is off adds no
-   bound, so switching a car off can never raise `z`.
+6. Planned even split (level P6 only): once level P5 has fixed `x_{·,0}`, the planned cars
+   that are on now share the first quarter by progressive filling (the P6 row), not by a
+   single bound `z ≤ i_{d,0}`: each round adds an integer level `f` with `i_{d,0} ≥ f` for the
+   cars still live, and holds it. A car that is off adds no bound, so switching a car off
+   can never raise the level. (Amended at the step-6 halt and again in step 5; the single
+   max-min this row used to describe is gone.)
 
 Levels run in this order. Each is minimised with every earlier level held at its optimum.
 A level with no non-zero coefficient, or no demand of its tier, is skipped.
@@ -320,15 +323,17 @@ size.
 | P2 | `Σ e_d·i_{d,t}` over unpriced `t` | Avoid unpriced quarters |
 | P3 | `Σ e_d·i_{d,t}` over `t` priced above `price_cap` | Use the cap only to meet the need |
 | P4 | `Σ w_{d,t}` | Avoid runs shorter than the minimum block |
-| P5 | `Σ π_t·e_d·i_{d,t}` over priced `t`; then, **when quarter 0 is unpriced**, minimise `Σ_d i_{d,0}` and hold it (the latest-first rule fixes how much charging quarter 0 gets; amended at the step-6 halt); then maximise `Σ x_{d,0}`, then in ranking order each `x_{d,0}` (each car is on if that is still possible after those ranked above it), and fix `x_{·,0}` | Lowest price; among equally cheap plans, as many cars as possible on now, the better-ranked ones first (the ranking part is deviation 11). With quarter 0 unpriced its total is held first, so the cars the need forces into quarter 0 are switched on and share it, without pulling unpriced charging earlier (deviation 9 superseded at the step-6 halt) |
-| P6 | Progressive filling over the planned cars on now, as S2: repeatedly maximise an integer `f` with `i_{d,0} ≥ min(f, hi_{d,0})` for the unsaturated ones, holding every earlier result; after each round mark saturated every car at its `hi`, or whose `i_{d,0}` cannot exceed `f` with everything held; stop when all are saturated. Runs whether quarter 0 is priced or not | Even split among the planned cars on now, as far as cost allows (8/11/11 for caps 8, 16, 16 on 30 A at equal prices; 8/8 for two forced cars in an unpriced quarter 0). Amended at the step-6 halt from a single max-min |
+| P5 | `Σ π_t·e_d·i_{d,t}` over priced `t`, held **exactly** when the prices lie on a grid and every current is whole (below); then, **when quarter 0 is unpriced**, minimise the first-quarter **energy** `Σ_d e_d·i_{d,0}` (kWh, not amps) and hold it (the latest-first rule fixes how much charging quarter 0 gets; amended at the step-6 halt, kWh in step 5, deviation 18); then maximise `Σ x_{d,0}`, then in ranking order each `x_{d,0}` (each car is on if that is still possible after those ranked above it), and fix `x_{·,0}` | Lowest price; among equally cheap plans, as many cars as possible on now, the better-ranked ones first (the ranking part is deviation 11). With quarter 0 unpriced its energy is held first, so the cars the need forces into quarter 0 are switched on and share it, without pulling unpriced charging earlier (deviation 9 superseded at the step-6 halt). Measured in kWh because A2 promises unpriced quarters "only when needed": amps would let a three-phase car put three times the energy into an unpriced quarter 0 that a single-phase one would. **Exact price hold** (deviation 19): when every price is a whole multiple of a tick of at least 1e-7 and every current is whole, the objective is written in whole ticks (`price/tick × |phases|` per amp-quarter) and held at its rounded optimum plus 0.5, so a quarter dearer by one tick is never bought; otherwise it is held to the numerical tolerance |
+| P6 | Progressive filling over the planned cars that are on now **and can still rise** (adjustable, with a first-quarter limit above the minimum; an on/off car, or one limited to its minimum, takes its current and is not part of the fill): repeatedly maximise an integer `f` with `i_{d,0} ≥ f` for the live cars, holding every earlier result; after each round mark saturated every car at its `hi`, or whose `i_{d,0}` cannot exceed `f` with everything held; stop when no car is live. **If a round saturates no car** (each could rise alone but not all together, e.g. three cars on 20 A) the loop ends and the remainder goes in ranking order, as S3 does (deviation 16). Runs whether quarter 0 is priced or not. Integer columns are rounded before they are compared, because HiGHS returns 7 as 6.9999995 (deviation 21) | Even split among the planned cars on now, as far as cost allows (8/11/11 for caps 8, 16, 16 on 30 A at equal prices; 8/8 for two forced cars in an unpriced quarter 0). Amended at the step-6 halt from a single max-min, and in step 5 to say what the code does |
 | P7 | `Σ τ_{d,t}·i_{d,t}`, with `τ = (t+1)·(n−r_d)` for priced `t` and `τ = (T−t)·(r_d+1)` for unpriced `t`; `r_d` is the position among the `PLANNED` demands and `n` their number | Earlier priced quarters first; unpriced quarters latest first, as in round 1; the better-ranked car gets the earlier quarter of either kind. `τ` is not separable, so swapping two cars between quarters changes it. A product is minimised by pairing its large factors with its small ones, so the rank factor is `n−r` (large for the better-ranked car) beside `t+1`, and `r+1` (large for the worse-ranked car) beside `T−t`. Corrected in step 5, deviation 10 |
 
 The full run is S1–S3 for `SMART_OFF`, S1–S3 for `CHARGE_NOW`, P1–P7, then S1–S3 for
 `SPARE`. Stages that have no demands are skipped.
 
-Holding a level: after level `k` returns a value `v`, its row becomes `objective ≤ v + tol`
-with `tol = 1e-6·max(1, |v|)`.
+Holding a level: after level `k` returns a value `v`, its row becomes `objective ≤ v + tol`.
+`tol` is `0.5` after rounding `v` for a level that can only take whole values (amps, counts,
+price ticks), and `1e-6 + 1e-9·|v|` otherwise (deviation 4; the first draft's `1e-6·max(1, |v|)`
+allowed two amp-quarters at a price step of 0.001).
 
 Every solve:
 - Options are `{"node_limit": NODE_LIMIT, "mip_rel_gap": 0.0, "presolve": True, "threads": 1}`.
@@ -849,6 +854,96 @@ measurement; it is kept (the node-budget tests and the not-proven path are writt
 and no value up to 1,024,000 changes a time on the grid.
 
 
+### Step-5 re-run changes (2026-10-22)
+
+Found by tests written in step 5's re-run, each red first and then green (section 5). They
+change `optimize.py` only; the Public API table is unchanged except the `Demand` row's
+validation sentence (deviation 20). Section 2's P5 and P6 rows, constraint 6 and the
+holding paragraph were rewritten to say what the code does.
+
+18. *The unpriced first quarter's forced total is held in kWh, not amps.* P5's second part
+    minimised `Σ i_{d,0}` in amps, so a three-phase car could put three times the energy
+    into an unpriced quarter 0 that a single-phase one would, against A2's "unpriced
+    quarters used only when needed and latest first" (a plan-level correction toward A2's
+    wording; it breaks no other criterion). Now `Σ |phases_d|·i_{d,0}` (energy up to the
+    constant `e` of one amp on one phase), held as a whole number when all currents are
+    whole. Red: `test_optimize_an_unpriced_first_quarter_holds_the_forced_energy_not_the_forced_amps`
+    (a three-phase and a single-phase car, 12 A-quarters each, no prices, 16 A):
+    `{'c': 6.0, 's': 6.0}` against `{'c': 0.0, 's': 12.0}`, which puts 0.69 kWh into the
+    unpriced quarter instead of 1.38 kWh. Green after the fix.
+19. *The price level is held exactly, in whole price ticks.* Reproduced: a car needing 20
+    A-quarters over two quarters at prices 0.20001 then 0.20 EUR/kWh (a one-tick, 10 EUR/MWh
+    resolution, difference) with 14 A in the cheap second quarter, so 6 A now is the cheapest
+    plan: `{'a': 9.0}` instead of `{'a': 6.0}`. Three amps of the dearer quarter were bought
+    because the hold slack (`1e-6`, and HiGHS's own `1e-7` feasibility tolerance on top) is
+    larger than one amp-quarter's price step (`1e-5 × 0.0575 = 5.75e-7`), and the cars-on-now
+    maximise, the fill and P7 all spend whatever slack the hold leaves. Now, when every
+    priced quarter's price is a whole multiple of a tick of at least `1e-7` (their gcd in
+    units of `1e-9`, at most `10^7` ticks) and every current is whole, P5's first part is
+    minimised in whole ticks (`price/tick × |phases|` per amp-quarter) and held at its
+    rounded optimum plus 0.5. A strictly cheaper quarter is then never given up, equal
+    prices still tie freely (`test_optimize_equal_prices_still_leave_the_split_free_after_the_tick_fix`),
+    and a hold with whole-number steps cannot make the model infeasible any more than the
+    other integral levels can. `_Problem.hold` now rounds the value of an integral level
+    before adding 0.5 (the solver's value can be off by its integrality tolerance times
+    large coefficients). Not covered, still held to the numerical tolerance: prices on a grid
+    finer than `1e-7`, a fractional on/off current anywhere in the problem, and prices of
+    more than `10^7` ticks. The first draft of the equal-price test expected 16 A for `a`; that
+    was a wrong expectation (a 4 A second quarter is below the 6 A minimum), the plan has 14 A
+    now and 6 A later.
+20. *`Demand` refuses a fractional `min_current` on a charger that can run adjustably.* The
+    current of an adjustable demand is an integer variable with `i ≥ min·x`, so a minimum
+    of 7.5 A really means 8 A while the fit tests count 7.5 A, and the quarter-0 stage could
+    ask for an infeasible model (`optimize` with a 7.5 to 16 A charge-now demand and 7.9 A of
+    room). The refusal is a `ValueError` naming `min_current`. The first version refused every
+    fractional minimum that differs from the maximum; a 600-snapshot stress run over
+    `random_snapshot` then showed `decide` reaching it: an on/off pump at 7.5 A under a user
+    limit of 5 A gives `min 7.5, max 5, now_max 5`, which is off in every quarter. Red:
+    `test_decide_a_fractional_on_off_charger_under_a_lower_user_limit_stays_off[planned]` and
+    `[limit-zero]` raised `ValueError: min_current: must be a whole number ...` from
+    `decide`. Final rule: refused when `min_current != max_current`, the minimum is
+    fractional and `max(max_current, now_max_current) >= min_current`. (The brief said
+    `decide` cannot reach a fractional minimum; it can, through an on/off charger under a
+    lower limit, and the final rule lets that through.) `_random_demands` in the limits property now draws a fractional minimum only for on/off
+    demands.
+21. *The fill compares rounded integer columns.* HiGHS returns 7 as 6.9999995 within its
+    `1e-6` integrality tolerance, and `_fill_now` tested `held >= reached + 1 - 1e-9`, so a
+    car already at the next amp was judged stuck and the ranking remainder skipped. Red:
+    `test_optimize_the_fill_is_robust_to_solver_integrality_noise` (every returned entry
+    above 0.5 lowered by `5e-7`, two cars on 15 A): `{'a': 7.0, 'b': 8.0}` against
+    `{'a': 8.0, 'b': 7.0}`. The three comparisons (`known`, `held`, the probe) now round.
+22. *Probes.* No code change. A failing probe already raises `SolverError` and a probe
+    stopped at the node budget already makes `proven` False (both pinned in step 5);
+    `Outcome` and `optimize` now say "every solve" instead of "every level".
+
+*Timing after these changes* (whole `decide`, `benchmark_snapshot` as before with 3-decimal
+prices, 4 cores, one thread, `NODE_LIMIT = 8000`, seconds, nothing else running; no
+`PLAN_NOT_PROVEN_OPTIMAL` anywhere):
+
+| Cell | Tier | Times (seeds in order) | Worst |
+|---|---|---|---|
+| 1 @ 35 A | 10 s | 0.09 0.06 0.10 0.04 0.06 | 0.10 |
+| 2 @ 35 A | 10 s | 0.18 0.14 0.27 0.10 0.12 | 0.27 |
+| 3 @ 35 A | 10 s | 0.62 0.17 0.53 0.32 0.89 0.35 0.40 0.28 | 0.89 |
+| 2 @ 50 A | 10 s | 0.25 0.13 0.28 0.14 0.16 | 0.28 |
+| 3 @ 50 A | 10 s | 0.45 0.17 0.32 0.29 0.27 | 0.45 |
+| 5 @ 50 A | 60 s | 1.53 1.13 2.50 1.29 2.38 0.60 1.07 0.93 | 2.50 |
+| 3 @ 70 A | 10 s | 0.36 0.17 0.35 0.25 0.30 | 0.36 |
+| 5 @ 70 A | 60 s | 0.82 0.54 1.21 0.79 0.60 | 1.21 |
+| 7 @ 70 A | 60 s | 3.65 4.95 2.33 1.89 1.64 1.67 2.34 2.29 | 4.95 |
+| 10 @ 70 A | 120 s | 6.52 5.92 11.08 2.16 46.10 1.89 6.40 23.66 | **46.10** (seed 5) |
+
+Every tier holds (the 10-charger worst case 46.1 s of 120 s; 59.5 s before this pass). The
+same three named cells with 5-decimal prices, which give the exact hold larger tick numbers
+(seeds 1 to 5, 10 @ 70 A seeds 1 to 8): 3 @ 35 A worst 0.42, 7 @ 70 A worst 14.48, 10 @ 70 A
+worst 15.62. Risk 1 does not trigger. A stress run beside the grid: 600 `random_snapshot`
+snapshots with prices rounded to 5, 3, 5 and 2 decimals in turn, and 500 planned-heavy ones
+(2 to 4 adjustable chargers on shared phases, flat and varying prices, a priced or unpriced
+first quarter): 0 `SolverError`s and 0 invariant failures in both; the planned-heavy set had 6
+node-budget stops (a not-proven event, every limit kept), as the step-4 code did on the same
+500 snapshots (6; worst 19.9 s then, 18.6 s now).
+
+
 ## 4. Verification log
 
 > Written in step 4: the static half. Command output, not a summary of it.
@@ -950,6 +1045,73 @@ Edge cases considered and deliberately skipped, with reasons:
 - *`mip_node_count` missing from the result*: `getattr(..., 0)` is a defence for scipy
   versions that omit it; the real result always carries it, so there is nothing to simulate
   beyond the stubs that already set it.
+
+### Re-run after the step-6 halt (step 5, 2026-10-22)
+
+Two `test-designer` reports (`input-space` 14 cases and 3 contradictions, `contract` 12
+cases and 7 contradictions) were merged. Every case was written (one oracle change, the
+rest as tests), and every contradiction is settled below. The designers' hand-worked
+expectations held on the first run except the two that exposed real behaviour (the
+three-phase unpriced total and the price tick, bugs 1 and 2 below); the only expectation of
+mine that was wrong was an equal-price control (deviation 19).
+
+| Intent | Test names | Result |
+|---|---|---|
+| T2 oracle, amended P5/P6 | `level_tuple` now emits the forced first-quarter energy when it is unpriced, the cars-on count and flags whether or not the first quarter is priced, and the fill levels (minimum, then each car in ranking order) over the live cars only (adjustable, first-quarter limit above the minimum); `test_optimize_matches_a_brute_force_enumeration_level_by_level` also draws three-phase demands. It passed on the unchanged model at 60 and 600 examples (so the amps-versus-kWh question needed a hand-made case, below); it passes on the final code at 300 examples (the suite keeps 60) | pass |
+| A3 planned tier, even first quarter | `test_optimize_an_unpriced_first_quarter_forced_to_one_car_switches_on_the_better_ranked` (2), `..._a_forced_expensive_first_quarter_is_split_evenly`, `..._the_even_split_never_pulls_a_car_into_an_expensive_first_quarter`, `..._planned_cars_tied_at_a_cap_leave_the_rest_to_the_uncapped_car`, `..._a_capped_first_car_passes_the_ranking_remainder_on`, `..._where_one_phase_binds_raise_the_free_phase_car_to_its_top`, `..._an_on_off_car_ranked_first_keeps_its_slot_and_the_adjustable_takes_the_rest`, `..._a_fractional_on_off_car_lowers_the_even_level_to_an_exact_fit`, `..._an_unpriced_first_quarter_takes_the_smaller_fractional_on_off_car`, `..._planned_cars_all_capped_below_the_room_get_their_caps`, `..._planned_cars_fill_to_their_own_limits_at_equal_prices` (6: unequal minimums, a car at its first-quarter limit, one limited to its minimum, an on/off car, a fractional limit of 10.5 A, a car off now), `..._a_need_limited_car_saturates_below_its_max_and_the_other_takes_the_rest`, `..._the_fill_never_moves_current_from_a_cheaper_quarter_into_the_first`, `..._an_unpriced_first_quarter_with_an_odd_forced_total_gives_the_extra_amp_by_rank`, `..._the_fill_leaves_every_plan_reachable_with_the_same_total_energy`; through `decide`: `test_decide_planned_cars_tied_at_a_user_limit_leave_the_rest_to_the_other`, `..._two_cars_forced_into_an_unpriced_current_quarter_share_it_in_plan`, `test_the_output_does_not_depend_on_the_hash_seed_through_the_planned_fill` | pass, first run |
+| A2 unpriced only as needed, in energy | `test_optimize_an_unpriced_first_quarter_holds_the_forced_energy_not_the_forced_amps` | red, then green (bug 1) |
+| A2 cheapest quarter first, to the price resolution | `test_optimize_a_first_quarter_dearer_by_one_price_tick_gets_no_extra_amp` (red, then green: bug 2), `test_optimize_equal_prices_still_leave_the_split_free_after_the_tick_fix`, `test_price_ticks_finds_the_coarse_grid_of_the_prices` (6), `test_price_ticks_gives_up_when_the_grid_is_too_fine_or_too_wide` (5) | pass |
+| A3 stable under solver noise | `test_optimize_the_fill_is_robust_to_solver_integrality_noise` | red, then green (bug 3) |
+| A6 and A5 for probes | `test_optimize_a_probe_failure_raises_solver_error` (status 2 from a probe, the wrapper saw `keep=False`), `test_optimize_a_probe_stopped_at_the_node_budget_is_not_proven` | pass, no code change needed |
+| A5 same solver calls every run | `test_optimize_the_fill_issues_the_same_solver_calls_every_run` (the `c` vector of every `milp` call, twice, for two fill instances), `test_the_output_does_not_depend_on_the_hash_seed_through_the_planned_fill` | pass |
+| A1 `Demand` validation | `test_demand_rejects_a_fractional_minimum_on_a_charger_that_can_run_adjustably` (5 shapes x 4 tiers), `test_demand_accepts_a_fractional_minimum_only_when_it_can_never_run_adjustably` (5), through `decide`: `test_decide_a_fractional_on_off_charger_under_a_lower_user_limit_stays_off` (3), `..._under_the_fallback_cap_stays_off` | red, then green (bug 4) |
+| T4 oracle for the tier invariant | `test_the_tier_invariant_does_not_count_a_charger_the_fallback_cap_keeps_off` | red on the old oracle, green (bug 5, a wrong expectation) |
+
+**Bugs found, each red first and then green:**
+
+| # | Bug | Red | Fix (section 3) |
+|---|---|---|---|
+| 1 | The unpriced first quarter's forced total was measured in amps, so a three-phase car could put three times the kWh there | `{'c': 6.0, 's': 6.0}` against `{'c': 0.0, 's': 12.0}` | deviation 18; green |
+| 2 | A strictly cheaper quarter was given up for a dearer one at a one-tick price difference (hold slack larger than a price step) | `{'a': 9.0}` against `{'a': 6.0}` (prices 0.20001 then 0.2) | deviation 19; green |
+| 3 | The fill judged a car at 6.9999995 A stuck and skipped the ranking remainder | `{'a': 7.0, 'b': 8.0}` against `{'a': 8.0, 'b': 7.0}` with `5e-7` of noise | deviation 21; green |
+| 4 | (introduced and caught inside this step) the first `Demand` refusal of a fractional `min_current` made `decide` raise for an on/off pump at 7.5 A under a 5 A user limit | `ValueError: min_current: must be a whole number ...` from `decide` (`[planned]`, `[limit-zero]`), found by the 600-snapshot stress run | deviation 20; green |
+| 5 | The test oracle `assert_invariants` called a spare car holding current a violation although the smart-off charger beside it could not run under the 4 A fallback cap (a wrong expectation in the oracle; the code was right). Present at the step-4 commit too | `y holds current that x could use` | the oracle's `can_run` now respects the fallback cap |
+
+Not bugs, no code change: probes (A6/A5 already held), the hold tolerance text in section 2
+(text only), `whole` being computed over every planned demand (input-space contradiction
+3; with a fractional on/off car anywhere the half-unit holds and the exact price hold fall
+back to their tolerances, which is safe and documented here, and no case needs it narrower).
+
+**Settled contradictions.** Input-space 1 and contract 3, 4, 5: section 2's constraint 6, P6 row
+(loop exit, live set) rewritten. Input-space 2: deviation 20. Input-space 3: above. Contract 1:
+deviation 19. Contract 2: deviation 18. Contract 6: `Outcome` and `optimize` docstrings say
+"every solve", probes tested. Contract 7: the oracle, first row.
+
+**Tests that changed.** `test_demand_accepts_zero_and_a_maximum_below_the_minimum`: its
+`fractional-min` case (`Demand(.., 6.5, 16.0, 16.0)`) is now refused by design and moved to the
+rejection test; an on/off fractional case replaced it. `_random_demands` (the limits property)
+draws a fractional minimum only for on/off demands. `test_a_real_node_budget_stop_returns_a_plan_within_every_limit`:
+the instances changed to 3 chargers at 16 A seeds 4 and 6 and 4 chargers at 20 A seed 6,
+because the exact price hold changed which solves branch; with `NODE_LIMIT = 1` they still give
+two not-proven plans with every limit kept and one `SolverError` status 4 (9 s). The `can_run`
+oracle fix above. Nothing was weakened or deleted otherwise.
+
+**Gates.** `ruff check .`, `ruff format --check .`, `mypy`: clean. `pytest`: 1377 passed in
+130 s (1305 before this step; 72 added). Every module showcase exits 0. `STRUCTURE.md`:
+the `Demand` row and the `test_ev_optimize.py` and `test_ev_decide.py` entries are updated.
+Timing: section 3, "Step-5 re-run changes" (all ten cells of the A5 grid, worst 46.1 s for 10
+chargers at 70 A).
+
+Edge cases considered and deliberately skipped, with reasons:
+
+- *Fractional on/off in the exact price hold*: it falls back to the tolerance (documented
+  in deviation 19); a tick-aware hold for non-integral currents would need a rational model
+  of the cost and no case needs it.
+- *Prices on a grid finer than 1e-7*: the same fallback; a 1e-9 grid is not a market price.
+- *T2 at more than 2 demands*: unchanged from the first run (the enumeration grows with
+  levels^(quarters x demands)).
+- *Pinning `_fit_now`'s call count*: it is a shortcut, covered by the results it must not change.
+- *The 192-quarter horizon through `decide`*: unchanged from the first run.
 
 ## 6. Concept check
 

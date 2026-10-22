@@ -185,7 +185,7 @@ fallback: a solve that ends without a point raises `SolverError`.
 | `class SolverError(RuntimeError)`; `__init__(self, status: int, message: str) -> None`; attributes `status`, `message`; `str(err) == f"HiGHS status {status}: {message}"` | The solver failed; carries scipy's `milp` status and message. |
 | `NODE_LIMIT: int` | Branch-and-bound nodes allowed per level solve (8000; see the benchmark in the round-2 plan). |
 | `class Tier(IntEnum)`: `SMART_OFF = 0`, `CHARGE_NOW = 1`, `PLANNED = 2`, `SPARE = 3` | Which precedence stage a demand belongs to. |
-| `Demand(charger_id: str, phases: frozenset[Phase], tier: Tier, min_current: float, max_current: float, now_max_current: float, need_kwh: float = 0.0, deadline: datetime \| None = None)` | One charger asking for current, given in ranking order; validates itself with `ValueError` naming the field. |
+| `Demand(charger_id: str, phases: frozenset[Phase], tier: Tier, min_current: float, max_current: float, now_max_current: float, need_kwh: float = 0.0, deadline: datetime \| None = None)` | One charger asking for current, given in ranking order; validates itself with `ValueError` naming the field (a fractional `min_current` is refused unless the demand is on/off, `min_current == max_current`, or can never run, both maxima below it). |
 | `Outcome(allocations: dict[str, float], plans: dict[str, SessionPlan], proven: bool)` | Quarter-0 current of every demand, a plan per `PLANNED` demand, `proven` False when a solve stopped at the node budget with a point. |
 | `optimize(demands: Sequence[Demand], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], now_capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str) -> Outcome` | Solve the lexicographic model; `SolverError` on failure, `ValueError` for a naive `now` or a repeated charger id, `ZoneInfoNotFoundError` for an unknown `timezone`; empty `demands` returns before those checks; a limit broken by rounding raises `SolverError` with status 0. |
 | `main() -> None` | Showcase: a charge-now car, two planned cars and a spare-capacity car on one phase, then a phase with no room. |
@@ -277,8 +277,14 @@ below the limit failing; a `hypothesis` property that no limit is ever broken (T
 that the level-by-level tuple equals a brute-force enumeration (T2); and the planned tier's
 full progressive fill (8 / 11 / 11 on 30 A, 8 / 8 for two cars forced into an unpriced first
 quarter, an unpriced first quarter not filled beyond what the need forces, the ranking
-remainder when no car can be saturated, 8 / 8 / 8 on mixed phases); and the `main`
-showcase.
+remainder when no car can be saturated, 8 / 8 / 8 on mixed phases; cars tied at a cap, one
+binding phase, on/off and fractional on/off cars, unequal minimums, a car off now, a
+need-limited car found by a probe, a forced dear first quarter split evenly, the cheaper
+quarter never given up for a dearer one by a price tick, the forced unpriced energy held in
+kWh not amps, the fill robust to integrality noise, probes failing with `SolverError` or
+stopping at the node budget, identical solver calls on repeated runs); the brute-force oracle
+follows the amended P5 and P6 and generates three-phase demands; a fractional `min_current`
+on an adjustable `Demand` is refused; and the `main` showcase.
 
 ### `tests/test_ev_allocation.py`
 
@@ -303,7 +309,7 @@ nights (including an unplanned finish landing exactly on the spring-forward tran
 a planned expected finish ending in or at the repeated hour of the fall-back night and at
 the spring-forward transition, `reaches_target` across the fold, a trickle of current (including a reserved
 charger's tiny measured draw) giving `None` and surviving the codec round trip, no state
-between interleaved snapshots, the solver's failure statuses raising `SolverError` from `decide` (including a later level stopping without a point), node-budget stops (stubbed and real) adding `PLAN_NOT_PROVEN_OPTIMAL` last and round-tripping the codec, the solver call spied, decisions equal under permuted chargers, states and sessions, planned fractional on/off chargers, the fallback capping only the first planned quarter, a ready time inside the current quarter, tiny needs planned in the ready-time quarter (or now with a one-quarter block), the first-ranked planned car charging first on equal prices and a plan below its max staying normal, a mid-quarter ready time credited the whole quarter (pinned, not endorsed), unpriced and empty price series, the price-cap event boundary, the tiers' waiting reason codes and stale prices sharing evenly (T4-T7), the two step-6 snapshots HiGHS called infeasible without presolve (explicit literals), and the public surface equal to round 1's plus `SolverError`, `PLAN_NOT_PROVEN_OPTIMAL` and `optimize`'s names (exports, removed modules and names, dataclass fields, signatures, enum members); and the `main` showcase.
+between interleaved snapshots, the solver's failure statuses raising `SolverError` from `decide` (including a later level stopping without a point), node-budget stops (stubbed and real) adding `PLAN_NOT_PROVEN_OPTIMAL` last and round-tripping the codec, the solver call spied, decisions equal under permuted chargers, states and sessions, planned fractional on/off chargers, the fallback capping only the first planned quarter, a ready time inside the current quarter, tiny needs planned in the ready-time quarter (or now with a one-quarter block), two planned cars tied at a user limit leaving the rest to the other, two cars forced into an unpriced current quarter sharing it in plan, the hash-seed check through the planned fill, the first-ranked planned car charging first on equal prices and a plan below its max staying normal, a mid-quarter ready time credited the whole quarter (pinned, not endorsed), unpriced and empty price series, the price-cap event boundary, the tiers' waiting reason codes and stale prices sharing evenly (T4-T7), the two step-6 snapshots HiGHS called infeasible without presolve (explicit literals), and the public surface equal to round 1's plus `SolverError`, `PLAN_NOT_PROVEN_OPTIMAL` and `optimize`'s names (exports, removed modules and names, dataclass fields, signatures, enum members); and the `main` showcase.
 
 ### `tests/test_ev_codec.py`
 

@@ -35,6 +35,7 @@ NODE_LIMIT = 8000
 
 _TOLERANCE = 1e-6
 _EPS = 1e-9
+_MAX_TICKS = 10_000_000
 
 
 class SolverError(RuntimeError):
@@ -90,7 +91,9 @@ class Demand:
         min_current: Lowest non-zero current in A; equal to `max_current` means
             all-or-nothing (on/off) at exactly this current, in every tier, even when
             `now_max_current` is higher. Otherwise the charger is adjustable in whole
-            amps, so the minimum must be a whole number.
+            amps, so a minimum it can actually run at must be a whole number (a
+            fractional minimum is allowed when both maxima are below it, which means
+            off in every quarter).
         max_current: Highest current in A in quarters after the first. Below
             `min_current` means off in those quarters.
         now_max_current: Highest current in A in the first quarter (user limit,
@@ -100,8 +103,8 @@ class Demand:
 
     Raises:
         ValueError: If a field is invalid (including a `tier` that is not a `Tier`,
-            and a fractional `min_current` that differs from `max_current`); the
-            message starts with the field name.
+            and a fractional `min_current` on a charger that differs from on/off and can run
+            at it); the message starts with the field name.
     """
 
     charger_id: str
@@ -121,14 +124,14 @@ class Demand:
             raise _bad("phases", "must not be empty")
         for name in ("min_current", "max_current", "now_max_current", "need_kwh"):
             _check_current(name, getattr(self, name))
-        if (
-            self.min_current != self.max_current
-            and not float(self.min_current).is_integer()
-        ):
+        runs_adjustably = self.min_current != self.max_current and (
+            max(self.max_current, self.now_max_current) >= self.min_current
+        )
+        if runs_adjustably and not float(self.min_current).is_integer():
             raise _bad(
                 "min_current",
-                "must be a whole number of amps unless equal to max_current "
-                f"(an on/off current), got {self.min_current}",
+                "must be a whole number of amps when the charger can run below its "
+                f"limits in whole amps (not on/off, not always off), got {self.min_current}",
             )
         if self.deadline is not None and self.deadline.utcoffset() is None:
             raise _bad("deadline", f"must be timezone-aware, got {self.deadline}")
@@ -529,13 +532,16 @@ def _price_ticks(values: Sequence[float]) -> list[int] | None:
         values: The prices.
 
     Returns:
-        Each price in ticks, or None when the grid is finer than 1e-7 or all are zero.
+        Each price in ticks, or None when the grid is finer than 1e-7, all prices are
+        zero or a price is more than `_MAX_TICKS` ticks.
     """
     scaled = [round(v * 1e9) for v in values]
     step = math.gcd(*scaled) if scaled else 0
     if step < 100:
         return None
-    return [v // step for v in scaled]
+    ticks = [v // step for v in scaled]
+    # Keep the objective's coefficients small enough for the solver's tolerances.
+    return ticks if max(abs(t) for t in ticks) <= _MAX_TICKS else None
 
 
 def _minimise_price(
