@@ -15,19 +15,14 @@ from datetime import UTC, datetime, time, timedelta
 from enum import StrEnum
 
 from .model import (
-    _INVALID_MEMORY,
     Charger,
     ChargerKind,
-    ChargerMemory,
     ChargerState,
     ConfigError,
-    GuardLevel,
-    Memory,
     Phase,
     PhaseCurrents,
     PriceInterval,
     PriceSeries,
-    Reduction,
     Session,
     Settings,
     Snapshot,
@@ -382,21 +377,6 @@ _SETTINGS_FIELDS: dict[str, _Converter[object]] = {
     "default_energy_need_kwh": _num,
     "max_price_age": _seconds,
     "max_measurement_age": _seconds,
-    "emergency_threshold": _num,
-    "emergency_calm": _seconds,
-    "yellow_margin": _num,
-    "green_hold": _seconds,
-    "deadband": _num,
-    "ramp_step": _int,
-    "ramp_period": _seconds,
-    "under_use_period": _seconds,
-    "reduction": _enum(Reduction),
-    "under_use_margin": _num,
-    "min_pause": _seconds,
-    "hysteresis": _seconds,
-    "resume_probe": _seconds,
-    "min_action_interval": _seconds,
-    "max_memory_age": _seconds,
 }
 
 
@@ -415,7 +395,7 @@ def _settings_from(data: object, path: str) -> Settings:
     )
     extra: dict[str, object] = {}
     for key, convert in _SETTINGS_FIELDS.items():
-        if key in ("price_cap", "emergency_threshold"):
+        if key == "price_cap":
             extra[key] = reader.opt(key, convert)
         else:
             reader.given(key, convert, extra)
@@ -428,125 +408,6 @@ def _settings_from(data: object, path: str) -> Settings:
         timezone=reader.req("timezone", _str),
         **extra,
     )
-
-
-# --- Memory -----------------------------------------------------------------
-
-_CHARGER_MEMORY_DATETIMES = (
-    "session_start",
-    "switched_at",
-    "under_use_since",
-    "full_use_since",
-    "under_use_stop_at",
-    "last_action_at",
-    "decreased_at",
-)
-
-
-def _charger_memory_from(data: object, path: str) -> ChargerMemory:
-    """Build one charger's memory from its dict."""
-    reader = _Reader(
-        data,
-        path,
-        (
-            "charger_id",
-            "car_connected",
-            "session_key",
-            "running",
-            "stopped_for_capacity",
-            "selected",
-            "regulated_cap",
-            "last_target",
-            *_CHARGER_MEMORY_DATETIMES,
-        ),
-    )
-    extra: dict[str, object] = {}
-    for key in _CHARGER_MEMORY_DATETIMES:
-        extra[key] = reader.opt(key, _datetime)
-    for key in ("car_connected", "running", "stopped_for_capacity", "selected"):
-        reader.given(key, _bool, extra)
-    reader.given("session_key", _str, extra)
-    return _make(
-        path,
-        ChargerMemory,
-        charger_id=reader.req("charger_id", _str),
-        regulated_cap=reader.opt("regulated_cap", _int),
-        last_target=reader.opt("last_target", _num),
-        **extra,
-    )
-
-
-def _memory_from(data: object, path: str) -> Memory:
-    """Build a memory from its dict."""
-    reader = _Reader(
-        data, path, ("saved_at", "chargers", "level", "green_since", "emergency_at")
-    )
-    return _make(
-        path,
-        Memory,
-        saved_at=reader.req("saved_at", _datetime),
-        chargers=reader.items("chargers", _charger_memory_from)
-        if reader.has("chargers")
-        else (),
-        level=reader.opt("level", _enum(GuardLevel)),
-        green_since=reader.opt("green_since", _datetime),
-        emergency_at=reader.opt("emergency_at", _datetime),
-    )
-
-
-def memory_to_dict(memory: Memory) -> dict[str, object]:
-    """Convert a memory to a plain JSON-compatible dict.
-
-    Args:
-        memory: The memory a decision returned.
-
-    Returns:
-        A dict of numbers, strings, booleans, lists, dicts and `None`, with times as
-        ISO 8601 strings including the offset.
-    """
-    return {
-        "saved_at": memory.saved_at.isoformat(),
-        "chargers": [
-            {
-                "charger_id": c.charger_id,
-                "session_start": _iso(c.session_start),
-                "car_connected": c.car_connected,
-                "session_key": c.session_key,
-                "running": c.running,
-                "switched_at": _iso(c.switched_at),
-                "stopped_for_capacity": c.stopped_for_capacity,
-                "selected": c.selected,
-                "regulated_cap": c.regulated_cap,
-                "under_use_since": _iso(c.under_use_since),
-                "full_use_since": _iso(c.full_use_since),
-                "under_use_stop_at": _iso(c.under_use_stop_at),
-                "last_target": c.last_target,
-                "last_action_at": _iso(c.last_action_at),
-                "decreased_at": _iso(c.decreased_at),
-            }
-            for c in memory.chargers
-        ],
-        "level": None if memory.level is None else memory.level.value,
-        "green_since": _iso(memory.green_since),
-        "emergency_at": _iso(memory.emergency_at),
-    }
-
-
-def memory_from_dict(data: object) -> Memory | None:
-    """Build a memory from a plain dict, never raising.
-
-    Args:
-        data: A dict as produced by `memory_to_dict`; anything else is accepted too.
-
-    Returns:
-        The memory, or None when `data` is not a valid memory of any kind: no
-        `saved_at`, unknown keys, wrong types, naive times, duplicate ids. Optional
-        parts (`chargers`, `level` and the rest) may be left out.
-    """
-    try:
-        return _memory_from(data, "memory")
-    except (ConfigError, TypeError, ValueError, OverflowError, RecursionError):
-        return None
 
 
 def snapshot_to_dict(snapshot: Snapshot) -> dict[str, object]:
@@ -574,21 +435,6 @@ def snapshot_to_dict(snapshot: Snapshot) -> dict[str, object]:
             "default_energy_need_kwh": settings.default_energy_need_kwh,
             "max_price_age": settings.max_price_age.total_seconds(),
             "max_measurement_age": settings.max_measurement_age.total_seconds(),
-            "emergency_threshold": settings.emergency_threshold,
-            "emergency_calm": settings.emergency_calm.total_seconds(),
-            "yellow_margin": settings.yellow_margin,
-            "green_hold": settings.green_hold.total_seconds(),
-            "deadband": settings.deadband,
-            "ramp_step": settings.ramp_step,
-            "ramp_period": settings.ramp_period.total_seconds(),
-            "under_use_period": settings.under_use_period.total_seconds(),
-            "reduction": settings.reduction.value,
-            "under_use_margin": settings.under_use_margin,
-            "min_pause": settings.min_pause.total_seconds(),
-            "hysteresis": settings.hysteresis.total_seconds(),
-            "resume_probe": settings.resume_probe.total_seconds(),
-            "min_action_interval": settings.min_action_interval.total_seconds(),
-            "max_memory_age": settings.max_memory_age.total_seconds(),
         },
         "chargers": [
             {
@@ -650,7 +496,6 @@ def snapshot_to_dict(snapshot: Snapshot) -> dict[str, object]:
                 "l3": currents.l3,
             }
         ),
-        "memory": None if snapshot.memory is None else memory_to_dict(snapshot.memory),
     }
 
 
@@ -682,12 +527,8 @@ def snapshot_from_dict(data: Mapping[str, object]) -> Snapshot:
             "sessions",
             "prices",
             "phase_currents",
-            "memory",
         ),
     )
-    memory: Memory | None = None
-    if data.get("memory") is not None:
-        memory = memory_from_dict(data["memory"]) or _INVALID_MEMORY
     return _make(
         "",
         Snapshot,
@@ -698,7 +539,6 @@ def snapshot_from_dict(data: Mapping[str, object]) -> Snapshot:
         sessions=reader.items("sessions", _session_from),
         prices=reader.req("prices", _prices_from),
         phase_currents=reader.opt("phase_currents", _currents_from),
-        memory=memory,
     )
 
 
@@ -846,11 +686,6 @@ def decision_to_dict(decision: Decision) -> dict[str, object]:
             }
             for e in decision.events
         ],
-        "memory": None if decision.memory is None else memory_to_dict(decision.memory),
-        "guard_level": None
-        if decision.guard_level is None
-        else decision.guard_level.value,
-        "next_check": _iso(decision.next_check),
     }
 
 
@@ -867,29 +702,13 @@ def decision_from_dict(data: Mapping[str, object]) -> Decision:
         ConfigError: If a field is missing, unknown, wrongly typed or invalid; its
             `field` is the dotted path.
     """
-    reader = _Reader(
-        data,
-        "",
-        (
-            "actions",
-            "chargers",
-            "available",
-            "status",
-            "events",
-            "memory",
-            "guard_level",
-            "next_check",
-        ),
-    )
+    reader = _Reader(data, "", ("actions", "chargers", "available", "status", "events"))
     return Decision(
         actions=reader.items("actions", _action_from),
         chargers=reader.items("chargers", _charger_decision_from),
         available=reader.req("available", _amps_from),
         status=reader.req("status", _enum(Status)),
         events=reader.items("events", _event_from),
-        memory=reader.opt("memory", _memory_from),
-        guard_level=reader.opt("guard_level", _enum(GuardLevel)),
-        next_check=reader.opt("next_check", _datetime),
     )
 
 
@@ -914,23 +733,6 @@ def main() -> None:
 
     print(text)
     print(f"round trip equal: {restored == snapshot}")
-
-    # Memory travels the same way; malformed memory decodes to None, never an error.
-    memory = Memory(
-        saved_at=now,
-        chargers=(ChargerMemory("carport", car_connected=True, running=True),),
-        level=GuardLevel.GREEN,  # GREEN, YELLOW, RED, EMERGENCY
-        green_since=now,
-    )
-    memory_text = json.dumps(memory_to_dict(memory))
-    garbage = {"saved_at": "yesterday"}
-
-    restored_memory = memory_from_dict(json.loads(memory_text))
-    rejected_memory = memory_from_dict(garbage)
-
-    print(memory_text)
-    print(f"memory round trip equal: {restored_memory == memory}")
-    print(f"malformed memory decodes to: {rejected_memory}")
 
     # A wrongly typed field is rejected with its dotted path.
     broken = json.loads(text)

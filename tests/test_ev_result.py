@@ -53,15 +53,11 @@ def test_reason_codes_are_exactly_the_planned_set() -> None:
         "UNAVAILABLE",
         "NO_CAR",
         "NO_SESSION",
-        "MINIMUM_PAUSE",
-        "UNDER_USE",
-        "EMERGENCY",
     }
 
 
 def test_status_and_event_kinds_are_exactly_the_planned_set() -> None:
     assert {s.name for s in Status} == {
-        "EMERGENCY",
         "NORMAL",
         "LIMITED_BY_BUDGET",
         "LIMITED_BY_PHASE",
@@ -75,9 +71,9 @@ def test_status_and_event_kinds_are_exactly_the_planned_set() -> None:
         "CHARGE_NOW_NEED_COVERED",
         "PHASE_DATA_STALE",
         "PRICES_STALE",
-        "MEMORY_RESET",
-        "PHASE_GUARD_INTERVENED",
+        "PLAN_NOT_PROVEN_OPTIMAL",
     }
+    assert EventKind.PLAN_NOT_PROVEN_OPTIMAL.value == "plan_not_proven_optimal"
 
 
 @pytest.mark.parametrize(

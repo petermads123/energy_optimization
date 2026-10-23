@@ -1,12 +1,10 @@
-"""Phase capacity and current sharing.
+"""Phase capacity, draw and reservations.
 
 Pure helpers: what a phase may carry (budget and phase guard), what chargers draw or
-are reserved at, whether phase measurements can be trusted, and the max-min-fair
-0-or-minimum sharing of that capacity among claims given in ranking order.
+are reserved at, and whether phase measurements can be trusted. Sharing the capacity
+among chargers is the optimiser's job, in `optimize`.
 """
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from .model import (
@@ -20,67 +18,6 @@ from .model import (
 )
 
 _EPS = 1e-9
-
-
-@dataclass(frozen=True)
-class Claim:
-    """One charger asking for current.
-
-    Attributes:
-        charger_id: The charger.
-        phases: The phases it is counted on.
-        min_current: Lowest non-zero current in A.
-        max_current: Highest current in A; equal to `min_current` means
-            all-or-nothing.
-    """
-
-    charger_id: str
-    phases: frozenset[Phase]
-    min_current: float
-    max_current: float
-
-
-def share(claims: Sequence[Claim], capacity: Mapping[Phase, float]) -> dict[str, float]:
-    """Share capacity among claims given in ranking order.
-
-    First each claim in order is included at its minimum if it fits on all its
-    phases, then included adjustable claims rise 1 A at a time, always the one with
-    the lowest allocation (ties in ranking order), until none can grow.
-
-    Args:
-        claims: The claims, highest ranking first.
-        capacity: What may be used per phase; a phase absent from it has none.
-
-    Returns:
-        The current of every claim by charger id; claims that did not fit get 0.
-    """
-    remaining = {phase: capacity.get(phase, 0.0) for phase in Phase}
-    allocation: dict[str, float] = {claim.charger_id: 0.0 for claim in claims}
-    included: list[Claim] = []
-    for claim in claims:
-        if claim.max_current < claim.min_current:
-            continue
-        if all(claim.min_current <= remaining[p] + _EPS for p in claim.phases):
-            allocation[claim.charger_id] = claim.min_current
-            for phase in claim.phases:
-                remaining[phase] -= claim.min_current
-            included.append(claim)
-    growable = [c for c in included if c.min_current < c.max_current]
-    while True:
-        candidates = [
-            c
-            for c in growable
-            if allocation[c.charger_id] < c.max_current - _EPS
-            and all(remaining[p] >= 1.0 - _EPS for p in c.phases)
-        ]
-        if not candidates:
-            break
-        lowest = min(candidates, key=lambda c: allocation[c.charger_id])
-        step = min(1.0, lowest.max_current - allocation[lowest.charger_id])
-        allocation[lowest.charger_id] += step
-        for phase in lowest.phases:
-            remaining[phase] -= step
-    return allocation
 
 
 def measurements_fresh(
@@ -175,34 +112,16 @@ def present_draw(charger: Charger, state: ChargerState, voltage: float) -> float
     return min(nominal, _measured_per_phase(state, len(charger.phases), voltage))
 
 
-def _settling_draw(charger: Charger, state: ChargerState, voltage: float) -> float:
-    """Return the draw of a charger still ramping down after a decrease.
-
-    Without a car there is nothing ramping down, so a leftover power reading counts
-    for nothing, as in `present_draw`.
-    """
-    controllable = charger.kind is not ChargerKind.FIXED and state.available
-    if controllable and state.car_connected and state.measured_power_w is not None:
-        return _measured_per_phase(state, len(charger.phases), voltage)
-    return present_draw(charger, state, voltage)
-
-
-def phase_capacity(
-    snapshot: Snapshot, fresh: bool, settling: frozenset[str] = frozenset()
-) -> dict[Phase, float]:
+def phase_capacity(snapshot: Snapshot, fresh: bool) -> dict[Phase, float]:
     """Return what all chargers together may use on each phase.
 
     Args:
         snapshot: The snapshot.
         fresh: Whether the phase measurements can be trusted.
-        settling: Ids of chargers that were sent a decrease a moment ago. Each
-            counts at its measured draw (when known) instead of the smaller of
-            setting and measured draw, so a car still ramping down is not mistaken
-            for other load.
 
     Returns:
         `min(budget, threshold - (measured - sum of present draws))` per phase when
-        `fresh`, else the budget; a settling charger counts at its measured draw. A phase whose measurement is missing gets the
+        `fresh`, else the budget. A phase whose measurement is missing gets the
         budget. May be negative.
     """
     settings: Settings = snapshot.settings
@@ -216,9 +135,7 @@ def phase_capacity(
             capacity[phase] = settings.phase_budget
             continue
         draw = sum(
-            (_settling_draw if charger.id in settling else present_draw)(
-                charger, states[charger.id], settings.voltage
-            )
+            present_draw(charger, states[charger.id], settings.voltage)
             for charger in snapshot.chargers
             if phase in charger.phases
         )
@@ -230,28 +147,31 @@ def phase_capacity(
 
 def main() -> None:
     """Showcase this module's functionality."""
-    claims = [
-        Claim("three_phase", frozenset({Phase.L1, Phase.L2, Phase.L3}), 6, 16),
-        Claim("single_l1", frozenset({Phase.L1}), 6, 10),
-        Claim("single_l2", frozenset({Phase.L2}), 6, 32),
-    ]
-    capacity = {Phase.L1: 20.0, Phase.L2: 25.0, Phase.L3: 16.0}
+    now = datetime(2026, 10, 21, 20, 0, tzinfo=UTC)
+    max_age = timedelta(seconds=60)
+    phases = frozenset({Phase.L1, Phase.L2})
+    currents = PhaseCurrents(now - timedelta(seconds=30), l1=12.0, l2=10.0, l3=None)
 
-    allocation = share(claims, capacity)
+    fresh = measurements_fresh(currents, now, max_age, phases)
 
-    for charger_id, current in allocation.items():
-        print(f"{charger_id}: {current} A")
+    print(f"measurements fresh on L1 and L2: {fresh}")
 
-    # Less than the minimum left for a second claim on the same phase: it gets 0.
-    claims = [
-        Claim("first", frozenset({Phase.L1}), 6, 16),
-        Claim("second", frozenset({Phase.L1}), 6, 16),
-    ]
-    capacity = {Phase.L1: 8.0, Phase.L2: 0.0, Phase.L3: 0.0}
+    # L3 has no value, so a charger on all three phases cannot trust them.
+    phases = frozenset(Phase)
 
-    allocation = share(claims, capacity)
+    fresh = measurements_fresh(currents, now, max_age, phases)
 
-    print(f"tight phase: {allocation}")
+    print(f"measurements fresh on all phases: {fresh}")
+
+    charger = Charger(
+        "fixed", frozenset({Phase.L1}), ChargerKind.FIXED, None, None, 8.0
+    )
+    state = ChargerState("fixed", True, 8, False, measured_power_w=1150.0)
+    voltage = 230.0
+
+    reserved = reserved_current(charger, state, voltage)
+
+    print(f"reserved at {reserved} A")
 
 
 if __name__ == "__main__":

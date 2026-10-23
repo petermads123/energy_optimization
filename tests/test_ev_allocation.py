@@ -1,19 +1,17 @@
-"""Tests for energy_optimization.ev.allocation (T4, T7, T13, T14): sharing and limits."""
+"""Tests for energy_optimization.ev.allocation (T7, T13, T14): limits and draw."""
 
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from energy_optimization.ev.allocation import main as showcase
 from energy_optimization.ev.allocation import (
-    Claim,
     measurements_fresh,
     phase_capacity,
     present_draw,
     reserved_current,
-    share,
 )
-from energy_optimization.ev.allocation import main as showcase
 from energy_optimization.ev.model import (
     Charger,
     ChargerKind,
@@ -30,15 +28,6 @@ L1 = frozenset({Phase.L1})
 L2 = frozenset({Phase.L2})
 ALL = frozenset(Phase)
 CAP25 = {Phase.L1: 25.0, Phase.L2: 25.0, Phase.L3: 25.0}
-
-
-def claim(
-    charger_id: str,
-    low: float = 6,
-    high: float = 16,
-    phases: frozenset[Phase] = L1,
-) -> Claim:
-    return Claim(charger_id, phases, low, high)
 
 
 def caps(l1: float = 25.0, l2: float = 25.0, l3: float = 25.0) -> dict[Phase, float]:
@@ -88,177 +77,6 @@ def snapshot(
         PriceSeries((), NOW),
         currents,
     )
-
-
-# --- share (T4) ----------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "reverse", [False, True], ids=["three-phase first", "single first"]
-)
-def test_share_mixed_phases_is_max_min_fair(reverse: bool) -> None:
-    claims = [claim("t", 6, 16, ALL), claim("s", 6, 10, L1)]
-    if reverse:
-        claims.reverse()
-
-    assert share(claims, CAP25) == {"t": 15.0, "s": 10.0}
-
-
-def test_share_unequal_minimums_level_up_from_the_lowest_allocation() -> None:
-    claims = [claim("a", 10, 16), claim("b", 6, 16)]
-
-    assert share(claims, caps(l1=24)) == {"a": 12.0, "b": 12.0}
-
-
-@pytest.mark.parametrize(
-    ("capacity", "expected"),
-    [
-        (14, (7.0, 7.0, 0.0)),
-        (13, (7.0, 6.0, 0.0)),
-        (13.5, (7.0, 6.0, 0.0)),
-        (18, (6.0, 6.0, 6.0)),
-    ],
-)
-def test_share_gives_zero_or_min_in_ranking_order(
-    capacity: float, expected: tuple[float, float, float]
-) -> None:
-    claims = [claim("a"), claim("b"), claim("c")]
-
-    result = share(claims, caps(l1=capacity))
-
-    assert (result["a"], result["b"], result["c"]) == expected
-
-
-def test_share_remainder_follows_ranking_order_not_id_order() -> None:
-    claims = [claim("y"), claim("x")]
-
-    assert share(claims, caps(l1=13)) == {"y": 7.0, "x": 6.0}
-
-
-def test_share_an_unfit_higher_ranked_claim_does_not_block_a_lower_one() -> None:
-    claims = [claim("a", 10, 16), claim("b", 6, 16)]
-
-    assert share(claims, caps(l1=8)) == {"a": 0.0, "b": 8.0}
-
-
-def test_share_a_later_claim_on_another_phase_still_fits() -> None:
-    claims = [claim("x", phases=L1), claim("y", phases=L2)]
-
-    assert share(claims, caps(l1=5, l2=10)) == {"x": 0.0, "y": 10.0}
-
-
-def test_share_a_full_phase_does_not_stop_claims_on_other_phases() -> None:
-    claims = [claim("A", phases=ALL), claim("B", phases=L2)]
-
-    assert share(claims, caps(l1=10, l2=25, l3=25)) == {"A": 10.0, "B": 15.0}
-
-
-def test_share_caps_every_claim_at_its_max() -> None:
-    claims = [claim("a", 6, 8), claim("b", 6, 16)]
-
-    assert share(claims, caps(l1=30)) == {"a": 8.0, "b": 16.0}
-
-
-@pytest.mark.parametrize(
-    ("capacity", "expected"), [(9, 0.0), (10, 10.0), (15, 10.0), (100, 10.0)]
-)
-def test_share_all_or_nothing_is_never_partial(
-    capacity: float, expected: float
-) -> None:
-    assert share([claim("o", 10, 10)], caps(l1=capacity)) == {"o": expected}
-
-
-@pytest.mark.parametrize(
-    ("capacity", "expected"),
-    [
-        (20, {"o": 7.5, "a": 12.0}),
-        (13, {"o": 7.5, "a": 0.0}),
-        (7.4, {"o": 0.0, "a": 7.0}),
-    ],
-)
-def test_share_all_or_nothing_never_grows_beside_an_adjustable_claim(
-    capacity: float, expected: dict[str, float]
-) -> None:
-    claims = [claim("o", 7.5, 7.5), claim("a", 6, 16)]
-
-    assert share(claims, caps(l1=capacity)) == expected
-
-
-@pytest.mark.parametrize(
-    ("capacity", "expected"),
-    [(15.5, 15.0), (15.9999999995, 16.0), (16, 16.0), (100, 16.0), (6.5, 6.0)],
-)
-def test_share_floors_fractional_capacity_to_whole_amps(
-    capacity: float, expected: float
-) -> None:
-    assert share([claim("a")], caps(l1=capacity)) == {"a": expected}
-
-
-@pytest.mark.parametrize(
-    ("capacity", "expected"),
-    [(6.0, 6.0), (6 - 1e-10, 6.0), (5.9999999995, 6.0), (5.99, 0.0), (0.0, 0.0)],
-)
-def test_share_min_boundary_with_tolerance(capacity: float, expected: float) -> None:
-    assert share([claim("a")], caps(l1=capacity)) == {"a": expected}
-
-
-@pytest.mark.parametrize(
-    ("l3", "expected"), [(9.0, 9.0), (5.0, 0.0), (6.0, 6.0), (16.0, 16.0)]
-)
-def test_share_the_tightest_phase_governs_a_multi_phase_claim(
-    l3: float, expected: float
-) -> None:
-    result = share([claim("t", 6, 16, ALL)], caps(16, 16, l3))
-
-    assert result == {"t": expected}
-
-
-@pytest.mark.parametrize(
-    "capacity",
-    [{}, {Phase.L1: 0.0}, {Phase.L1: -3.0}, {Phase.L2: 25.0}],
-    ids=["empty", "zero", "negative", "other phase only"],
-)
-def test_share_gives_nothing_when_the_phase_has_no_room(
-    capacity: dict[Phase, float],
-) -> None:
-    assert share([claim("a")], capacity) == {"a": 0.0}
-
-
-def test_share_of_no_claims_is_empty() -> None:
-    assert share([], CAP25) == {}
-
-
-def test_share_a_claim_with_max_below_min_gets_zero_and_consumes_nothing() -> None:
-    claims = [claim("bad", 10, 8), claim("a")]
-
-    assert share(claims, caps(l1=16)) == {"bad": 0.0, "a": 16.0}
-
-
-def test_share_returns_every_claim_id_even_when_excluded() -> None:
-    claims = [claim("a"), claim("b"), claim("c")]
-
-    assert set(share(claims, caps(l1=6))) == {"a", "b", "c"}
-
-
-def test_share_does_not_mutate_its_arguments() -> None:
-    capacity = caps(l1=20)
-    before = dict(capacity)
-    claims = [claim("a"), claim("b")]
-    claims_before = list(claims)
-
-    share(claims, capacity)
-
-    assert capacity == before
-    assert claims == claims_before
-
-
-def test_share_is_idempotent() -> None:
-    claims = [claim("a"), claim("b", phases=ALL)]
-
-    assert share(claims, caps(l1=20)) == share(claims, caps(l1=20))
-
-
-# --- measurements_fresh (T13) --------------------------------------------------
 
 
 def currents(
@@ -597,141 +415,7 @@ def test_phase_capacity_does_not_mutate_the_snapshot() -> None:
     assert snap == before
 
 
-# --- phase_capacity with settling (T11, amended A8) -----------------------------
-
-
-def settling_snapshot(
-    charger: Charger, charger_state: ChargerState, l1: float | None = 20.0
-) -> Snapshot:
-    currents = PhaseCurrents(NOW, l1, 20.0 if l1 is not None else 0.0, 20.0)
-    return snapshot([charger], [charger_state], currents, budget=25.0, threshold=25.0)
-
-
-def drawing(
-    setting: float = 6.0, amps: float | None = 16.0, **kwargs: bool
-) -> ChargerState:
-    power = None if amps is None else amps * 230.0
-    return state("a", setting=setting, power=power, **kwargs)
-
-
-def test_phase_capacity_settling_counts_the_measured_draw_not_the_lower_setting() -> (
-    None
-):
-    snap = settling_snapshot(adjustable(), drawing())
-
-    assert phase_capacity(snap, True)[Phase.L1] == 11.0
-    assert phase_capacity(snap, True, frozenset({"a"}))[Phase.L1] == 21.0
-
-
-def test_phase_capacity_settling_default_is_no_settling() -> None:
-    snap = settling_snapshot(adjustable(), drawing())
-
-    assert phase_capacity(snap, True) == phase_capacity(snap, True, frozenset())
-
-
-def test_phase_capacity_settling_counts_a_paused_car_that_still_draws() -> None:
-    snap = settling_snapshot(adjustable(), drawing(setting=6.0, paused=True))
-
-    assert phase_capacity(snap, True)[Phase.L1] == 5.0
-    assert phase_capacity(snap, True, frozenset({"a"}))[Phase.L1] == 21.0
-
-
-def test_phase_capacity_settling_ignores_a_leftover_reading_without_a_car() -> None:
-    snap = settling_snapshot(adjustable(), drawing(car=False))
-
-    assert phase_capacity(snap, True, frozenset({"a"})) == phase_capacity(snap, True)
-    assert phase_capacity(snap, True, frozenset({"a"}))[Phase.L1] == 5.0
-
-
-def test_phase_capacity_settling_without_a_power_reading_uses_the_present_draw() -> (
-    None
-):
-    snap = settling_snapshot(adjustable(), drawing(amps=None))
-
-    assert phase_capacity(snap, True, frozenset({"a"})) == phase_capacity(snap, True)
-    assert phase_capacity(snap, True)[Phase.L1] == 11.0
-
-
-def test_phase_capacity_settling_a_draw_below_the_setting_changes_nothing() -> None:
-    snap = settling_snapshot(adjustable(), drawing(setting=16.0, amps=4.0))
-
-    assert phase_capacity(snap, True, frozenset({"a"})) == phase_capacity(snap, True)
-    assert phase_capacity(snap, True)[Phase.L1] == 9.0
-
-
-def test_phase_capacity_settling_counts_the_draw_on_every_phase_of_a_charger() -> None:
-    # 3 phases at 230 V: 16 A on each needs 3 x 230 x 16 W.
-    snap = settling_snapshot(
-        adjustable(ALL), state("a", setting=6.0, power=3 * 230.0 * 16.0)
-    )
-
-    plain = phase_capacity(snap, True)
-    settled = phase_capacity(snap, True, frozenset({"a"}))
-
-    assert all(plain[p] == 11.0 for p in Phase)
-    assert all(settled[p] == 21.0 for p in Phase)
-
-
-def test_phase_capacity_settling_only_touches_the_chargers_named() -> None:
-    chargers = [adjustable(cid="a"), adjustable(cid="b")]
-    states = [drawing(), state("b", setting=6.0, power=16.0 * 230.0)]
-    currents = PhaseCurrents(NOW, 30.0, 0.0, 0.0)
-    snap = snapshot(chargers, states, currents, budget=100.0, threshold=40.0)
-
-    only_a = phase_capacity(snap, True, frozenset({"a"}))[Phase.L1]
-    both = phase_capacity(snap, True, frozenset({"a", "b"}))[Phase.L1]
-
-    assert only_a == 40.0 - (30.0 - (16.0 + 6.0))  # a at 16, b at its 6 A setting
-    assert both == 40.0 - (30.0 - 32.0)  # both at 16
-
-
-@pytest.mark.parametrize("settling", [frozenset({"zzz"}), frozenset({""})])
-def test_phase_capacity_settling_ignores_unknown_ids(settling: frozenset[str]) -> None:
-    snap = settling_snapshot(adjustable(), drawing())
-
-    assert phase_capacity(snap, True, settling) == phase_capacity(snap, True)
-
-
-def test_phase_capacity_settling_is_ignored_for_stale_measurements() -> None:
-    snap = settling_snapshot(adjustable(), drawing())
-
-    assert phase_capacity(snap, False, frozenset({"a"})) == caps()
-
-
-def test_phase_capacity_settling_is_ignored_for_a_fixed_charger() -> None:
-    snap = settling_snapshot(fixed(level=6.0, cid="a"), drawing(setting=6.0, amps=10.0))
-
-    assert phase_capacity(snap, True, frozenset({"a"})) == phase_capacity(snap, True)
-
-
-def test_phase_capacity_settling_is_ignored_for_an_unavailable_charger() -> None:
-    snap = settling_snapshot(adjustable(), drawing(available=False))
-
-    assert phase_capacity(snap, True, frozenset({"a"})) == phase_capacity(snap, True)
-
-
-def test_phase_capacity_settling_leaves_a_phase_without_a_reading_at_the_budget() -> (
-    None
-):
-    snap = settling_snapshot(adjustable(ALL), drawing(), l1=None)
-
-    result = phase_capacity(snap, True, frozenset({"a"}))
-
-    assert result[Phase.L1] == 25.0
-
-
-def test_phase_capacity_settling_does_not_change_its_argument() -> None:
-    settling = frozenset({"a"})
-    snap = settling_snapshot(adjustable(), drawing())
-
-    first = phase_capacity(snap, True, settling)
-    second = phase_capacity(snap, True, settling)
-
-    assert first == second
-    assert settling == frozenset({"a"})
-
-
 def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:
     showcase()
 
-    assert "tight phase" in capsys.readouterr().out
+    assert "reserved at" in capsys.readouterr().out

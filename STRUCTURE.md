@@ -68,31 +68,28 @@ it will not install.
 ### Subpackage `src/energy_optimization/ev/`
 
 The smart EV charging decision core: a pure function from one complete snapshot (time,
-prices, chargers, sessions, measured phase currents, settings, the previous decision's
-memory) to one decision (ordered actions, a plan and a reason per charger, available amps,
-status, events, the memory for the next call, the phase-guard level, the next check). No
-I/O, never reads the clock, standard library only. Memory missing, malformed, out of date
-or future-dated is a conservative start (nothing increased), never an error. Every public type is a frozen dataclass; input
+prices, chargers, sessions, measured phase currents, settings) to one decision (ordered
+actions, a plan and a reason per charger, available amps, status, events). No I/O, never
+reads the clock; standard library plus `numpy` and `scipy` (the HiGHS solver). Every public type is a frozen dataclass; input
 types validate themselves on construction and raise `ConfigError` naming the field.
 Wherever output depends on a set of phases, phases are iterated in `Phase` order
 (L1, L2, L3), never in `frozenset` order. Every module is runnable with
 `python -m energy_optimization.ev.<module>` and ends in a `main()` showcase.
 
-Dependency order: `model` is the leaf; `result` uses `model`; `quarters` uses `model`;
-`guard` uses `model`; `regulation` uses `model`; `planning` uses `model`, `quarters`,
-`result`; `allocation` uses `model`; `decide` uses all of those; `codec` uses `model` and
-`result`.
+Dependency order: `model` and `result` are leaves; `quarters` uses `model`; `planning`
+uses `model`, `result`; `allocation` uses `model`; `optimize` uses `model`, `planning`,
+`quarters`, `result`; `decide` uses all of those; `codec` uses `model` and `result`.
 
 ### `src/energy_optimization/ev/__init__.py`
 
 Re-exports the public API with `__all__`: every public type in `model` and `result` (except
-the `Params` alias, importable from `result`), `decide`, and the six codec functions
-(snapshot, decision and memory, each way). The helpers in `quarters`, `planning`,
-`allocation`, `guard` and `regulation` are importable from their own modules.
+the `Params` alias, importable from `result`), `decide`, `SolverError` and the four codec
+functions. The helpers in `quarters`, `planning`, `allocation` and `optimize` are importable
+from their own modules.
 
 ### `src/energy_optimization/ev/model.py`
 
-Input types and their validation. `Phase`, `ChargerKind`, `Reduction`, `GuardLevel` are `StrEnum`s; the dataclasses
+Input types and their validation. `Phase`, `ChargerKind` are `StrEnum`s; the dataclasses
 below are frozen and check themselves in `__post_init__`. Tuple fields accept any sequence
 and become tuples. Numeric fields reject `bool` and non-finite floats; float fields accept
 ints.
@@ -107,14 +104,10 @@ ints.
 | `Session(charger_id: str, ready_time: time, energy_need_kwh: float \| None = None, soc_percent: float \| None = None, target_soc_percent: float \| None = None, battery_capacity_kwh: float \| None = None, delivered_kwh: float = 0.0, charge_now: bool = False, smart_charging: bool = True, user_current_limit: int \| None = None, plugged_in_at: datetime \| None = None)` | The car on one charger; `ready_time` is naive local time. |
 | `PriceInterval(start: datetime, end: datetime, price: float)` | One priced interval on quarter boundaries. |
 | `PriceSeries(intervals: tuple[PriceInterval, ...], updated_at: datetime)` | The price series; intervals must not overlap. |
-| `class Reduction(StrEnum)`: `TO_USE`, `HALVE` | How an under-use cut is computed. |
-| `class GuardLevel(StrEnum)`: `GREEN`, `YELLOW`, `RED`, `EMERGENCY` | The phase guard's level. |
 | `PhaseCurrents(measured_at: datetime, l1: float \| None, l2: float \| None, l3: float \| None)`; `get(self, phase: Phase) -> float \| None` | Measured current per phase for the whole connection. |
-| `ChargerMemory(charger_id: str, session_start: datetime \| None = None, car_connected: bool = False, session_key: str = "", running: bool = False, switched_at: datetime \| None = None, stopped_for_capacity: bool = False, selected: bool = False, regulated_cap: int \| None = None, under_use_since: datetime \| None = None, full_use_since: datetime \| None = None, under_use_stop_at: datetime \| None = None, last_target: float \| None = None, last_action_at: datetime \| None = None, decreased_at: datetime \| None = None)` | What one charger carries between calls; datetimes aware. |
-| `Memory(saved_at: datetime, chargers: tuple[ChargerMemory, ...] = (), level: GuardLevel \| None = None, green_since: datetime \| None = None, emergency_at: datetime \| None = None)`; `charger(self, charger_id: str) -> ChargerMemory \| None` | Everything carried between calls; charger ids unique. |
-| `Settings(phase_budget: float, phase_threshold: float, fallback_current: int, timezone: str, voltage: float = 230.0, min_block_quarters: int = 2, price_cap: float \| None = None, default_energy_need_kwh: float = 30.0, max_price_age: timedelta = timedelta(minutes=60), max_measurement_age: timedelta = timedelta(seconds=60), emergency_threshold: float \| None = None, emergency_calm: timedelta = timedelta(minutes=5), yellow_margin: float = 2.0, green_hold: timedelta = timedelta(seconds=60), deadband: float = 2.0, ramp_step: int = 2, ramp_period: timedelta = timedelta(minutes=5), under_use_period: timedelta = timedelta(minutes=15), reduction: Reduction = Reduction.TO_USE, under_use_margin: float = 1.0, min_pause: timedelta = timedelta(minutes=15), hysteresis: timedelta = timedelta(minutes=30), resume_probe: timedelta = timedelta(minutes=60), min_action_interval: timedelta = timedelta(seconds=30), max_memory_age: timedelta = timedelta(minutes=30))` | Installation settings; budget, threshold, fallback and timezone are required; the rest govern behaviour over time (emergency off when unset). |
-| `Snapshot(now: datetime, settings: Settings, chargers: tuple[Charger, ...], states: tuple[ChargerState, ...], sessions: tuple[Session, ...], prices: PriceSeries, phase_currents: PhaseCurrents \| None = None, memory: Memory \| None = None)` | One call's input; cross-checks ids between chargers, states and sessions (memory entries for unknown chargers are allowed and dropped by `decide`). |
-| `main() -> None` | Showcase: build a snapshot carrying a memory, then trigger a `ConfigError`. |
+| `Settings(phase_budget: float, phase_threshold: float, fallback_current: int, timezone: str, voltage: float = 230.0, min_block_quarters: int = 2, price_cap: float \| None = None, default_energy_need_kwh: float = 30.0, max_price_age: timedelta = timedelta(minutes=60), max_measurement_age: timedelta = timedelta(seconds=60))` | Installation settings; budget, threshold, fallback and timezone are required. |
+| `Snapshot(now: datetime, settings: Settings, chargers: tuple[Charger, ...], states: tuple[ChargerState, ...], sessions: tuple[Session, ...], prices: PriceSeries, phase_currents: PhaseCurrents \| None = None)` | One call's input; cross-checks ids between chargers, states and sessions. |
+| `main() -> None` | Showcase: build a snapshot, then trigger a `ConfigError`. |
 
 ### `src/energy_optimization/ev/result.py`
 
@@ -126,15 +119,15 @@ Output types. No logic beyond `PhaseAmps.get` and the tuple normalisation in `Ch
 | `class Stage(StrEnum)`: `DOWN`, `UP` | Which phase of execution an action belongs to. |
 | `class ActionKind(StrEnum)`: `SET_CURRENT`, `PAUSE`, `RESUME` | What to do to a charger. |
 | `Action(charger_id: str, kind: ActionKind, target_current: float, stage: Stage)` | One change with an absolute target. |
-| `class ReasonCode(StrEnum)`: `CHARGE_NOW`, `IN_PLAN`, `READY_TIME_PASSED`, `PLAN_COMPLETED`, `PRICES_STALE`, `PLANNED_LATER`, `WAITING_FOR_HIGHER_PRIORITY`, `WAITING_FOR_CAPACITY`, `TARGET_REACHED`, `BELOW_MINIMUM`, `SMART_CHARGING_OFF`, `FIXED`, `UNAVAILABLE`, `NO_CAR`, `NO_SESSION`, `MINIMUM_PAUSE`, `UNDER_USE`, `EMERGENCY` | Stable reason codes; values are the lower-case names. |
+| `class ReasonCode(StrEnum)`: `CHARGE_NOW`, `IN_PLAN`, `READY_TIME_PASSED`, `PLAN_COMPLETED`, `PRICES_STALE`, `PLANNED_LATER`, `WAITING_FOR_HIGHER_PRIORITY`, `WAITING_FOR_CAPACITY`, `TARGET_REACHED`, `BELOW_MINIMUM`, `SMART_CHARGING_OFF`, `FIXED`, `UNAVAILABLE`, `NO_CAR`, `NO_SESSION` | Stable reason codes; values are the lower-case names. |
 | `Reason(code: ReasonCode, text: str, params: Params = field(default_factory=dict))` | Why a charger got what it got. |
 | `PlannedQuarter(start: datetime, price: float \| None, current: float)` | One planned quarter; `price` None means unpriced. |
 | `ChargerDecision(charger_id: str, allocation: float, priority: int \| None, reason: Reason, plan: tuple[PlannedQuarter, ...] = (), remaining_need_kwh: float \| None = None, deadline: datetime \| None = None, expected_finish: datetime \| None = None, reaches_target: bool \| None = None)` | Everything decided for one charger. |
-| `class Status(StrEnum)`: `EMERGENCY`, `NORMAL`, `LIMITED_BY_BUDGET`, `LIMITED_BY_PHASE`, `WAITING_FOR_CAPACITY`, `PHASE_DATA_STALE`, `PRICES_STALE` | Overall status. |
-| `class EventKind(StrEnum)`: `TARGET_UNREACHABLE`, `PRICE_CAP_EXCEEDED`, `CHARGE_NOW_NEED_COVERED`, `PHASE_DATA_STALE`, `PRICES_STALE`, `MEMORY_RESET`, `PHASE_GUARD_INTERVENED` | Notification-worthy events. |
+| `class Status(StrEnum)`: `NORMAL`, `LIMITED_BY_BUDGET`, `LIMITED_BY_PHASE`, `WAITING_FOR_CAPACITY`, `PHASE_DATA_STALE`, `PRICES_STALE` | Overall status. |
+| `class EventKind(StrEnum)`: `TARGET_UNREACHABLE`, `PRICE_CAP_EXCEEDED`, `CHARGE_NOW_NEED_COVERED`, `PHASE_DATA_STALE`, `PRICES_STALE`, `PLAN_NOT_PROVEN_OPTIMAL` | Notification-worthy events; the last says a solve stopped at the node budget. |
 | `Event(kind: EventKind, text: str, charger_id: str \| None = None, params: Params = field(default_factory=dict))` | One event. |
 | `PhaseAmps(l1: float, l2: float, l3: float)`; `get(self, phase: Phase) -> float` | Amps per phase. |
-| `Decision(actions: tuple[Action, ...], chargers: tuple[ChargerDecision, ...], available: PhaseAmps, status: Status, events: tuple[Event, ...], memory: Memory \| None = None, guard_level: GuardLevel \| None = None, next_check: datetime \| None = None)` | One call's answer; `chargers` in snapshot charger order; `decide` always sets `memory`, `guard_level` is None under stale measurements unless an emergency is latched, `next_check` is in the settings timezone. |
+| `Decision(actions: tuple[Action, ...], chargers: tuple[ChargerDecision, ...], available: PhaseAmps, status: Status, events: tuple[Event, ...])` | One call's answer; `chargers` in snapshot charger order. |
 | `main() -> None` | Showcase: build a small decision by hand. |
 
 ### `src/energy_optimization/ev/quarters.py`
@@ -154,107 +147,79 @@ compared directly because that ignores `fold`.
 
 ### `src/energy_optimization/ev/planning.py`
 
-Remaining need and cheapest-block planning with shared capacity, price cap and unpriced
-quarters; the current quarter can be held for the sessions named in `first` and closed to
-a `skip_current` request.
+Planning vocabulary: remaining need, the energy of a quarter, and the plan type the
+optimiser returns. The plan itself is made in `optimize`.
 
 | Signature | Description |
 |---|---|
 | `class NeedSource(StrEnum)`: `ENERGY`, `SOC`, `DEFAULT` | Where a remaining need came from. |
 | `remaining_need_kwh(session: Session, default_need_kwh: float) -> tuple[float, NeedSource]` | Remaining need, clipped at 0, and its source. |
 | `energy_per_quarter_kwh(current: float, phase_count: int, voltage: float) -> float` | Energy delivered in one quarter. |
-| `PlanRequest(charger_id: str, phases: frozenset[Phase], min_current: float, max_current: float, need_kwh: float, deadline: datetime, skip_current: bool = False)` | One session to plan; equal min and max means all-or-nothing; `skip_current` closes the quarter containing `now` to it (it is held off for now). |
 | `SessionPlan(charger_id: str, quarters: tuple[PlannedQuarter, ...], planned_kwh: float, reachable: bool, price_cap_exceeded: bool, uses_unpriced: bool)` | One session's plan, quarters in time order. |
-| `plan_sessions(requests: Sequence[PlanRequest], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str, first: Sequence[str] = ()) -> dict[str, SessionPlan]` | Plan every request against shared per-phase capacity, most urgent first. The sessions named in `first`, in the order they contest it, keep the quarter containing `now` if their own plan has it there (each planned alone on what the earlier ones left of it); everything else, their later quarters included, is planned most urgent first on what remains, so the plans together never book more than `capacity`. A bare string is a `TypeError`. |
-| `main() -> None` | Showcase: two cars on a shared phase; a default need. |
-
-### `src/energy_optimization/ev/guard.py`
-
-The phase guard over time. One reading is classified green / yellow / red / emergency;
-the level is then carried across calls through `Memory`: increases need the phases
-continuously green for the green hold, red and emergency count as an intervention, and an
-emergency latches until the calm period has passed (it survives stale data). Under stale
-or missing measurements increases stay allowed, because round 1's fallback cap governs
-them, unless an emergency is latched.
-
-| Signature | Description |
-|---|---|
-| `instant_level(currents: PhaseCurrents, phases: frozenset[Phase], settings: Settings) -> GuardLevel` | Level of one reading over `phases`; a missing value is skipped. |
-| `GuardState(level: GuardLevel \| None, green_since: datetime \| None, emergency_at: datetime \| None, increases_allowed: bool, intervened: bool)` | The guard after one call. |
-| `advance_guard(memory: Memory \| None, instant: GuardLevel \| None, now: datetime, settings: Settings) -> GuardState` | One step of the guard over time. |
-| `main() -> None` | Showcase: a red reading, then green calls until increases are allowed, then a stale call that leaves increases to the fallback cap. |
-
-### `src/energy_optimization/ev/regulation.py`
-
-Regulation of one adjustable charger to what its car actually draws: after a whole
-under-use period the charger is cut to its measured draw plus a margin (or halved), a cut
-below the minimum becomes 0, each whole ramp period of full use then raises the cap one
-step, and a charger cut to 0 is offered current again after the resume probe or when the
-session is reset. A cut only ever lowers (never above the setting, the existing cap or the
-maximum) and the ramp never lowers a cap or leaves one between 0 and the minimum; a cap
-the charger cannot run at, or a 0 with no stop time, is taken as a stop and probed from
-the first sight. On/off chargers and chargers without a power reading are never
-regulated.
-
-| Signature | Description |
-|---|---|
-| `Regulation(regulated_cap: int \| None, under_use_since: datetime \| None, full_use_since: datetime \| None, under_use_stop_at: datetime \| None, cut: bool)` | One charger's regulation after one call; cap 0 means stopped for under-use. |
-| `regulate(previous: ChargerMemory \| None, charger: Charger, state: ChargerState, reset: bool, now: datetime, settings: Settings) -> Regulation` | One step of under-use cut, ramp and resume probe. |
-| `main() -> None` | Showcase: a cut, a cut to zero, a steady draw inside the deadband, a ramp step. |
+| `main() -> None` | Showcase: a remaining need from energy and from the default; energy per quarter. |
 
 ### `src/energy_optimization/ev/allocation.py`
 
-Phase capacity, draw and reservations, measurement freshness and max-min-fair sharing.
+Phase capacity, draw and reservations, and measurement freshness.
 
 | Signature | Description |
 |---|---|
-| `Claim(charger_id: str, phases: frozenset[Phase], min_current: float, max_current: float)` | One charger asking for current; equal min and max means all-or-nothing. |
-| `share(claims: Sequence[Claim], capacity: Mapping[Phase, float]) -> dict[str, float]` | Share capacity among claims given in ranking order: 0/min selection, then max-min-fair 1 A steps. |
 | `measurements_fresh(currents: PhaseCurrents \| None, now: datetime, max_age: timedelta, phases: frozenset[Phase]) -> bool` | Measurement present, recent and complete for `phases`. |
 | `present_draw(charger: Charger, state: ChargerState, voltage: float) -> float` | What a charger is taken to draw now on each phase, for the phase guard: 0 when paused or without a car, the smaller of setting and measured draw otherwise; a fixed or unavailable charger counts at its measured draw (its reservation when power is missing), the rest of its reservation being held back by `decide`. |
 | `reserved_current(charger: Charger, state: ChargerState, voltage: float) -> float` | What a fixed or unavailable charger is reserved at on each phase. |
-| `phase_capacity(snapshot: Snapshot, fresh: bool, settling: frozenset[str] = frozenset()) -> dict[Phase, float]` | Per phase, budget intersected with the phase guard when `fresh`; may be negative. A charger in `settling` (sent a decrease a moment ago) counts at its measured draw instead of the smaller of setting and measured, provided it has a car and a power reading. |
-| `main() -> None` | Showcase: sharing on mixed phases and on a tight phase. |
+| `phase_capacity(snapshot: Snapshot, fresh: bool) -> dict[Phase, float]` | Per phase, budget intersected with the phase guard when `fresh`; may be negative. |
+| `main() -> None` | Showcase: measurement freshness and a reservation. |
 
-### `src/energy_optimization/ev/decide.py`
+### `src/energy_optimization/ev/optimize.py`
 
-The decision core: memory usability, classification, regulation, priority tiers with
-anti-flapping (minimum pause, hysteresis; in the planned tier the planner lets the sessions that
-contest a place keep the current quarter, in the ranked tier's order, and plans every later
-quarter most urgent first; a charger held off by the minimum pause claims nothing of the
-current quarter; a running charger the plan still drops for capacity is a capacity stop held
-off by the minimum pause), planning,
-sharing, the lowering steps (emergency, no increases, pacing), actions with in-flight
-suppression, reasons, status, events, the new memory and the next check. A command sent
-within the action interval counts as where the charger is (it may not have landed), so
-an emergency, a smaller share or a pacing hold is judged against it; an unplug keeps
-what the minimum pause needs; the next check is never later than the new memory's
-expiry; all arithmetic is in UTC and a time no UTC date can hold is an invalid memory.
+The optimiser: one mixed-integer program solved by HiGHS through `scipy.optimize.milp`,
+level by level (lexicographically). It plans every quarter from now to each car's ready
+time and shares quarter 0 tier by tier on what the tiers above leave: smart charging off,
+charge now, planned cars, then spare capacity. Quarter-0-only tiers are solved on small
+models before and after the planning model. Within the planning model the cost level is held exactly in whole ticks of the price grid when every price is a whole multiple of a tick of at least 1e-7 and every current is whole, and to a tolerance otherwise. As many planned cars as possible are on now, the better-ranked first, and they share the first quarter by progressive filling in every tier (when no car can rise with the others, the leftover goes one amp at a time to the lowest, ties in ranking order: round 1's `share`). An unpriced first quarter carries only the energy the need forces. Deterministic: one thread, a fixed node budget
+per solve (`NODE_LIMIT`), never a wall-clock limit; all time arithmetic in UTC. No greedy
+fallback: a solve that HiGHS reports infeasible (status 2, with or without a point) or that returns no point at all (any status) is retried once with presolve off, and the retry's result is the one judged: a second failure raises `SolverError`, while a result with a point and any other status (a node-budget stop is kept as not proven; a status 3 or 4 below the limit raises) is never retried.
 
 | Signature | Description |
 |---|---|
-| `decide(snapshot: Snapshot) -> Decision` | Decide what every charger should be set to now; the decision's `memory` goes into the next snapshot. |
-| `main() -> None` | Showcase: three chargers and two sessions, a follow-up call fed with the memory, then the same snapshot without phase measurements. |
+| `class SolverError(RuntimeError)`; `__init__(self, status: int, message: str) -> None`; attributes `status`, `message`; `str(err) == f"HiGHS status {status}: {message}"` | The solver failed; carries scipy's `milp` status and message. |
+| `NODE_LIMIT: int` | Branch-and-bound nodes allowed per level solve (8000; see the benchmark in the round-2 plan). |
+| `class Tier(IntEnum)`: `SMART_OFF = 0`, `CHARGE_NOW = 1`, `PLANNED = 2`, `SPARE = 3` | Which precedence stage a demand belongs to. |
+| `Demand(charger_id: str, phases: frozenset[Phase], tier: Tier, min_current: float, max_current: float, now_max_current: float, need_kwh: float = 0.0, deadline: datetime \| None = None)` | One charger asking for current, given in ranking order. `min_current == max_current` is on/off at exactly that current in every tier; otherwise it runs in whole amps, so a fractional `min_current` is refused unless both maxima are below it (off in every quarter). A maximum below `min_current` means off in those quarters. Validates itself with `ValueError` naming the field (`tier` must be a `Tier`; `deadline` must be aware and is required for `PLANNED`). |
+| `Outcome(allocations: dict[str, float], plans: dict[str, SessionPlan], proven: bool)` | Quarter-0 current of every demand, a plan per `PLANNED` demand. `proven` is False when any solve (a level, or a probe that decides a level) stopped at the node budget with a point; for a retried solve the retry's result counts, so a first attempt without a point followed by a proven retry leaves it True. |
+| `optimize(demands: Sequence[Demand], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], now_capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str) -> Outcome` | Solve the lexicographic model; `SolverError` when a solve fails (infeasible or no point: only after its one retry with presolve off fails too, carrying the retry's status and message; a status 3 or 4 below the limit with a point: at once), `ValueError` for a naive `now` or a repeated charger id, `ZoneInfoNotFoundError` for an unknown `timezone`; empty `demands` returns before those checks; a limit broken by rounding raises `SolverError` with status 0. |
+| `main() -> None` | Showcase: a charge-now car, two planned cars and a spare-capacity car on one phase, then a phase with no room. |
+
+### `src/energy_optimization/ev/decide.py`
+
+The decision core: classification, priority tiers, demands for `optimize`, actions, reasons,
+status and events. Its time arithmetic is in UTC throughout (every aware input is
+converted before it is added to or compared; only output datetimes are presented in the
+settings timezone). Both expected-finish branches add in UTC: a planned one adds its last
+quarter's length to that quarter's UTC start, so it is right in the repeated hour of the
+fall-back night, and an unplanned one is `None` for a trickle of current no calendar can
+hold, instead of raising `OverflowError`.
+
+| Signature | Description |
+|---|---|
+| `decide(snapshot: Snapshot) -> Decision` | Decide what every charger should be set to now; raises `SolverError` when the solver fails. |
+| `main() -> None` | Showcase: three chargers and two sessions, then the same snapshot without phase measurements. |
 
 ### `src/energy_optimization/ev/codec.py`
 
-Snapshot, decision and memory to and from plain JSON-compatible dicts. Keys are field names, enums
+Snapshot and decision to and from plain JSON-compatible dicts. Keys are field names, enums
 go by value, datetimes are ISO 8601 with offset, `time` is `time.isoformat()`, `timedelta`
-is seconds, phase sets are sorted lists. A snapshot's `memory` that cannot be decoded
-does not fail the snapshot: `decide` sees it as invalid and starts conservatively. Inside a
-decision the memory is decoded strictly, like every other field. Decoding rejects missing, unknown and wrongly
+is seconds, phase sets are sorted lists. Decoding rejects missing, unknown and wrongly
 typed fields with a `ConfigError` whose `field` is a dotted path such as
 `chargers[1].max_current`.
 
 | Signature | Description |
 |---|---|
 | `snapshot_to_dict(snapshot: Snapshot) -> dict[str, object]` | Snapshot to a plain dict. |
-| `snapshot_from_dict(data: Mapping[str, object]) -> Snapshot` | Dict to snapshot; `ConfigError` with a dotted path on bad input, except that a malformed `memory` becomes the invalid-memory marker. |
+| `snapshot_from_dict(data: Mapping[str, object]) -> Snapshot` | Dict to snapshot; `ConfigError` with a dotted path on bad input. |
 | `decision_to_dict(decision: Decision) -> dict[str, object]` | Decision to a plain dict. |
-| `decision_from_dict(data: Mapping[str, object]) -> Decision` | Dict to decision; `ConfigError` with a dotted path on bad input, including bad `memory`. |
-| `memory_to_dict(memory: Memory) -> dict[str, object]` | Memory to a plain dict. |
-| `memory_from_dict(data: object) -> Memory \| None` | Dict to memory; never raises, anything malformed gives None. |
-| `main() -> None` | Showcase: snapshot to JSON and back; memory to JSON and back, and malformed memory decoding to None; a rejected bad field. |
+| `decision_from_dict(data: Mapping[str, object]) -> Decision` | Dict to decision, same error rules. |
+| `main() -> None` | Showcase: snapshot to JSON and back; a rejected bad field. |
 
 ## Tests: `tests/`
 
@@ -270,10 +235,7 @@ asserting the `ConfigError.field` — a missing budget, threshold or fallback pa
 duplicate phases given as a list, an unloadable timezone, naive timestamps, overlapping or
 misaligned price intervals (judged in UTC, including across the fall-back fold), snapshot
 cross-links — plus the accepted boundaries, normalisation to tuples, ints and floats, and
-the `main` showcase. Round 2 (T1) adds the new `Settings` fields (every span, margin,
-step and the emergency threshold against the phase threshold), `ChargerMemory` (every
-time field, flags, cap and last target, session key), `Memory` (ids, level, times,
-lookup) and `Snapshot.memory`.
+the `main` showcase.
 
 ### `tests/test_ev_result.py`
 
@@ -291,30 +253,48 @@ refused, `quarter_prices` splitting, and the `main` showcase.
 
 ### `tests/test_ev_planning.py`
 
-Covers `src/energy_optimization/ev/planning.py` (T8-T10, T12): `remaining_need_kwh` and `energy_per_quarter_kwh`
-tables, the cheapest-block planner against a brute-force optimum on hand-checked series,
-the finishing rule, the price-cap precedence and boundary, unpriced quarters used last and
-latest first, shared capacity with the least-slack session first, the sessions named in
-`first` keeping only the current quarter (contested in the order given, ahead of
-urgency; a later one holding what the earlier ones left; an unknown id, an empty `first`
-or a session whose own plan skips the quarter holding nothing; duplicates read once; a
-list and a tuple alike; a bare string refused; arguments not mutated), a `skip_current`
-request starting with the next quarter and leaving the current one to the others,
-whole-amp flooring, a zero `max_current` as unreachable, DST horizons, and two
-`hypothesis` properties: one over generated requests, and one over generated holders and
-closed requests that never books beyond the capacity and does not depend on request
-order; and the `main` showcase.
+Covers `src/energy_optimization/ev/planning.py`: `remaining_need_kwh` and
+`energy_per_quarter_kwh` tables, and the `main` showcase. The greedy planner's tests went
+with the planner.
+
+### `tests/test_ev_optimize.py`
+
+Covers `src/energy_optimization/ev/optimize.py` (T1, T2, T4, T6, T7, T8): the quarter-0
+tiers reproduce round 1's `share` rule (zero-or-min in ranking order, max-min fairness on
+mixed phases, all-or-nothing claims including a fractional current, tolerance, empty and
+negative capacity, purity) and its named results in every quarter-0 tier; the planning
+stage on hand-checked plans (minimum blocks and a block longer than the window, a tiny need
+under a block, partly and fully unpriced horizons, negative prices overfilling by at most a
+quarter, the price cap at its boundary, a shortfall, first-quarter capacity, deadlines at or
+before now, the fall-back night in UTC, a 48-hour horizon, fractional on/off currents, the
+better-ranked car getting the earlier quarter and being on now first); the tiers on the
+leftover for every pair; smart-off held to `capacity` in later quarters; `Demand`
+validation naming each field (including `tier`), `Outcome`, `SolverError` and `NODE_LIMIT`;
+the `Raises:` branches, the empty-demands early return and negative or absent capacity; the
+rounding checks that raise with status 0; the solver call spied for no `time_limit`, one
+thread, the node budget, a zero gap and presolve on except for the one retry that follows a failed attempt and changes only that option; the retry (a failed solve retried once with presolve off, the retry's answer proven or not, a second failure raising with the retry's status and message for each failure kind, a stop at the node budget with a point not retried, the planned remainder through a retry of every solve, identical solver calls across retried runs, seeds 1931 and 5662 of step 6's tiny set solved); a node-budget stop with a point being not proven and a status 4
+below the limit failing without a retry; a `hypothesis` property that no limit is ever broken (T1) and one
+that the level-by-level tuple equals a brute-force enumeration (T2); the one-amp remainder (fractional first-quarter limits, a binding phase beside a free one, an on/off car inside the ranking, unequal minimums, smart-off's two rooms, remainders of 0 and 1 and a half amp of room, a raise stopped at the node budget, an odd first quarter forced by prices, the planned tier against round 1's `share` on generated claims, and the accepted solver-tolerance slack); and the planned tier's
+full progressive fill (8 / 11 / 11 on 30 A, 8 / 8 for two cars forced into an unpriced first
+quarter, an unpriced first quarter not filled beyond what the need forces, the leftover one amp
+at a time to the lowest (7 / 7 / 6 on 20 A, 2 / 2 / 1 for minimums 2, 1, 1 on 5 A, in every tier, and equal to a restatement of `share` on generated claims), 8 / 8 / 8 on mixed phases; cars tied at a cap, one
+binding phase, on/off and fractional on/off cars, unequal minimums, a car off now, a
+need-limited car found by a probe, a forced dear first quarter split evenly, the cheaper
+quarter never given up for a dearer one by a price tick, the forced unpriced energy held in
+kWh not amps, the fill robust to integrality noise, probes failing with `SolverError` or
+stopping at the node budget, identical solver calls on repeated runs); the brute-force oracle
+follows the amended P5 and P6 and generates three-phase demands; a fractional `min_current`
+on an adjustable `Demand` is refused and accepted when the demand is on/off or always off; the
+private tick helper's grid detection and its give-ups (grids finer than 1e-7, more than
+10^7 ticks, all-zero prices), and a first quarter dearer by one tick getting no extra amp
+while equal prices still split freely; and the `main` showcase.
 
 ### `tests/test_ev_allocation.py`
 
-Covers `src/energy_optimization/ev/allocation.py` (T4, T7, T13, T14): `share` (zero-or-min in ranking order,
-max-min fairness on mixed phases, all-or-nothing claims, tolerance, empty and negative
-capacity, purity), `measurements_fresh` boundaries, `reserved_current`, `present_draw`
+Covers `src/energy_optimization/ev/allocation.py` (T7, T13, T14): `measurements_fresh` boundaries, `reserved_current`, `present_draw`
 (smaller of setting and measured, paused, no car, fixed at its measured draw) and
 `phase_capacity` (negative values, missing phases, fixed reservations); and the `main`
-showcase. Round 2 (T11) adds `phase_capacity` with `settling`: the measured draw of a
-charger still ramping down, a paused car still drawing, no car or no reading, three
-phases, and the cases where it is ignored (stale, unknown id, fixed, unavailable).
+showcase.
 
 ### `tests/test_ev_decide.py`
 
@@ -322,71 +302,26 @@ Covers `src/energy_optimization/ev/decide.py` (T3, T5-T7, T9, T13-T18, T20): doc
 priority tiers and reason codes, reservations and smart charging off, the fallback table,
 actions and their order, events, expected finish and `reaches_target`, DST nights, the
 float-residue and `user_current_limit=0` regressions, determinism across hash seeds, the
-standard-library-only AST scan, the 100 ms performance check, and two `hypothesis`
-properties over generated snapshots: one (T17) whose invariants, including that no plan
-books more than a phase holds, are computed independently of the module's helpers, and
-one that sends each snapshot through the dict round trip and gets the same decision; and
-the `main` showcase. Its `snap` helper hands every snapshot a warm memory (saved a minute ago, green
-for an hour, no charger history) so the round-1 scenarios run in steady state instead of
-the conservative start.
-
-Round 2 adds multi-call scenarios that feed each decision's memory into the next
-snapshot (T3-T13): the conservative start and every memory-usability boundary, times no
-UTC date can hold, huge duration settings; minimum pause (including across an unplug and
-charge now), selection hysteresis and minimum on-time in both the tier ranking and the
-planned tier (a started charger kept against a more urgent newcomer without starving it of
-later quarters, only the contender that takes the place being more than the hysteresis
-earlier, a capacity stop held off by the minimum pause and claiming nothing meanwhile, plans
-that never book more than the phase holds, a price-driven stop that is not a capacity
-stop), an in-flight resume; regulation through `decide` (a cut freeing current,
-a stop, the probe, a session change or re-plug clearing it, ramp back, never-regulated
-chargers, smart charging off); the guard levels (yellow, red, green hold, stale data,
-emergency and its calm period, emergency countermanding an in-flight resume); pacing,
-in-flight suppression and settling; `next_check` for every source, the earliest winning,
-the memory expiry clamp and UTC arithmetic across the fold; the session start taken from
-memory. Three `hypothesis` properties (T15) run sequences of calls feeding memory forward and
-check, independently of the module, the budget and amended phase-guard bounds, legal
-currents, no increase in yellow, red or a restart, the green hold, pacing, the
-minimum pause, emergency, action existence and order against the command in flight, and
-the memory round trip: one over arbitrary installations, one over plain installations
-where every timer can fire, and one over crowded installations (overlapping phases, a
-tight budget, cars plugging in and out) that also checks after every call that no plan
-books more than a phase holds. The 100 ms check also runs with a fully populated memory
-and with ten running chargers whose plan puts them later.
+AST scan (standard library, numpy and scipy only) and the `pyproject.toml` dependencies, the A5 tier timing tests (3, 7 and 10 chargers within 10, 60 and 120 s on five seeds each), and two `hypothesis`
+properties over generated snapshots: one (T17) whose invariants are computed independently of
+the module's helpers, and one that sends each snapshot through the dict round trip and gets
+the same decision; the invariants include a plan-fit oracle keyed in UTC and
+`expected_finish` after the first planned quarter, compared as instants. Also the
+stateless-core tests: the unplanned expected finish added in UTC across both 2026 DST
+nights (including an unplanned finish landing exactly on the spring-forward transition),
+a planned expected finish ending in or at the repeated hour of the fall-back night and at
+the spring-forward transition, `reaches_target` across the fold, a trickle of current (including a reserved
+charger's tiny measured draw) giving `None` and surviving the codec round trip, no state
+between interleaved snapshots, the solver's failure statuses raising `SolverError` from `decide` (including a later level stopping without a point, the retry's status and message being the ones reported rather than the first attempt's, and a status 4 below the node limit raising whatever its message), node-budget stops (stubbed and real) adding `PLAN_NOT_PROVEN_OPTIMAL` last and round-tripping the codec, the solver call spied, decisions equal under permuted chargers, states and sessions, planned fractional on/off chargers, the fallback capping only the first planned quarter, a ready time inside the current quarter, tiny needs planned in the ready-time quarter (or now with a one-quarter block), two planned cars tied at a user limit leaving the rest to the other, two cars forced into an unpriced current quarter sharing it in plan, the hash-seed check through the planned fill, the first-ranked planned car charging first on equal prices and a plan below its max staying normal, a mid-quarter ready time credited the whole quarter (pinned, not endorsed), unpriced and empty price series, the price-cap event boundary, the tiers' waiting reason codes and stale prices sharing evenly (T4-T7), the two step-6 snapshots HiGHS called infeasible without presolve (explicit literals), a fractional on/off charger staying off under a lower user limit, a zero limit or the fallback cap, the tier invariant not counting a charger the fallback cap keeps off, and the public surface equal to round 1's plus `SolverError`, `PLAN_NOT_PROVEN_OPTIMAL` and `optimize`'s names (exports, removed modules and names, dataclass fields, signatures, enum members); and the `main` showcase.
 
 ### `tests/test_ev_codec.py`
 
 Covers `src/energy_optimization/ev/codec.py` (T2, T19): JSON round trips of snapshots and decisions (negative
 prices, odd offsets, `None` measurements, every enum, parameter types kept), plain-type
 output, and rejection of missing, unknown, wrongly typed, huge, null-on-defaulted and
-invalid fields with the exact dotted path; and the `main` showcase. Round 2 (T2) adds
-`memory_to_dict` / `memory_from_dict` (every field, every level, offsets and the fall-back
-fold compared as instants, plain types, none-for-anything-malformed including deep
-nesting), the `memory` key in snapshot dicts (absent, null, malformed becoming the invalid
-marker that survives a round trip, a bad charger field still reported), the new decision
-keys read strictly with dotted paths, and the new settings fields.
-
-### `tests/test_ev_guard.py`
-
-Covers `src/energy_optimization/ev/guard.py` (round 2 T9): `instant_level` at every
-boundary (just under, at and just over the yellow, red and emergency limits, no emergency
-threshold, zero margin, missing and unlisted phases, no phases) and `advance_guard` over
-call sequences — the green hold at its boundary, yellow and red blocking increases, green
-having to be continuous, a green run ended by a non-green memory, the emergency latch and
-calm release at their boundary (zero calm, hold longer than calm, a non-green call
-restarting it), stale data with and without a latch, and times compared in UTC across the
-fold and in other offsets; and the `main` showcase.
-
-### `tests/test_ev_regulation.py`
-
-Covers `src/energy_optimization/ev/regulation.py` (round 2 T6, T8): the concept's own
-scenarios (a cut to draw plus margin, a cut below the minimum, the deadband, a ramp step,
-the probe), the boundaries of the under-use, ramp and probe periods and of the three
-zones, both reduction methods, a steady draw after a cut neither ramped nor cut again over
-several calls, a held setting neither raising nor lowering the cap, a cut that never
-raises (deadband below the margin, an existing cap), a cap between 0 and the minimum or a
-0 with no stop time treated as a stop, reset, on/off and fixed chargers, missing power,
-paused and no-car calls, and times compared in UTC; and the `main` showcase.
+invalid fields with the exact dotted path; the literal round-1 key sets of snapshot and
+decision dicts; the rejection of `memory`, the 15 round-2 settings and the round-2
+decision keys, each naming that field; and the `main` showcase.
 
 ### `tests/test_guard_git.py`
 

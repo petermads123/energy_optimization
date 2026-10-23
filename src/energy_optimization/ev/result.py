@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from .model import GuardLevel, Memory, Phase
+from .model import Phase
 
 type Params = dict[str, str | float | int | bool]
 
@@ -64,9 +64,6 @@ class ReasonCode(StrEnum):
     UNAVAILABLE = "unavailable"
     NO_CAR = "no_car"
     NO_SESSION = "no_session"
-    MINIMUM_PAUSE = "minimum_pause"
-    UNDER_USE = "under_use"
-    EMERGENCY = "emergency"
 
 
 @dataclass(frozen=True)
@@ -135,7 +132,6 @@ class ChargerDecision:
 class Status(StrEnum):
     """Overall status."""
 
-    EMERGENCY = "emergency"
     NORMAL = "normal"
     LIMITED_BY_BUDGET = "limited_by_budget"
     LIMITED_BY_PHASE = "limited_by_phase"
@@ -145,15 +141,18 @@ class Status(StrEnum):
 
 
 class EventKind(StrEnum):
-    """Notification-worthy events."""
+    """Notification-worthy events.
+
+    `PLAN_NOT_PROVEN_OPTIMAL` means the solver stopped at its node budget: the plan is
+    the best found, within every limit, but not proven optimal.
+    """
 
     TARGET_UNREACHABLE = "target_unreachable"
     PRICE_CAP_EXCEEDED = "price_cap_exceeded"
     CHARGE_NOW_NEED_COVERED = "charge_now_need_covered"
     PHASE_DATA_STALE = "phase_data_stale"
     PRICES_STALE = "prices_stale"
-    MEMORY_RESET = "memory_reset"
-    PHASE_GUARD_INTERVENED = "phase_guard_intervened"
+    PLAN_NOT_PROVEN_OPTIMAL = "plan_not_proven_optimal"
 
 
 @dataclass(frozen=True)
@@ -209,11 +208,6 @@ class Decision:
         available: Amps still available per phase after reservations.
         status: Overall status.
         events: Notification-worthy events.
-        memory: The memory to hand back in the next snapshot; `decide` always sets it.
-        guard_level: The phase guard's level after the call, None when the
-            measurements are stale and no emergency is latched.
-        next_check: The earliest moment a new call could change the decision, in the
-            settings timezone; None when nothing is pending.
     """
 
     actions: tuple[Action, ...]
@@ -221,9 +215,6 @@ class Decision:
     available: PhaseAmps
     status: Status
     events: tuple[Event, ...]
-    memory: Memory | None = None
-    guard_level: GuardLevel | None = None
-    next_check: datetime | None = None
 
     def __post_init__(self) -> None:
         """Normalise the sequences to tuples."""
