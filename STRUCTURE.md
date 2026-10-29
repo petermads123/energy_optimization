@@ -420,8 +420,10 @@ decision keys, each naming that field; and the `main` showcase.
 ### `tests/test_common.py`
 
 Covers `src/energy_optimization/common.py` (T10, T15): the moved names are the same objects
-from `common`, `ev.model`, `ev.quarters`, `ev.optimize`, `ev` and `interruptible`; every
-name in both `__all__` lists imports; the validation helpers' edges (`fail`'s context
+from `common`, `ev.model`, `ev.quarters`, `ev.optimize`, `ev` and `interruptible`, and the
+private helper aliases in `ev.model` and `ev.quarters` are the `common` helpers; every name
+in both `__all__` lists imports; `ConfigError` and `SolverError` (base class,
+`field`/`status`, `message`, unchanged `str`); the validation helpers' edges (`fail`'s context
 prefix, `check_number`/`check_whole` on bools, huge ints, NaN and numpy scalars,
 `check_aware` with an offset-less tzinfo); `to_utc` across an odd offset and the fall-back
 fold; the grid helpers and price types; and the `main` showcase.
@@ -432,12 +434,12 @@ Covers `src/energy_optimization/interruptible/model.py` (T7, T8): `Limits` range
 before cross-checks and the field each names, integral floats, bools and fractions per field,
 `history_needed`; `Load` bounds for `rebound`, `min_saving_percent` and `power_kw`;
 `LoadSnapshot` history normalisation, the index named in a bad entry, unordered history
-refused, `force_on`, naive `now`, wrong `load` and `prices`; and the `main` showcase.
+refused, `force_on`, naive `now`, wrong `load` and `prices`; the `LoadState` members and values; and the `main` showcase.
 
 ### `tests/test_interruptible_result.py`
 
 Covers `src/energy_optimization/interruptible/result.py`: the exact `ReasonCode` members and
-values, `LoadSchedule` defaults and plan normalisation, frozenness, and the `main` showcase.
+values, `LoadSchedule` defaults and plan normalisation, frozenness, comparison by value, and the `main` showcase.
 
 ### `tests/test_interruptible_schedule.py`
 
@@ -451,8 +453,12 @@ horizon (the defect this step found) and negative or zero always-on cost (T6); h
 length, older history changing nothing and a huge window (T8); purity, determinism and the
 spied `milp` options (T9); the minimum saving at its inclusive boundary (T11); the
 end-of-horizon rule (T12); a 192-quarter horizon within 10 s on five seeds (T13); the reason
-table and its precedence (T14); the solver retry and failure statuses through a spy that
-patches the `scheduler` module (T16); and the `main` showcase.
+table and its precedence, including no price for the current quarter, an unpriced gap ending
+the horizon, and prices that start after or end before now (T14); the solver retry and
+failure statuses through a spy that patches the `scheduler` module (T16); a naive `now`
+refused with `ConfigError` naming `now` (T7); `N = 0` behaving as `N = 1`; hand-checked
+plans, with unsorted price intervals read in time order and prices beyond a gap ignored; and
+the `main` showcase.
 
 ### `tests/test_guard_git.py`
 
