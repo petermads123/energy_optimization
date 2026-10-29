@@ -232,7 +232,7 @@ power, so the power cancels out; money figures are those units × `power_kw` / 4
 
 History enters in five places:
 - **Off run in progress.** An off run of length h > 0 that is still going makes every path
-  start with an *in-progress arc* `0 → min(b + K, T)`, with b ∈ [max(0, M − h), X − h]. Its
+  start with an *in-progress arc* `0 → min(b + K, T)`, with b ∈ [max(0, M − h), X − h]; when h ≥ X, or any of guards 2–4 fires, the set is {0}, so a hand-switched run longer than X still has an arc. Its
   cost carries the rebound of all h + b quarters.
 - **On run after an off run.** An on run of length j < N after an off run means no off arc
   starts before N − j.
@@ -248,8 +248,7 @@ History enters in five places:
 2. With the cost held within a tolerance of level 1's, minimise the total number of off
    quarters (the concept's tie-break).
 
-The rest of the tie-break comes from HiGHS's own determinism, as in `ev`: one thread, a
-fixed node budget, no time limit.
+Level 2's objective is `Σ_t off_t · (1 + (t + 1)/(T·(T + 1)))`. The weights add up to less than 1, so the off count stays primary, and among equal counts the earlier off quarters win. That fixes the rest of the tie-break with no extra solve. Beyond that, HiGHS is deterministic, as in `ev`: one thread, a fixed node budget, no time limit.
 
 **What was rejected.**
 - **A compact MILP with one binary per quarter plus start/end indicators.** Its rebound term
@@ -258,6 +257,8 @@ fixed node budget, no time limit.
   model just leaves arcs out.
 - **Dynamic programming.** With a sliding window, the DP state has to remember the last
   Z − 1 quarters, which is 2^95 states for a day-long window.
+
+**Only `SolverError` moves from the solver side.** `interruptible` keeps its own `milp` call, retry and node-budget logic, modelled on `ev.optimize._solve`. `ev.optimize` keeps calling the `milp` it imports itself, because about 20 `ev` tests patch `optimize_module.milp`.
 
 **`SolverError` moves to the shared module too.** It is the one other name both cores need,
 so it moves under the concept's "what both cores need moves". `ev.optimize.SolverError`
@@ -268,7 +269,7 @@ remains the same class, re-exported.
 | Concept | Field | Constraint |
 |---|---|---|
 | X | `Limits.max_off_run` | ≥ 1 |
-| Y | `Limits.window_off_budget` | `min_off_run` ≤ Y ≤ Z |
+| Y | `Limits.window_off_budget` | ≥ 1 (own field); then ≤ Z (names Y), ≥ M (names M) |
 | Z | `Limits.window_length` | ≥ 1 |
 | N | `Limits.min_on_after_off` | ≥ 0; 0 behaves as 1 |
 | M | `Limits.min_off_run` | 1 ≤ M ≤ X, M ≤ Y |
@@ -286,7 +287,7 @@ remains the same class, re-exported.
 | `src/energy_optimization/interruptible/__init__.py` | new | Re-exports the new core's public API with `__all__`. |
 | `src/energy_optimization/interruptible/model.py` | new | Input types: `LoadState`, `Limits`, `Load`, `LoadSnapshot`, each validating itself. |
 | `src/energy_optimization/interruptible/result.py` | new | Output types: `ReasonCode`, `Reason`, `ScheduledQuarter`, `LoadSchedule`. |
-| `src/energy_optimization/interruptible/schedule.py` | new | `schedule()`: horizon, history, arcs, the two-level MILP, the reason, the money figures. |
+| `src/energy_optimization/interruptible/scheduler.py` | new | `schedule()`: horizon, history, arcs, the two-level MILP, the reason, the money figures. |
 | `src/energy_optimization/__init__.py` | changed | The docstring names both subpackages and `common`. |
 | `STRUCTURE.md`, `README.md`, `CLAUDE.md`, `pyproject.toml` | changed | The new layout. `README.md` gets a short "what is in the package" section. `CLAUDE.md` only if it names the layout (today it does not). `pyproject.toml` gets its `description` updated. |
 
@@ -320,10 +321,7 @@ whole package).
 | `prices_fresh(series: PriceSeries, now: datetime, max_age: timedelta) -> bool` | Moved. | A10 |
 | `main() -> None` | Showcase: a price series split into quarters, a rejected field. | — |
 
-`ev.model` imports the helpers under their old private names (`from ..common import
-check_number as _number`, …), so its class bodies are untouched. The re-exports use the
-redundant-alias form (`from ..common import ConfigError as ConfigError`), so Ruff and mypy
-treat them as deliberate.
+`ev.model` imports the helpers under their old private names (`from energy_optimization.common import check_number as _number`, …), so its class bodies are untouched. Imports are **absolute**, because Ruff's TID252 bans parent-relative imports. The re-exports use the redundant-alias form (`from energy_optimization.common import ConfigError as ConfigError`), so Ruff and mypy treat them as deliberate.
 
 `interruptible/model.py`. All dataclasses are frozen and validate in `__post_init__`,
 raising `ConfigError` with the field name:
@@ -331,7 +329,7 @@ raising `ConfigError` with the field name:
 | Signature | Purpose | Covers |
 |---|---|---|
 | `class LoadState(StrEnum)`: `ON = "on"`, `OFF = "off"` | A quarter's state, in history, plan and decision. | A1 |
-| `Limits(max_off_run: int, window_off_budget: int, window_length: int, min_on_after_off: int = 0, min_off_run: int = 1)`; property `history_needed -> int` = max(Z − 1, X, N) | X, Y, Z, N and M. Integral floats are accepted, as in `ev`. Per-field ranges are checked first, then the cross-checks: Y > Z names `window_off_budget`; M > X and M > Y name `min_off_run`. | A1, A7, A8 |
+| `Limits(max_off_run: int, window_off_budget: int, window_length: int, min_on_after_off: int = 0, min_off_run: int = 1)`; property `history_needed -> int` = max(Z − 1, X, N) | X, Y, Z, N and M. Integral floats are accepted, as in `ev`. Per-field ranges are checked first (X ≥ 1, Y ≥ 1, Z ≥ 1, N ≥ 0, M ≥ 1, each naming its own field), then the cross-checks: Y > Z names `window_off_budget`; M > X and M > Y name `min_off_run`. | A1, A7, A8 |
 | `Load(limits: Limits, rebound: float, min_saving_percent: float = 0.0, power_kw: float \| None = None)` | `rebound` in [0, 1]; `min_saving_percent` ≥ 0 and finite; `power_kw` > 0 or None. | A6, A7, A11 |
 | `LoadSnapshot(now: datetime, load: Load, prices: PriceSeries, history: tuple[LoadState, ...] = (), force_on: bool = False)` | One call's input. `history` is oldest first, its last entry the quarter before the one holding `now`. Any sequence is accepted and becomes a tuple; a non-`LoadState` entry is refused, and the message names its index. | A5, A7, A8 |
 | `main() -> None` | Showcase: a fridge's limits and a snapshot; then `ConfigError` for M > X. | — |
@@ -346,12 +344,12 @@ raising `ConfigError` with the field name:
 | `LoadSchedule(state: LoadState, reason: Reason, plan: tuple[ScheduledQuarter, ...], saving_percent: float \| None, always_on_cost: float \| None = None, planned_cost: float \| None = None, saving: float \| None = None, history_short: bool = False, proven: bool = True)` | The answer. `state` is `plan[0].state`, or `ON` when the plan is empty. `saving_percent` is None only when the always-on cost is 0 or there are no prices. The three money fields are set only when `power_kw` is given. `proven` is False when a level stopped at the node budget. | A6, A8 |
 | `main() -> None` | Showcase: a small schedule built by hand. | — |
 
-`interruptible/schedule.py`:
+`interruptible/scheduler.py` (the module is not named `schedule`: `__init__` re-exports the function `schedule`, which would shadow a module of that name and make the tests' `milp` spies patch nothing):
 
 | Signature | Purpose | Covers |
 |---|---|---|
 | `NODE_LIMIT: int` | Branch-and-bound nodes per level solve: 8000, as in `ev`. | A9, A13 |
-| `schedule(snapshot: LoadSnapshot) -> LoadSchedule` | Plan the load. Raises `SolverError` only when a solve has no point after its one retry with presolve off. | A1–A6, A8, A9, A11–A13 |
+| `schedule(snapshot: LoadSnapshot) -> LoadSchedule` | Plan the load. Raises `SolverError` when a solve has no point (or status 2) after its one retry with presolve off, or at once on a status other than 0, 1 or a node-budget 4 when it has a point. | A1–A6, A8, A9, A11–A13 |
 | `main() -> None` | Showcase: a fridge across an evening price peak; then the same load with the override on. | — |
 
 `interruptible/__init__.py` re-exports `LoadState`, `Limits`, `Load`, `LoadSnapshot`,
@@ -366,7 +364,7 @@ import.
    `prices_fresh` and `SolverError` here, with docstrings and messages kept character for
    character. Add `to_utc` and `main()`.
 2. **Repoint `ev`.**
-   - `ev/model.py` imports from `..common`: the helpers under their old underscore names,
+   - `ev/model.py` imports from `energy_optimization.common` (absolute): the helpers under their old underscore names,
      and the three public names re-exported. The moved definitions are deleted.
    - `ev/quarters.py` re-exports the five grid names, and `next_occurrence` uses `to_utc`.
    - `ev/optimize.py` re-exports `SolverError`.
@@ -374,7 +372,7 @@ import.
      anything else is written.
 3. **`interruptible/model.py`**, in the order of the table.
 4. **`interruptible/result.py`.**
-5. **`interruptible/schedule.py`**, as private steps inside `schedule()`:
+5. **`interruptible/scheduler.py`**, as private steps inside `schedule()`:
    1. **Horizon.**
       - `start = floor_to_quarter(now)`.
       - The prices come from `quarter_prices(prices)`.
@@ -388,7 +386,7 @@ import.
         off quarters it covers.
       - **`history_short`:** whether the history is shorter than `history_needed`.
 
-      Windows are grouped by their horizon range `[max(s, 0), min(s + Z, T))`. Each range
+      Every fact is derived from `history[-history_needed:]` with on-padding before it, so older history changes nothing, not even the money figures. Windows are grouped by their horizon range `[max(s, 0), min(s + Z, T))`. Each range
       keeps the largest history count, so the work is O(T + len(history)), not O(Z).
    3. **Current-quarter guards** that decide the reason before any solve, in this
       precedence:
@@ -421,11 +419,8 @@ import.
         `Σ off_t ≤ max(0, Y − history count)`.
       - **Level 1** minimises the cost.
       - **Level 2** minimises `Σ off_t` with `cost ≤ c1 + tol`.
-      - **Options:** `node_limit=NODE_LIMIT`, `threads=1` (as `ev` passes it, with the same
-        warning filter), presolve on, no `time_limit`.
-      - **Failures:** a result with no point is retried once with presolve off. A second
-        miss raises `SolverError(status, message)` with the retry's status and message. A
-        stop at the node budget with a point is kept, with `proven=False`.
+      - **Options:** `{"node_limit": NODE_LIMIT, "mip_rel_gap": 0.0, "presolve": ..., "threads": 1}` (as `ev` passes them, with the same warning filter); no `time_limit`.
+      - **Failures**, mirroring `ev.optimize._solve`: a result with `status == 2` or no point is retried once with presolve off, and the retry is the result judged. A retry still without a point, or still status 2, raises `SolverError(status, message)` with the retry's status and message. With a point, status 0 is proven, and status 1, or status 4 with `mip_node_count >= NODE_LIMIT`, is kept with `proven=False`. Any other status raises `SolverError` at once, without a retry.
    6. **Plan.** Walk the chosen path into `ScheduledQuarter`s. The reason is the guard's if
       one fired. Otherwise:
       - off now: `MIN_OFF_RUN` while 0 < h < M, else `PLANNED_OFF`;
@@ -434,6 +429,7 @@ import.
       - `planned` is the path's cost.
       - `always_on` is the cost of the in-progress arc with b = 0 (clipped) followed by on
         arcs, i.e. switching on now. Both include the constant history tail.
+      - **A clipped in-progress arc** (its tail cut at T) has the rebound energy that falls past T charged at the last horizon price, on both sides, in the figures only. This keeps the "looks free" effect A12 guards against out of the reported saving. The optimisation is unaffected, because a clipped arc is always the only one allowed.
       - `saving_percent` is `100 · (always_on − planned) / |always_on|`, or None when
         `always_on == 0`.
       - With power given, `planned_cost` and `always_on_cost` are the units × `power_kw` /
@@ -456,20 +452,20 @@ New test files: `tests/test_common.py`, `tests/test_interruptible_model.py`,
 |---|---|---|
 | T1 | A `hypothesis` property over generated limits, histories and prices: every plan keeps X, Y-of-Z (windows reaching into the history), N after every off period (counting the history's), and M for every off period that starts in the horizon. Quarters that the history already constrains are on. Checked by an oracle written independently of the module. | A1 |
 | T2 | On horizons of up to ~10 quarters, with history, rebound and minimum saving, the plan's cost equals the minimum found by enumerating every on/off sequence that keeps the limits and the minimum saving. Among equal-cost plans, the plan has the fewest off quarters. | A2 |
-| T3 | A flat price with r = 1 gives always-on (with and without history, any limits). A flat price with r < 1 does plan off quarters. | A3 |
+| T3 | A flat price with r = 1 starts no off period in the horizon, with and without history, for any limits: always-on, except that an off run in progress below M continues exactly to M and is on afterwards. A flat price with r < 1 does plan off quarters. | A3 |
 | T4 | A history whose off run has reached X gives `on` and `MAX_OFF_RUN`. A history that fills a window's budget gives `on` and `WINDOW_BUDGET`. History that breaks a limit (a hand-switched plug) is accepted, and the constrained quarters are on. | A4, A1 |
 | T5 | `force_on` gives `on` and `FORCED_ON`, including mid-run below M. The rest of the plan keeps the limits from quarter 1 on. | A5 |
-| T6 | `saving_percent` matches a hand calculation; the money fields appear only with `power_kw` and scale with it; r = 1 at a flat price gives 0 %; a zero always-on cost gives None; negative prices give a well-defined percentage. | A6 |
+| T6 | `saving_percent` matches a hand calculation; the money fields appear only with `power_kw` and scale with it; r = 1 at a flat price gives 0 %, including with a forced, clipped continuation; a zero always-on cost gives None; negative prices give a well-defined percentage. | A6 |
 | T7 | `ConfigError` names the field for every invalid input: each limit below its range, M > X, M > Y, Y > Z, r outside [0, 1], a negative or non-finite minimum saving, `power_kw` ≤ 0, bools and non-finite numbers, a naive `now`, a non-`LoadState` history entry, and prices off the quarter grid. | A7 |
-| T8 | A short or empty history is padded as on and flags `history_short`. A history longer than `history_needed` gives the same plan as its tail. A huge `window_length` with a short history neither materialises the padding nor slows down. | A8 |
-| T9 | Repeated calls are equal; inputs are unchanged; the solver call is spied for one thread, `NODE_LIMIT`, no `time_limit`, and presolve off only on the retry. | A9 |
-| T10 | `ev.model.ConfigError is common.ConfigError` (and likewise for the price types, the grid helpers and `SolverError`); every name in `ev.__all__` still imports; `git diff origin/main -- tests/test_ev_*.py` is empty; the `ev` suite is green. | A10 |
+| T8 | A short or empty history is padded as on and flags `history_short`. A history longer than `history_needed` gives the same `LoadSchedule` (plan, reason and every figure) as its tail. A huge `window_length` with a short history neither materialises the padding nor slows down. | A8 |
+| T9 | Repeated calls are equal; inputs are unchanged; the solver call is spied for one thread, `NODE_LIMIT`, no `time_limit`, and `mip_rel_gap` 0, and presolve off only on the retry. The spies patch the `scheduler` module. | A9 |
+| T10 | `ev.model.ConfigError is common.ConfigError` (and likewise for the price types, the grid helpers and `SolverError`); every name in `ev.__all__` still imports; the `ev` suite is green. That `tests/test_ev_*.py` is unchanged against `main` is checked at steps 4 and 6 and recorded in the plan file, not asserted in pytest. | A10 |
 | T11 | At P %, every off period that starts in the horizon saves ≥ P % of its affected quarters' always-on cost. Inputs where no period reaches P % give always-on and `NO_SAVING`. The plan is identical with and without `power_kw`. | A11 |
 | T12 | The last max(N, 1) quarters are on in every plan. A run in progress below M continues to M even when that pushes its tail past T. A horizon too short to fit M + K gives `END_OF_HORIZON`. | A12 |
 | T13 | 192 quarters, Z = 96, Y = 32, X = 8, N = 4, M = 2, r = 0.8, on five price seeds: each within 10 s. | A13 |
 | T14 | The reason table: `NO_PRICES` (no price now, and an unpriced gap ending the horizon), `MIN_ON_AFTER_OFF`, `MIN_OFF_RUN`, `PLANNED_OFF`, `PLANNED_ON`, `NO_SAVING`, and the precedence when several hold. | A4, A5 |
 | T15 | `common`: the moved helpers' behaviour and messages; `to_utc`. All new `main()` showcases run. | A10 |
-| T16 | A stubbed `milp` with no point is retried with presolve off, then raises `SolverError` with the retry's status. A node-budget stop with a point gives `proven=False`. | A2, A9 |
+| T16 | A stubbed `milp` with no point, or with status 2, is retried with presolve off, then raises `SolverError` with the retry's status. A node-budget stop with a point (status 1, or 4 at the node limit) gives `proven=False`. Status 3, or 4 below the limit, raises at once. | A2, A9 |
 
 ### Coverage
 
@@ -501,9 +497,28 @@ New test files: `tests/test_common.py`, `tests/test_interruptible_model.py`,
   model would choose off. The guards also fix quarter 0 on in the model, so this cannot
   happen silently. A test finding a case the precedence does not decide is a **halt** (it
   amends A4/A5).
+- **How A3 is read.** A3's "always-on" means no off period *starts* in the horizon. An off run in progress below M is a history commitment, and the concept ranks it above cost, so it continues to M even at a flat price with r = 1. T3 tests that reading. A test that finds a different one is a **halt**.
 - **A history the concept does not decide.** One example is an off run truncated by the
   start of the history: its rebound uses the visible length, which is stated here. Anything
   else of that kind is a **halt**.
+
+---
+
+### Critique
+
+From the `plan-critic`, which gave the verdict "accept with changes". Each finding is listed with what was done about it.
+
+1. **An in-progress run with h > X had no arcs, so it would raise `SolverError`.** Applied: the allowed set is {0} when h ≥ X or any of guards 2–4 fires.
+2. **A module named `schedule.py` is shadowed by the re-exported function, so the `milp` spies would patch nothing.** Applied: the module is renamed `scheduler.py`.
+3. **Solver options and statuses.** Applied: `mip_rel_gap` 0, a retry on status 2 or no point, node-budget detection, an immediate raise on other statuses, all mirroring `ev.optimize._solve`. T9 and T16 are extended.
+4. **A clipped forced continuation made A6 report a false saving, and A3 can't hold with a run in progress below M.** Applied: the figures charge the past-T rebound at the last price. A3 is read as "no off period starts in the horizon" (Risks and T3), and the user is told when the plan is presented.
+5. **Ruff's TID252 bans `from ..common`.** Applied: absolute imports.
+6. **History facts must come from the look-back only.** Applied: everything is derived from `history[-history_needed:]`, and T8 compares the whole `LoadSchedule`.
+7. **Don't share the solve wrapper, since the `ev` tests patch `optimize.milp`.** Applied: stated in Approach.
+8. **`window_off_budget` had no range of its own.** Applied: Y ≥ 1 names `window_off_budget`.
+9. **A `git diff` doesn't belong in pytest.** Applied: it moves to the step 4 and step 6 records.
+10. **The tie-break beyond the off count.** Applied: weighted level-2 objective, with earlier off quarters winning among equal counts.
+
 
 ---
 
