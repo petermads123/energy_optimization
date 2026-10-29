@@ -1,6 +1,6 @@
 # Interruptible load scheduler — off-time limits
 
-<!-- claude-plan step=6 status=active -->
+<!-- claude-plan step=7 status=active -->
 
 | Field | Value |
 |---|---|
@@ -18,7 +18,7 @@
 | 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | done |
-| 6 | Concept check | `/concept-check` | in `/build` | pending |
+| 6 | Concept check | `/concept-check` | in `/build` | done |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
 | 9 | Pull request | `/create-pr` | with the user | pending |
@@ -666,9 +666,28 @@ Edge cases considered and deliberately skipped, with reasons:
 
 | # | Criterion | Met | Evidence |
 |---|---|---|---|
-| A1 | | | |
+| A1 | No breach of any limit counting history | yes | `test_t1_every_plan_keeps_every_limit_counting_history` (hypothesis, oracle independent of the module); arcs fix X/M/N/A12 by construction (`scheduler.py` `_arcs`), window rows from `_windows`; history-breaking cases `test_t4_history_that_breaks_*` |
+| A2 | Lowest cost among valid plans, brute-force checked | yes | `test_t2_plan_is_the_cheapest_then_fewest_off_then_earliest` (3000 off-suite examples agreed per step 5); two-level solve `scheduler.py:490-496` |
+| A3 | Flat price, r = 1 gives always-on | yes | `test_t3_*`; arcs need `saving > tol` (`scheduler.py:207`); the run-in-progress-below-M reading is the one section 1 ranks (history commitment above cost) |
+| A4 | History at budget or run at X gives on, reason names the limit | yes | `test_t4_max_off_run_boundary`, `test_t4_window_budget_*`; `_guard` `scheduler.py:148-156` |
+| A5 | Override forces on, rest keeps limits | yes | `test_t5_*`; `FORCED_ON` guard and first=1 in `_arcs` |
+| A6 | Saving percent, money with power, 0 % at flat r = 1 | yes | `test_t6_*` incl. clipped-continuation regression; `scheduler.py:524-536` |
+| A7 | `ConfigError` naming the field | yes | `tests/test_interruptible_model.py`, `test_t7_*`; M > X, M > Y, Y > Z, r, P, off-grid prices |
+| A8 | Short history padded on, flagged | yes | `test_t8_*` (flag at look-back, older history equal as whole `LoadSchedule`, huge window under 1 s); `_facts` uses `history[-needed:]` |
+| A9 | Deterministic, no mutation | yes | `test_t9_*` (repeat, purity, solver options spied) |
+| A10 | Shared module; `ev` names importable; ev suite unchanged | yes | `git fetch origin main` then `git diff --stat origin/main -- 'tests/test_ev_*.py'`: empty, exit 0. Ev suite + `test_common.py` run now: 1290 passed. Run: every name in `ev.__all__` importable, `ev.ConfigError is common.ConfigError`, `ev.PriceSeries is common.PriceSeries`; no `interruptible` module imports `ev` and `ev` does not mention `interruptible` |
+| A11 | Minimum saving per off period, same with or without power | yes | `test_t11_*`; arc filter `scheduler.py:207`; scaling by power only applied to figures |
+| A12 | Last max(N,1) quarters on except run continuing to M | yes | `test_t12_*`; `end + tail > horizon` break `scheduler.py:202`; clipped run arc only for the shortest allowed |
+| A13 | 192 quarters, Z = 96 within 10 s | yes, thin margin | T13 five seeds pass; slowest 7.51 s (seed 3), others 0.45 to 1.4 s, measured this step |
 
 Drift found, and what was done about it:
+
+- **Out of scope:** nothing built from the exclusion list (no codec, no multi-load, no thermal model, no window reservation past the horizon, no price-age check).
+- **Connections:** `ev` imports from `common`; `interruptible` imports from `common` only; neither imports the other. Showcases run (`python -m energy_optimization.interruptible.scheduler` reads as a fridge across an evening peak, with the override as the second case).
+- **Step 5 flag (a), `NO_SAVING` for an off run that the plan ends now with no later off quarter:** judged acceptable, no drift. Section 1's reason list says "no saving worth taking" without defining it further, and a run in progress is judged by cost alone, so ending it now is the cost-optimal outcome with nothing later worth taking. No criterion decides the code (A4/A5 name only the binding-limit and override cases). The wording "no off period saves enough" is slightly loose for that case; cosmetic, left as is. Not a concept change.
+- **Step 5 flag (b), T13 margin:** A13 is met (max 7.51 s of 10 s on this machine; 0.45 to 1.4 s on the other four seeds). Thin on one seed, not a criterion failure. Worth a `DEVELOPMENT.md` note at step 8 (level 2 as one 5.5 s LP).
+- **Structure:** structure-auditor report (in sync) taken as given.
+- No unmet criterion; marker advanced to step 7.
 
 ### Earlier rounds still hold
 
