@@ -55,3 +55,17 @@ timestamp and the core should distrust an old one.
 - The exact price hold (whole ticks) is off whenever any on/off current is fractional; the fallback tolerance can then trade away a one-tick price gap worth under 1e-6 EUR. Next step: none unless a fractional on/off charger is ever used.
 - The overfill bound (a plan may exceed the need by at most one quarter at the top current) changes round 1's plans at negative prices. Next step: confirm with a real negative-price day.
 - Test debt: the leftover rule's effect on `status` has no dedicated test, and the brute-force property at 60 examples rarely reaches the minimum-block level (it does at 600). Next step: add both when the tests are next touched.
+
+## Interruptible load scheduler: window budget past the horizon
+
+2026-10-29, `feat/interruptible-load-scheduler` round 1. The off-budget of a window that reaches
+past the last priced quarter is not reserved, so a plan can spend it at the end of the horizon
+and leave the first quarters after it starved of off-time. Accepted because the core re-plans
+every quarter and prices usually reach 10+ hours ahead. Next step: revisit if a real plan shows
+the quarters after the horizon starved of off-time.
+
+## Interruptible load scheduler: JSON codec
+
+2026-10-29, `feat/interruptible-load-scheduler` round 1. The new core has no dict/JSON codec
+like `ev.codec`; round 1 left it out. Next step: add one when a caller needs to log or replay
+inputs.
