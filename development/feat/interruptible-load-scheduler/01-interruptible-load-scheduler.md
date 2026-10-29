@@ -1,6 +1,6 @@
 # Interruptible load scheduler — off-time limits
 
-<!-- claude-plan step=8 status=active -->
+<!-- claude-plan step=9 status=active -->
 
 | Field | Value |
 |---|---|
@@ -20,7 +20,7 @@
 | 5 | Test | `/test` | in `/build` | done |
 | 6 | Concept check | `/concept-check` | in `/build` | done |
 | 7 | Ship | `/ship` | in `/build` | done |
-| 8 | Recommend | `/recommend` | with the user | pending |
+| 8 | Recommend | `/recommend` | with the user | done |
 | 9 | Pull request | `/create-pr` | with the user | pending |
 | 10 | Review | `/watch-pr` | on the pull request | pending |
 
@@ -714,19 +714,7 @@ Gates on the whole tree: `ruff check .` clean, `ruff format --check .` 67 files 
 
 ## 8. Recommendations
 
-> Written in step 8. Only follow-ups that are critical and belong to this work, which most
-> rounds do not have: replace the table with `None.` when there are none. Lesser ideas are
-> one-line notes in `DEVELOPMENT.md`, not rows here. Not bugs in what this round built —
-> those go back through `/build` before the pull request. A critical defect outside what
-> section 1 promised, such as a class member it put out of scope, is a recommendation here,
-> and its round opens through `/fix`.
-
-| # | Recommendation | Why it is critical | Effort | Decision |
-|---|---|---|---|---|
-| R1 | | | | |
-
-Decisions: `deferred`, `rejected`, or `next round` — a new numbered file in this folder,
-taken back through steps 1 to 7 on the same branch.
+None.
 
 ---
 

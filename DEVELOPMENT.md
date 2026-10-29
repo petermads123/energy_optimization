@@ -69,3 +69,11 @@ the quarters after the horizon starved of off-time.
 2026-10-29, `feat/interruptible-load-scheduler` round 1. The new core has no dict/JSON codec
 like `ev.codec`; round 1 left it out. Next step: add one when a caller needs to log or replay
 inputs.
+
+## `feat/interruptible-load-scheduler` round 1 notes
+
+2026-10-29, from round 1's step 5 and step 6 records (`development/feat/interruptible-load-scheduler/01-interruptible-load-scheduler.md`, sections 5 and 6).
+
+- A13's timing margin is thin: one seed of the 192-quarter, Z = 96 case takes about 7.5 s of the 10 s bound, 5.5 s of it level 2's single LP. Next step: tighten level 2 (or measure on the Raspberry Pi) before relying on a short call cadence.
+- `NO_SAVING`'s text ("no off period saves enough") also covers an off run in progress that the plan ends now with nothing later worth taking, which reads loosely. Next step: reword, or add a reason code, if a caller shows the text to users.
+- `MAX_OFF_RUN`'s text names the off run as seen within the look-back, so a longer hand-switched run reads as `history_needed` quarters. Next step: none unless the figure is shown to users.
