@@ -1,6 +1,6 @@
 # Interruptible load scheduler — off-time limits
 
-<!-- claude-plan step=3 status=active -->
+<!-- claude-plan step=4 status=active -->
 
 | Field | Value |
 |---|---|
@@ -15,7 +15,7 @@
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
-| 3 | Implement | `/implement` | in `/build` | pending |
+| 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | pending |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
@@ -527,6 +527,33 @@ From the `plan-critic`, which gave the verdict "accept with changes". Each findi
 > Written in step 3. Only deviations from the plan above, each with its reason. "Built as
 > planned" is a complete and good entry. On a fix round, also the reproduction test's red
 > run, pasted here before the fix was written — step 6 cites it.
+
+Built as planned; the Public API table matches the code. Points the plan left open, decided
+while writing, none of which touches section 1:
+
+- `tests/test_ev_*.py` is untouched (`git diff main -- tests/test_ev_*.py` is empty) and the
+  whole suite was green after guide step 2, before the new subpackage was written.
+- `ev.model` keeps the old private names (`_fail`, `_number`, ...) as import aliases of the
+  new public `common` names, so its class bodies are unchanged.
+- `LoadSchedule.history_short` is set on the `NO_PRICES` result too; nothing else is reported there.
+- Window rows: windows starting before the visible history are dropped as implied by the one
+  starting at its first quarter, and a row whose budget is at least its length is dropped as
+  trivial. This keeps the work O(T + len(history)).
+- The on arcs are continuous in [0, 1]; only off and run arcs are integer. Flow conservation
+  makes the on arcs integral once those are.
+- A clipped run arc's rebound past T is charged at the last horizon price in the figures
+  only. The constant tail of an off run that has already ended is not charged past T.
+- `saving_percent` is None when `|always_on| <= tol`, and a difference within `tol` is
+  reported as exactly 0 (so r = 1 at a flat price gives 0 %).
+- Sanity check outside the suite (scratchpad, not committed): 400 random small horizons
+  against a brute-force enumeration agreed on cost and off count except where the
+  enumeration was looser than the plan's rules (a run clipped at T, or a history that
+  already breaks N); A13's case (192 quarters, Z = 96, X = 8, N = 4, M = 2, r = 0.8)
+  solved in 1 to 3 s on five seeds. Step 5 builds the real oracle.
+- `README.md`, the package docstring and the `pyproject.toml` description are updated;
+  `CLAUDE.md` does not name the layout and is unchanged. `STRUCTURE.md` gained `common`,
+  the `interruptible` subpackage and the re-export notes for `ev`; the new test files are
+  added to it in step 5.
 
 ---
 
