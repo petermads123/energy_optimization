@@ -5,12 +5,22 @@ Every type is a frozen dataclass that checks itself in `__post_init__` and raise
 the decision code never has to re-check its input.
 """
 
-import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from enum import StrEnum
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from energy_optimization.common import ConfigError as ConfigError
+from energy_optimization.common import PriceInterval as PriceInterval
+from energy_optimization.common import PriceSeries as PriceSeries
+from energy_optimization.common import check_aware as _aware
+from energy_optimization.common import check_bool as _bool
+from energy_optimization.common import check_number as _number
+from energy_optimization.common import check_text as _text
+from energy_optimization.common import check_whole as _whole
+from energy_optimization.common import fail as _fail
+from energy_optimization.common import set_field as _set
 
 
 class Phase(StrEnum):
@@ -27,84 +37,6 @@ class ChargerKind(StrEnum):
     ADJUSTABLE = "adjustable"
     ON_OFF = "on_off"
     FIXED = "fixed"
-
-
-class ConfigError(ValueError):
-    """Invalid input, naming the offending field.
-
-    Attributes:
-        field: The name of the offending field, dotted when nested.
-    """
-
-    def __init__(self, field: str, message: str) -> None:
-        """Create the error.
-
-        Args:
-            field: The name of the offending field.
-            message: What is wrong with it, naming the value.
-        """
-        super().__init__(f"{field}: {message}")
-        self.field = field
-        self.message = message
-
-
-def _fail(field: str, message: str, ctx: str = "") -> ConfigError:
-    """Build a `ConfigError`, prefixing the message with its context."""
-    return ConfigError(field, f"{ctx}{message}")
-
-
-def _number(field: str, value: object, ctx: str = "") -> float:
-    """Return `value` as a finite float; reject bools, non-numbers, NaN and inf."""
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise _fail(field, f"must be a number, got {value!r}", ctx)
-    try:
-        result = float(value)
-    except OverflowError:
-        raise _fail(
-            field, "must be finite, got an integer too large for a float", ctx
-        ) from None
-    if not math.isfinite(result):
-        raise _fail(field, f"must be finite, got {value!r}", ctx)
-    return result
-
-
-def _whole(field: str, value: object, ctx: str = "") -> int:
-    """Return `value` as an int; accept an integral float, reject everything else."""
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise _fail(field, f"must be a whole number, got {value!r}", ctx)
-    if isinstance(value, float) and (not math.isfinite(value) or value != int(value)):
-        raise _fail(field, f"must be a whole number, got {value!r}", ctx)
-    return int(value)
-
-
-def _aware(field: str, value: object, ctx: str = "") -> datetime:
-    """Return `value` if it is a timezone-aware datetime, else raise."""
-    if not isinstance(value, datetime):
-        raise _fail(field, f"must be a datetime, got {value!r}", ctx)
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise _fail(
-            field, f"must be timezone-aware, got naive {value.isoformat()}", ctx
-        )
-    return value
-
-
-def _bool(field: str, value: object, ctx: str = "") -> bool:
-    """Return `value` if it is a bool, else raise."""
-    if not isinstance(value, bool):
-        raise _fail(field, f"must be a bool, got {value!r}", ctx)
-    return value
-
-
-def _text(field: str, value: object, ctx: str = "") -> str:
-    """Return `value` if it is a non-empty string after stripping, else raise."""
-    if not isinstance(value, str) or not value.strip():
-        raise _fail(field, f"must be a non-empty string, got {value!r}", ctx)
-    return value
-
-
-def _set(obj: object, field: str, value: object) -> None:
-    """Set a field on a frozen dataclass."""
-    object.__setattr__(obj, field, value)
 
 
 @dataclass(frozen=True)
@@ -320,70 +252,6 @@ class Session:
         if number < 0:
             raise _fail(name, f"must be ≥ 0, got {number}", ctx)
         _set(self, name, number)
-
-
-@dataclass(frozen=True)
-class PriceInterval:
-    """One priced interval.
-
-    Attributes:
-        start: Start, aware, on a quarter boundary in UTC.
-        end: End, aware, on a quarter boundary in UTC, after `start`.
-        price: Full consumer price per kWh; finite, may be negative.
-    """
-
-    start: datetime
-    end: datetime
-    price: float
-
-    def __post_init__(self) -> None:
-        """Validate the interval."""
-        start = _aware("start", self.start)
-        end = _aware("end", self.end)
-        if end.astimezone(UTC) <= start.astimezone(UTC):
-            raise _fail(
-                "end", f"must be after start {start.isoformat()}, got {end.isoformat()}"
-            )
-        for name, moment in (("start", start), ("end", end)):
-            utc = moment.astimezone(UTC)
-            if utc.minute % 15 or utc.second or utc.microsecond:
-                raise _fail(
-                    name,
-                    f"must be on a quarter-hour boundary, got {moment.isoformat()}",
-                )
-        _set(self, "price", _number("price", self.price))
-
-
-@dataclass(frozen=True)
-class PriceSeries:
-    """The price series.
-
-    Attributes:
-        intervals: Priced intervals, in any order but not overlapping.
-        updated_at: When the series was last updated, aware.
-    """
-
-    intervals: tuple[PriceInterval, ...]
-    updated_at: datetime
-
-    def __post_init__(self) -> None:
-        """Validate the series."""
-        if isinstance(self.intervals, str) or not isinstance(self.intervals, Iterable):
-            raise _fail("intervals", f"must be a sequence, got {self.intervals!r}")
-        intervals = tuple(self.intervals)
-        for interval in intervals:
-            if not isinstance(interval, PriceInterval):
-                raise _fail("intervals", f"must hold PriceInterval, got {interval!r}")
-        _set(self, "intervals", intervals)
-        _aware("updated_at", self.updated_at)
-        ordered = sorted(intervals, key=lambda item: item.start.astimezone(UTC))
-        for earlier, later in zip(ordered, ordered[1:], strict=False):
-            if later.start.astimezone(UTC) < earlier.end.astimezone(UTC):
-                raise _fail(
-                    "intervals",
-                    f"overlap: {earlier.start.isoformat()}..{earlier.end.isoformat()} "
-                    f"and {later.start.isoformat()}..{later.end.isoformat()}",
-                )
 
 
 @dataclass(frozen=True)

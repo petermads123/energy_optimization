@@ -28,6 +28,8 @@ from numpy.typing import NDArray
 from scipy.optimize import Bounds, LinearConstraint, OptimizeResult, milp
 from scipy.sparse import csr_array
 
+from energy_optimization.common import SolverError as SolverError
+
 from .model import Phase
 from .planning import SessionPlan, energy_per_quarter_kwh
 from .quarters import floor_to_quarter, quarter_starts
@@ -39,26 +41,6 @@ NODE_LIMIT = 8000
 _TOLERANCE = 1e-6
 _EPS = 1e-9
 _MAX_TICKS = 10_000_000
-
-
-class SolverError(RuntimeError):
-    """The solver failed.
-
-    Attributes:
-        status: The status `scipy.optimize.milp` reported.
-        message: The message it reported.
-    """
-
-    def __init__(self, status: int, message: str) -> None:
-        """Build the error.
-
-        Args:
-            status: The `milp` status code.
-            message: The `milp` message.
-        """
-        super().__init__(f"HiGHS status {status}: {message}")
-        self.status = status
-        self.message = message
 
 
 class Tier(IntEnum):
