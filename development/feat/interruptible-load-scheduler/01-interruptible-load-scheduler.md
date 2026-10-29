@@ -1,6 +1,6 @@
 # Interruptible load scheduler — off-time limits
 
-<!-- claude-plan step=4 status=active -->
+<!-- claude-plan step=5 status=active -->
 
 | Field | Value |
 |---|---|
@@ -16,7 +16,7 @@
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done |
-| 4 | Verify | `/verify` | in `/build` | pending |
+| 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
@@ -563,12 +563,38 @@ while writing, none of which touches section 1:
 
 | Check | Result |
 |---|---|
-| `ruff check .` | |
-| `ruff format --check .` | |
-| `mypy` | |
-| Plan completeness | every signature in the Public API table exists as written |
-| `STRUCTURE.md` | in sync |
-| `python -m <package>.<module>` | |
+| `ruff check .` | `All checks passed!` |
+| `ruff format --check .` | `63 files already formatted` |
+| `mypy` | `Success: no issues found in 31 source files` |
+| `pytest` | `1525 passed in 122.46s (0:02:02)` |
+| Plan completeness | every signature in the Public API table exists as written; no Missing, Deviation or Unplanned rows |
+| `STRUCTURE.md` | in sync (structure-auditor: no edits needed; the code was not changed in this step, so the report still holds) |
+| `tests/test_ev_*.py` against `main` (T10) | `git fetch origin main`, then `git diff --stat origin/main -- 'tests/test_ev_*.py'`: empty output, exit 0 (unchanged) |
+| `python -m energy_optimization.<module>` | `common`, `ev.model`, `ev.quarters`, `ev.optimize`, `interruptible.model`, `interruptible.result`, `interruptible.scheduler` all exit 0; the `RuntimeWarning` on the re-exported modules is the expected one |
+
+Showcase output (new modules):
+
+```
+common:
+4 quarters, each at 1.25:
+  2026-10-21T18:00:00+00:00 ... 18:45
+rejected: end: must be on a quarter-hour boundary, got 2026-10-21T19:10:00+00:00 (field=end)
+interruptible.model:
+look-back: 15 quarters
+snapshot: Limits(max_off_run=4, window_off_budget=8, window_length=16, min_on_after_off=2, min_off_run=2) at 2026-10-21T17:00:00+00:00
+rejected: min_off_run: must be ≤ max_off_run (4), got 6 (field=min_off_run)
+interruptible.result:
+now: off (planned_off: off in the dearest quarter)
+plan: ['off', 'on']
+saving: 12.5 %, proven=True
+interruptible.scheduler:
+now: off (planned off; the plan has 10 off quarters in all)
+plan (# on, . off): ..##########..##....####..######
+saving: 19.6 % (0.3525)
+forced: on (forced_on)
+```
+
+Showcases are in the required form (named inputs, call on its own line, named result, printed).
 
 ---
 
