@@ -281,7 +281,7 @@ non-finite numbers refused. Per-field ranges are checked first, then the cross-c
 | `class LoadState(StrEnum)`: `ON = "on"`, `OFF = "off"` | A quarter's state, in history, plan and decision. |
 | `Limits(max_off_run: int, window_off_budget: int, window_length: int, min_on_after_off: int = 0, min_off_run: int = 1)`; property `history_needed -> int` | X, Y, Z, N and M. X, Y, Z, M at least 1, N at least 0 (0 behaves as 1); Y at most Z (names `window_off_budget`); M at most X and at most Y (names `min_off_run`). `history_needed` is `max(Z - 1, X, N)`. |
 | `Load(limits: Limits, rebound: float, min_saving_percent: float = 0.0, power_kw: float \| None = None)` | `rebound` in [0, 1]; `min_saving_percent` at least 0; `power_kw` above 0 or None. |
-| `LoadSnapshot(now: datetime, load: Load, prices: PriceSeries, history: tuple[LoadState, ...] = (), force_on: bool = False)` | One call's input; `history` oldest first, any sequence accepted, a non-`LoadState` entry refused naming its index. |
+| `LoadSnapshot(now: datetime, load: Load, prices: PriceSeries, history: tuple[LoadState, ...] = (), force_on: bool = False)` | One call's input; `history` oldest first, any ordered iterable accepted (a string, set or mapping is refused), a non-`LoadState` entry refused naming its index. |
 | `main() -> None` | Showcase: a fridge's limits and a snapshot, then `ConfigError` for M > X. |
 
 ### `src/energy_optimization/interruptible/result.py`
@@ -416,6 +416,43 @@ output, and rejection of missing, unknown, wrongly typed, huge, null-on-defaulte
 invalid fields with the exact dotted path; the literal round-1 key sets of snapshot and
 decision dicts; the rejection of `memory`, the 15 round-2 settings and the round-2
 decision keys, each naming that field; and the `main` showcase.
+
+### `tests/test_common.py`
+
+Covers `src/energy_optimization/common.py` (T10, T15): the moved names are the same objects
+from `common`, `ev.model`, `ev.quarters`, `ev.optimize`, `ev` and `interruptible`; every
+name in both `__all__` lists imports; the validation helpers' edges (`fail`'s context
+prefix, `check_number`/`check_whole` on bools, huge ints, NaN and numpy scalars,
+`check_aware` with an offset-less tzinfo); `to_utc` across an odd offset and the fall-back
+fold; the grid helpers and price types; and the `main` showcase.
+
+### `tests/test_interruptible_model.py`
+
+Covers `src/energy_optimization/interruptible/model.py` (T7, T8): `Limits` range checks
+before cross-checks and the field each names, integral floats, bools and fractions per field,
+`history_needed`; `Load` bounds for `rebound`, `min_saving_percent` and `power_kw`;
+`LoadSnapshot` history normalisation, the index named in a bad entry, unordered history
+refused, `force_on`, naive `now`, wrong `load` and `prices`; and the `main` showcase.
+
+### `tests/test_interruptible_result.py`
+
+Covers `src/energy_optimization/interruptible/result.py`: the exact `ReasonCode` members and
+values, `LoadSchedule` defaults and plan normalisation, frozenness, and the `main` showcase.
+
+### `tests/test_interruptible_schedule.py`
+
+Covers `src/energy_optimization/interruptible/scheduler.py` (T1-T9, T11-T14, T16): two
+`hypothesis` properties checked by an oracle written in the test file from the concept's
+rules (T1: no limit broken, counting history; T2: the plan equals the brute-force cheapest,
+then fewest off, then earliest off, with history, rebound and minimum saving); flat prices at
+r = 1 and the run-in-progress readings of A3 (T3); each history boundary for X, the window
+and N (T4); the override (T5); the figures, including the forced continuation longer than the
+horizon (the defect this step found) and negative or zero always-on cost (T6); history
+length, older history changing nothing and a huge window (T8); purity, determinism and the
+spied `milp` options (T9); the minimum saving at its inclusive boundary (T11); the
+end-of-horizon rule (T12); a 192-quarter horizon within 10 s on five seeds (T13); the reason
+table and its precedence (T14); the solver retry and failure statuses through a spy that
+patches the `scheduler` module (T16); and the `main` showcase.
 
 ### `tests/test_guard_git.py`
 

@@ -1,6 +1,6 @@
 # Interruptible load scheduler — off-time limits
 
-<!-- claude-plan step=5 status=active -->
+<!-- claude-plan step=6 status=active -->
 
 | Field | Value |
 |---|---|
@@ -17,7 +17,7 @@
 | 2 | Plan | `/plan` | with the user | done |
 | 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | done |
-| 5 | Test | `/test` | in `/build` | pending |
+| 5 | Test | `/test` | in `/build` | done |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
@@ -550,6 +550,12 @@ while writing, none of which touches section 1:
   enumeration was looser than the plan's rules (a run clipped at T, or a history that
   already breaks N); A13's case (192 quarters, Z = 96, X = 8, N = 4, M = 2, r = 0.8)
   solved in 1 to 3 s on five seeds. Step 5 builds the real oracle.
+- Step 5 fixes (code changed after step 4, no signature changed): `_past_horizon` charges the
+  rebound of a clipped run for the off quarters seen (`run + min(extra, T)`), not for quarters
+  past the horizon that are never credited, so a forced continuation longer than the horizon
+  reports 0 % at a flat price with r = 1 (T6); `LoadSnapshot.history` refuses a set, frozenset
+  or mapping (unordered), still accepting any ordered iterable; the `LoadSchedule.saving_percent`
+  docstring says "0 (within a rounding tolerance)".
 - `README.md`, the package docstring and the `pyproject.toml` description are updated;
   `CLAUDE.md` does not name the layout and is unchanged. `STRUCTURE.md` gained `common`,
   the `interruptible` subpackage and the re-export notes for `ev`; the new test files are
@@ -604,8 +610,52 @@ Showcases are in the required form (named inputs, call on its own line, named re
 
 | Intent | Test names | Result |
 |---|---|---|
+| T1 | `test_t1_every_plan_keeps_every_limit_counting_history` (hypothesis, 150 examples; also run at 1500 off-suite) | pass |
+| T2 | `test_t2_plan_is_the_cheapest_then_fewest_off_then_earliest` (hypothesis brute force, 120 examples; 3000 off-suite), `test_schedule_hand_checked_plans` | pass |
+| T3 | `test_t3_flat_price_with_full_rebound_starts_no_off_period` (15), `test_t3_flat_price_full_rebound_*`, `test_t3_run_in_progress_*`, `test_t3_negative_flat_prices_*` | pass |
+| T4 | `test_t4_max_off_run_boundary`, `test_t4_window_budget_*`, `test_t4_history_that_breaks_*` | pass |
+| T5 | `test_t5_*` (force_on, mid-run, past X, N after the forced end, later off quarters) | pass |
+| T6 | `test_t6_*` (hand percentages, money scaling, zero and negative always-on, the regression below) | pass |
+| T7 | `test_interruptible_model.py` (every field, `Limits` order of checks, naive `now`, bad history, bad `load`/`prices`), `test_t7_naive_now_*` | pass |
+| T8 | `test_t8_*` (flag at the look-back, padding, older history equal as a whole `LoadSchedule`, huge window under 1 s) | pass |
+| T9 | `test_t9_*` (repeat, purity, UTC starts, spied options: one thread, node 8000, gap 0, no `time_limit`) | pass |
+| T10 | `test_common.py` identity tests, `__all__` imports; the `ev` suite untouched and green | pass |
+| T11 | `test_t11_*` (inclusive boundary, rebound spread, zero span, no period reaches P, with/without power, hypothesis) | pass |
+| T12 | `test_t12_*` (END_OF_HORIZON boundaries, last N on, clipped continuation) | pass |
+| T13 | `test_t13_a_192_quarter_horizon_*` (five seeds) | pass; one seed takes 7.4 s |
+| T14 | `test_t14_*` (every code, 8-row precedence table, N boundary) | pass |
+| T15 | `test_common.py` helpers, `to_utc`, grid, price types; every `main()` showcase test | pass |
+| T16 | `test_t16_*` (retry on no point and status 2, second failure's status/message, status 1 and 4 at the limit proven False, status 3 and 4 below the limit at once, second-level failure) | pass |
+
+Full suite: `1843 passed in 135.67s`; `ruff check`, `ruff format --check` and `mypy` clean; `git diff --stat origin/main -- tests/test_ev_*.py` empty.
+
+**Bugs the tests found**
+
+1. `_figures`/`_past_horizon` (input-space Contradiction 1, confirmed): history `-`, `lim(4,4,4,0,4)`, flat `[1, 1]`, r = 1 gave -33.33 % instead of 0 %. The forced run is longer than the horizon, and rebound was charged for off quarters past the horizon that the always-on figure never credits. Red run before the fix: `test_t6_clipped_continuation_longer_than_the_horizon_reports_zero_at_flat_r1` and `...[prices0]` failed with `-33.333333333333336`. Fix: charge for `run + min(extra, horizon)` quarters. The plan itself was never affected. Green after.
+2. `LoadSnapshot.history` accepted a set or mapping (contract Contradiction 2). "Any sequence" in the plan and "oldest first" in the concept need an order, so these are refused with `ConfigError` naming `history`; generators and other ordered iterables still work.
+
+**Designer contradictions, applied or rebutted**
+
+- Input-space 1: applied (bug 1).
+- Input-space 2 (a zero affected cost passes any P): rebutted. The concept measures against the absolute value, so P % of 0 is 0 and any saving above tolerance is enough; pinned by `test_t11_zero_span_passes_any_threshold`.
+- Input-space 3 (`MAX_OFF_RUN` text names the capped visible run): rebutted. The core only sees the look-back, which is at least X, and the text names the numbers it used; noted for step 6, no test pins the capped figure.
+- Input-space 4 / contract 1 (`saving_percent` None within `tol`, not only at exactly 0): rebutted as the plan's rule (section 3 note on `tol`); the `LoadSchedule` docstring now says "within a rounding tolerance". Prices of 1e-10 are out of range for any currency unit.
+- Input-space 5 (per-arc saving can exceed 100 % with negative tail prices): not a defect; `test_t11_percent_above_one_hundred_can_still_allow_a_negative_price_tail` pins it.
+- Contract 2 (history as a set): applied (bug 2).
+- Contract 3 (`NO_SAVING` for a run that ends now): rebutted as guide step 5.6's rule; pinned as "not endorsed" by `test_t14_run_ending_now_without_later_off_reports_no_saving`, for step 6 to judge.
+- Contract 4 (history rebound constant clipped at T): not a contradiction; section 3 states it, and no test changes it.
+- Contract 5: no disagreement.
+
+Oracle notes (test-side only): the T1/T2 oracle reads the concept's rules, not the module. Three oracle mistakes were found and fixed while writing it (a forced continuation cut by the horizon, the M rule for a run that ends at T, and the rebound of a run ending exactly now); after that 3000 random cases of up to 9 quarters with history, rebound and minimum saving agreed with the module on cost, off count and earliest placement.
 
 Edge cases considered and deliberately skipped, with reasons:
+
+- `Decimal`, `numpy` bools and text inputs for the limits: `check_number`/`check_whole` are shared with `ev` and covered in `test_common.py`; the limits have no free-text field.
+- A 48-hour horizon or larger than 192 quarters: A13 fixes the size; a slow larger case is for `DEVELOPMENT.md`, not a test that would flake.
+- Asserting the exact `MAX_OFF_RUN` figure for a run longer than the look-back: see the rebuttal above.
+- Time-zone named inputs: the core has no timezone; odd UTC offsets are covered (`test_t9_now_inside_a_quarter_*`, `test_schedule_horizon_runs_*`).
+- Concurrency: the core is stateless and pure; repeat and purity tests cover it.
+- T13 wall-clock margin: seed 3 takes about 7.4 s (level 2 is one LP of 5.5 s, one node), under the 10 s limit but not by a wide margin on a slower machine. Not relaxed; flagged for step 6/8.
 
 ---
 
