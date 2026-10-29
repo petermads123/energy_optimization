@@ -256,7 +256,9 @@ def _past_horizon(
     """Charge the rebound of a clipped run arc that falls past the horizon."""
     tail = max(load.limits.min_on_after_off, 1)
     inside = min(extra + tail, horizon) - min(extra, horizon)
-    return load.rebound * (run + extra) / tail * (tail - inside) * last_price
+    # Off quarters past the horizon are neither credited nor charged a rebound.
+    off_seen = run + min(extra, horizon)
+    return load.rebound * off_seen / tail * (tail - inside) * last_price
 
 
 def _failed(result: OptimizeResult) -> bool:

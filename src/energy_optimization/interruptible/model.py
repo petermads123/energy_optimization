@@ -5,7 +5,8 @@ Every type is a frozen dataclass that checks itself in `__post_init__` and raise
 scheduler never has to re-check its input. All limits are counted in whole quarters.
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -164,8 +165,10 @@ class LoadSnapshot:
             raise fail("load", f"must be a Load, got {self.load!r}")
         if not isinstance(self.prices, PriceSeries):
             raise fail("prices", f"must be a PriceSeries, got {self.prices!r}")
-        if isinstance(self.history, str) or not isinstance(self.history, Iterable):
-            raise fail("history", f"must be a sequence, got {self.history!r}")
+        if isinstance(self.history, str | Mapping | AbstractSet) or not isinstance(
+            self.history, Iterable
+        ):
+            raise fail("history", f"must be an ordered sequence, got {self.history!r}")
         history = tuple(self.history)
         for index, entry in enumerate(history):
             if not isinstance(entry, LoadState):

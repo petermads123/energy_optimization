@@ -64,7 +64,8 @@ class LoadSchedule:
         reason: Why.
         plan: On or off for every quarter of the horizon, in time order.
         saving_percent: The plan's saving against always-on in percent, None when
-            the always-on cost is 0 or there are no prices.
+            the always-on cost is 0 (within a rounding tolerance) or there are no
+            prices.
         always_on_cost: Expected cost of switching on now and staying on, in the
             price's currency; set only when the power is given.
         planned_cost: Expected cost of the plan; set only when the power is given.
