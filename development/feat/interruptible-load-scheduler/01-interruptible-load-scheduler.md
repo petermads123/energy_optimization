@@ -1,6 +1,6 @@
 # Interruptible load scheduler — off-time limits
 
-<!-- claude-plan step=7 status=active -->
+<!-- claude-plan step=8 status=active -->
 
 | Field | Value |
 |---|---|
@@ -19,7 +19,7 @@
 | 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | done |
 | 6 | Concept check | `/concept-check` | in `/build` | done |
-| 7 | Ship | `/ship` | in `/build` | pending |
+| 7 | Ship | `/ship` | in `/build` | done |
 | 8 | Recommend | `/recommend` | with the user | pending |
 | 9 | Pull request | `/create-pr` | with the user | pending |
 | 10 | Review | `/watch-pr` | on the pull request | pending |
@@ -705,8 +705,10 @@ Drift found, and what was done about it:
 
 | Field | Value |
 |---|---|
-| Commits | |
-| Pushed to | |
+| Commits | `bf48d99` Concept; `b8c6cc9` Plan (draft); `96f5a8d` Plan; `95c5cd1` Plan accepted; `7c16b8a` WIP step 3 (common, ev repointed); `d990cdc` Add interruptible-load scheduler core; `114d7a4` Verify; `11ad479` WIP step 5; `a7e3d10` Test; `f9f659f` Concept check; plus this commit, `Ship: Interruptible load scheduler` |
+| Pushed to | `origin/feat/interruptible-load-scheduler` |
+
+Gates on the whole tree: `ruff check .` clean, `ruff format --check .` 67 files formatted, `mypy` no issues in 35 source files, `pytest` 1843 passed in 135.58s. `git diff --stat origin/main -- 'tests/test_ev_*.py'` is empty. Steps 1 to 6 are done, section 6 has no unmet rows, section 5 has a test against every intent. No stray files in `git diff main...HEAD --stat`; `.venv` is ignored and untracked. Every step from 1 to 6 left a commit.
 
 ---
 
