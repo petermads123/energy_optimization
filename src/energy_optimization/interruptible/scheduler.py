@@ -330,13 +330,18 @@ class _Program:
         self.costs = np.array([arc.cost for arc in arcs] + [0.0] * horizon)
 
     def solve(
-        self, objective: NDArray[np.float64], cost_limit: float | None = None
+        self,
+        objective: NDArray[np.float64],
+        cost_limit: float | None = None,
+        off_limit: float | None = None,
     ) -> NDArray[np.float64]:
         """Solve, retry once with presolve off if the attempt failed.
 
         Args:
             objective: The objective vector to minimise.
             cost_limit: When given, a row holding the cost at or below it.
+            off_limit: When given, a row holding the number of off quarters at or
+                below it.
 
         Returns:
             The solution.
@@ -345,11 +350,11 @@ class _Program:
             SolverError: If the retry fails too, or a status other than 0, 1 or a
                 node-budget stop comes back with a point.
         """
-        result = self._milp(objective, cost_limit, presolve=True)
+        result = self._milp(objective, cost_limit, off_limit, presolve=True)
         if _failed(result):
             # HiGHS sometimes reports a feasible model infeasible, or stops without a
             # point, under one presolve setting and solves it under the other.
-            result = self._milp(objective, cost_limit, presolve=False)
+            result = self._milp(objective, cost_limit, off_limit, presolve=False)
         status = int(result.status)
         message = str(result.message)
         solution = result.x
@@ -367,6 +372,7 @@ class _Program:
         self,
         objective: NDArray[np.float64],
         cost_limit: float | None,
+        off_limit: float | None,
         presolve: bool,
     ) -> OptimizeResult:
         """Call HiGHS once on the model as it stands."""
@@ -381,6 +387,14 @@ class _Program:
                     vals.append(arc.cost)
             low.append(-math.inf)
             high.append(cost_limit)
+        if off_limit is not None:
+            row = len(low)
+            for t in range(self.horizon):
+                rows.append(row)
+                cols.append(len(self.arcs) + t)
+                vals.append(1.0)
+            low.append(-math.inf)
+            high.append(off_limit)
         matrix = csr_array((vals, (rows, cols)), shape=(len(low), self.columns))
         options = {
             "node_limit": NODE_LIMIT,
@@ -493,7 +507,10 @@ def schedule(snapshot: LoadSnapshot) -> LoadSchedule:
     weights[len(arcs) :] = [
         1 + (t + 1) / (horizon * (horizon + 1)) for t in range(horizon)
     ]
-    second = program.solve(weights, cost_limit=best + tol)
+    # Level 1's plan is feasible here and level 2 minimises the off count first, so
+    # capping the count at level 1's loses nothing and spares HiGHS most of its work.
+    off_count = float(round(first[len(arcs) :].sum()))
+    second = program.solve(weights, cost_limit=best + tol, off_limit=off_count)
     chosen = [arc for arc, value in zip(arcs, second, strict=False) if value > 0.5]
 
     off = [False] * horizon
