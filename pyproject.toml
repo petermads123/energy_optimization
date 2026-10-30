@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "energy_optimization"
 version = "0.1.0"
-description = "Household energy optimization, starting with a pure decision core for smart EV charging"
+description = "Household energy optimization: pure decision cores for smart EV charging and interruptible loads"
 authors = [
   { name = "Peter Mads Pedersen", email = "petermads123@hotmail.com" }
 ]

@@ -8,34 +8,12 @@ UTC first.
 from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from .model import PriceSeries
-
-QUARTER: timedelta = timedelta(minutes=15)
-
-
-def floor_to_quarter(moment: datetime) -> datetime:
-    """Return the start of the quarter containing a moment.
-
-    Args:
-        moment: An aware datetime.
-
-    Returns:
-        The start of its quarter-hour, in UTC.
-
-    Raises:
-        ValueError: If `moment` is naive.
-    """
-    if moment.tzinfo is None or moment.utcoffset() is None:
-        raise ValueError(f"moment must be timezone-aware, got {moment.isoformat()}")
-    utc = moment.astimezone(UTC)
-    return utc.replace(minute=utc.minute - utc.minute % 15, second=0, microsecond=0)
-
-
-def _utc(moment: datetime, name: str) -> datetime:
-    """Return an aware moment in UTC; a naive one would be read in the host's zone."""
-    if moment.tzinfo is None or moment.utcoffset() is None:
-        raise ValueError(f"{name} must be timezone-aware, got {moment.isoformat()}")
-    return moment.astimezone(UTC)
+from energy_optimization.common import QUARTER as QUARTER
+from energy_optimization.common import floor_to_quarter as floor_to_quarter
+from energy_optimization.common import prices_fresh as prices_fresh
+from energy_optimization.common import quarter_prices as quarter_prices
+from energy_optimization.common import quarter_starts as quarter_starts
+from energy_optimization.common import to_utc as _utc
 
 
 def next_occurrence(ready_time: time, after: datetime, timezone: str) -> datetime:
@@ -78,69 +56,6 @@ def next_occurrence(ready_time: time, after: datetime, timezone: str) -> datetim
             if candidate > after_utc:
                 return candidate
         day += timedelta(days=1)
-
-
-def quarter_starts(start: datetime, end: datetime) -> list[datetime]:
-    """List the quarter starts covering `start` up to `end`.
-
-    Args:
-        start: An aware datetime.
-        end: An aware datetime.
-
-    Returns:
-        UTC quarter starts from the quarter containing `start` while before `end`;
-        empty when `end <= start`.
-
-    Raises:
-        ValueError: If `start` or `end` is naive.
-    """
-    start_utc = _utc(start, "start")
-    end_utc = _utc(end, "end")
-    if end_utc <= start_utc:
-        return []
-    current = floor_to_quarter(start_utc)
-    starts: list[datetime] = []
-    while current < end_utc:
-        starts.append(current)
-        current += QUARTER
-    return starts
-
-
-def quarter_prices(series: PriceSeries) -> dict[datetime, float]:
-    """Split every price interval into quarters.
-
-    Args:
-        series: The price series.
-
-    Returns:
-        The price of each quarter, keyed by its UTC start.
-    """
-    prices: dict[datetime, float] = {}
-    for interval in series.intervals:
-        current = interval.start.astimezone(UTC)
-        end = interval.end.astimezone(UTC)
-        while current < end:
-            prices[current] = interval.price
-            current += QUARTER
-    return prices
-
-
-def prices_fresh(series: PriceSeries, now: datetime, max_age: timedelta) -> bool:
-    """Say whether the price series is recent enough to plan with.
-
-    Args:
-        series: The price series.
-        now: The time now, aware.
-        max_age: How old the series may be.
-
-    Returns:
-        `abs(now - series.updated_at) <= max_age`; a timestamp far in the future is
-        as untrustworthy as one far in the past.
-
-    Raises:
-        ValueError: If `now` is naive.
-    """
-    return abs(_utc(now, "now") - series.updated_at.astimezone(UTC)) <= max_age
 
 
 def main() -> None:

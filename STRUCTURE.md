@@ -42,7 +42,9 @@ moves them, because the `structure-auditor` and the stop gate read only this fil
 ```
 src/                    everything installable; nothing outside it is packaged
   energy_optimization/  the package itself
+    common.py           shared foundation: errors, price types, quarter grid
     ev/                 smart EV charging decision core (see its modules below)
+    interruptible/      interruptible-load scheduler (see its modules below)
 tests/                  pytest suite, one test_<module>.py per module
 development/            one folder per branch, one file per round: the pipeline's state
 .claude/                Claude Code configuration: rules, skills, agents, hooks
@@ -59,11 +61,43 @@ STRUCTURE.md            this file
 ### `src/energy_optimization/__init__.py`
 
 Package entry point. Nothing is re-exported at the root: the EV charging core is the
-subpackage `energy_optimization.ev`, imported as `from energy_optimization.ev import decide`.
+subpackage `energy_optimization.ev`, imported as `from energy_optimization.ev import decide`,
+and the load scheduler is `energy_optimization.interruptible`
+(`from energy_optimization.interruptible import schedule`). The docstring names both and
+`common`.
 
 Every package directory under `src/`, including every subpackage added later, needs one of
 these. The stop gate blocks on a directory of modules without it: it is not a package, so
 it will not install.
+
+### `src/energy_optimization/common.py`
+
+The foundation both cores share, a leaf with the standard library only. `ev.model`,
+`ev.quarters` and `ev.optimize` re-export the names that used to live in them, so every
+import path that worked before still works and `ev.model.ConfigError is common.ConfigError`.
+All grid arithmetic is in UTC; datetimes sharing a `ZoneInfo` are never compared directly
+because that ignores `fold`.
+
+| Signature | Description |
+|---|---|
+| `class ConfigError(ValueError)`; `__init__(self, field: str, message: str) -> None`; attributes `field`, `message`; `str(err) == f"{field}: {message}"` | Invalid input, naming the field. |
+| `class SolverError(RuntimeError)`; `__init__(self, status: int, message: str) -> None`; attributes `status`, `message`; `str(err) == f"HiGHS status {status}: {message}"` | The solver failed; carries scipy's `milp` status and message. |
+| `fail(field: str, message: str, ctx: str = "") -> ConfigError` | Build a `ConfigError`, prefixing the message with `ctx`. |
+| `check_number(field: str, value: object, ctx: str = "") -> float` | A finite float; bools, non-numbers, NaN and inf refused. |
+| `check_whole(field: str, value: object, ctx: str = "") -> int` | An int; an integral float accepted. |
+| `check_aware(field: str, value: object, ctx: str = "") -> datetime` | An aware datetime. |
+| `check_bool(field: str, value: object, ctx: str = "") -> bool` | A bool. |
+| `check_text(field: str, value: object, ctx: str = "") -> str` | A non-blank string. |
+| `set_field(obj: object, field: str, value: object) -> None` | Set a field on a frozen dataclass. |
+| `PriceInterval(start: datetime, end: datetime, price: float)` | One priced interval on quarter boundaries. |
+| `PriceSeries(intervals: tuple[PriceInterval, ...], updated_at: datetime)` | The price series; intervals must not overlap. |
+| `QUARTER: timedelta` | The planning step, 15 minutes. |
+| `to_utc(moment: datetime, name: str) -> datetime` | An aware moment in UTC; `ValueError` naming `name` if naive. |
+| `floor_to_quarter(moment: datetime) -> datetime` | Start of the quarter containing an aware moment, in UTC; `ValueError` if naive. |
+| `quarter_starts(start: datetime, end: datetime) -> list[datetime]` | UTC quarter starts from the quarter containing `start` while before `end`; `ValueError` if either is naive. |
+| `quarter_prices(series: PriceSeries) -> dict[datetime, float]` | Every interval split into quarters, keyed by UTC start. |
+| `prices_fresh(series: PriceSeries, now: datetime, max_age: timedelta) -> bool` | `abs(now - updated_at) <= max_age`; `ValueError` if `now` is naive. |
+| `main() -> None` | Showcase: a price series split into quarters, a rejected field. |
 
 ### Subpackage `src/energy_optimization/ev/`
 
@@ -76,7 +110,8 @@ Wherever output depends on a set of phases, phases are iterated in `Phase` order
 (L1, L2, L3), never in `frozenset` order. Every module is runnable with
 `python -m energy_optimization.ev.<module>` and ends in a `main()` showcase.
 
-Dependency order: `model` and `result` are leaves; `quarters` uses `model`; `planning`
+Dependency order (all of it on top of `common`, which `model`, `quarters` and `optimize`
+import and re-export from): `model` and `result` are leaves; `quarters` uses `model`; `planning`
 uses `model`, `result`; `allocation` uses `model`; `optimize` uses `model`, `planning`,
 `quarters`, `result`; `decide` uses all of those; `codec` uses `model` and `result`.
 
@@ -98,12 +133,10 @@ ints.
 |---|---|
 | `class Phase(StrEnum)`: `L1`, `L2`, `L3` | A phase of the grid connection. |
 | `class ChargerKind(StrEnum)`: `ADJUSTABLE`, `ON_OFF`, `FIXED` | What a charger can do. |
-| `class ConfigError(ValueError)`; `__init__(self, field: str, message: str) -> None`; attributes `field`, `message`; `str(err) == f"{field}: {message}"` | Invalid input, naming the field. |
+| `ConfigError`, `PriceInterval`, `PriceSeries` | Re-exported from `common`, where they are defined. |
 | `Charger(id: str, phases: frozenset[Phase], kind: ChargerKind, min_current: int \| None = None, max_current: int \| None = None, assumed_current: float \| None = None, fallback_current: int \| None = None)` | A charge point; the fields that apply depend on `kind`. |
 | `ChargerState(charger_id: str, car_connected: bool, current_setting: float, paused: bool, measured_power_w: float \| None = None, available: bool = True)` | A charger's state now. |
 | `Session(charger_id: str, ready_time: time, energy_need_kwh: float \| None = None, soc_percent: float \| None = None, target_soc_percent: float \| None = None, battery_capacity_kwh: float \| None = None, delivered_kwh: float = 0.0, charge_now: bool = False, smart_charging: bool = True, user_current_limit: int \| None = None, plugged_in_at: datetime \| None = None)` | The car on one charger; `ready_time` is naive local time. |
-| `PriceInterval(start: datetime, end: datetime, price: float)` | One priced interval on quarter boundaries. |
-| `PriceSeries(intervals: tuple[PriceInterval, ...], updated_at: datetime)` | The price series; intervals must not overlap. |
 | `PhaseCurrents(measured_at: datetime, l1: float \| None, l2: float \| None, l3: float \| None)`; `get(self, phase: Phase) -> float \| None` | Measured current per phase for the whole connection. |
 | `Settings(phase_budget: float, phase_threshold: float, fallback_current: int, timezone: str, voltage: float = 230.0, min_block_quarters: int = 2, price_cap: float \| None = None, default_energy_need_kwh: float = 30.0, max_price_age: timedelta = timedelta(minutes=60), max_measurement_age: timedelta = timedelta(seconds=60))` | Installation settings; budget, threshold, fallback and timezone are required. |
 | `Snapshot(now: datetime, settings: Settings, chargers: tuple[Charger, ...], states: tuple[ChargerState, ...], sessions: tuple[Session, ...], prices: PriceSeries, phase_currents: PhaseCurrents \| None = None)` | One call's input; cross-checks ids between chargers, states and sessions. |
@@ -132,17 +165,15 @@ Output types. No logic beyond `PhaseAmps.get` and the tuple normalisation in `Ch
 
 ### `src/energy_optimization/ev/quarters.py`
 
-The quarter-hour grid. All arithmetic in UTC; datetimes sharing a `ZoneInfo` are never
-compared directly because that ignores `fold`.
+The EV side of the quarter-hour grid. `QUARTER`, `floor_to_quarter`, `quarter_starts`,
+`quarter_prices` and `prices_fresh` are re-exported from `common`, where they are defined;
+`next_occurrence` stays here because local ready times are EV-only. All arithmetic in UTC;
+datetimes sharing a `ZoneInfo` are never compared directly because that ignores `fold`.
 
 | Signature | Description |
 |---|---|
-| `QUARTER: timedelta` | The planning step, 15 minutes. |
-| `floor_to_quarter(moment: datetime) -> datetime` | Start of the quarter containing an aware moment, in UTC; `ValueError` if naive. |
+| `QUARTER`, `floor_to_quarter`, `quarter_starts`, `quarter_prices`, `prices_fresh` | Re-exported from `common`, same signatures. |
 | `next_occurrence(ready_time: time, after: datetime, timezone: str) -> datetime` | First moment strictly after `after` at which local time is `ready_time`, in UTC; a gap time shifts forward, a fold time is the first occurrence unless `after` is already past it (then the second); `ready_time.fold` is ignored; `ValueError` if `after` is naive. |
-| `quarter_starts(start: datetime, end: datetime) -> list[datetime]` | UTC quarter starts from the quarter containing `start` while before `end`; `ValueError` if either is naive. |
-| `quarter_prices(series: PriceSeries) -> dict[datetime, float]` | Every interval split into quarters, keyed by UTC start. |
-| `prices_fresh(series: PriceSeries, now: datetime, max_age: timedelta) -> bool` | `abs(now - updated_at) <= max_age`; `ValueError` if `now` is naive. |
 | `main() -> None` | Showcase: deadlines and quarter counts across the 2026 DST nights. |
 
 ### `src/energy_optimization/ev/planning.py`
@@ -182,7 +213,7 @@ fallback: a solve that HiGHS reports infeasible (status 2, with or without a poi
 
 | Signature | Description |
 |---|---|
-| `class SolverError(RuntimeError)`; `__init__(self, status: int, message: str) -> None`; attributes `status`, `message`; `str(err) == f"HiGHS status {status}: {message}"` | The solver failed; carries scipy's `milp` status and message. |
+| `SolverError` | Re-exported from `common`, where it is defined. |
 | `NODE_LIMIT: int` | Branch-and-bound nodes allowed per level solve (8000; see the benchmark in the round-2 plan). |
 | `class Tier(IntEnum)`: `SMART_OFF = 0`, `CHARGE_NOW = 1`, `PLANNED = 2`, `SPARE = 3` | Which precedence stage a demand belongs to. |
 | `Demand(charger_id: str, phases: frozenset[Phase], tier: Tier, min_current: float, max_current: float, now_max_current: float, need_kwh: float = 0.0, deadline: datetime \| None = None)` | One charger asking for current, given in ranking order. `min_current == max_current` is on/off at exactly that current in every tier; otherwise it runs in whole amps, so a fractional `min_current` is refused unless both maxima are below it (off in every quarter). A maximum below `min_current` means off in those quarters. Validates itself with `ValueError` naming the field (`tier` must be a `Tier`; `deadline` must be aware and is required for `PLANNED`). |
@@ -220,6 +251,69 @@ typed fields with a `ConfigError` whose `field` is a dotted path such as
 | `decision_to_dict(decision: Decision) -> dict[str, object]` | Decision to a plain dict. |
 | `decision_from_dict(data: Mapping[str, object]) -> Decision` | Dict to decision, same error rules. |
 | `main() -> None` | Showcase: snapshot to JSON and back; a rejected bad field. |
+
+### Subpackage `src/energy_optimization/interruptible/`
+
+The interruptible-load scheduler: a pure function from one snapshot (time, a load with its
+off-time limits, prices, the load's recent history, an override) to a `LoadSchedule` (on or
+off now, a plan for every priced quarter, the saving against always-on, a reason). For
+devices that are normally on and may be off for bounded periods: a fridge, a water heater,
+a pump. No I/O, never reads the clock; standard library plus `numpy` and `scipy`. Every
+public type is a frozen dataclass; input types validate themselves and raise `ConfigError`
+naming the field. It does not call `ev` and `ev` does not call it; both import `common`.
+Dependency order: `model` is a leaf; `result` uses `model`; `scheduler` uses `model` and
+`result`. Every module is runnable with `python -m energy_optimization.interruptible.<module>`
+and ends in a `main()` showcase.
+
+### `src/energy_optimization/interruptible/__init__.py`
+
+Re-exports with `__all__`: `LoadState`, `Limits`, `Load`, `LoadSnapshot`, `ReasonCode`,
+`Reason`, `ScheduledQuarter`, `LoadSchedule`, `schedule`, and from `common` `ConfigError`,
+`SolverError`, `PriceInterval` and `PriceSeries`, so a caller needs one import.
+
+### `src/energy_optimization/interruptible/model.py`
+
+Input types. All limits are whole quarters; integral floats are accepted, bools and
+non-finite numbers refused. Per-field ranges are checked first, then the cross-checks.
+
+| Signature | Description |
+|---|---|
+| `class LoadState(StrEnum)`: `ON = "on"`, `OFF = "off"` | A quarter's state, in history, plan and decision. |
+| `Limits(max_off_run: int, window_off_budget: int, window_length: int, min_on_after_off: int = 0, min_off_run: int = 1)`; property `history_needed -> int` | X, Y, Z, N and M. X, Y, Z, M at least 1, N at least 0 (0 behaves as 1); Y at most Z (names `window_off_budget`); M at most X and at most Y (names `min_off_run`). `history_needed` is `max(Z - 1, X, N)`. |
+| `Load(limits: Limits, rebound: float, min_saving_percent: float = 0.0, power_kw: float \| None = None)` | `rebound` in [0, 1]; `min_saving_percent` at least 0; `power_kw` above 0 or None. |
+| `LoadSnapshot(now: datetime, load: Load, prices: PriceSeries, history: tuple[LoadState, ...] = (), force_on: bool = False)` | One call's input; `history` oldest first, any ordered iterable accepted (a string, set or mapping is refused), a non-`LoadState` entry refused naming its index. |
+| `main() -> None` | Showcase: a fridge's limits and a snapshot, then `ConfigError` for M > X. |
+
+### `src/energy_optimization/interruptible/result.py`
+
+Output types. No logic beyond the tuple normalisation of `LoadSchedule.plan`.
+
+| Signature | Description |
+|---|---|
+| `class ReasonCode(StrEnum)`: `NO_PRICES`, `FORCED_ON`, `MAX_OFF_RUN`, `WINDOW_BUDGET`, `MIN_ON_AFTER_OFF`, `END_OF_HORIZON`, `MIN_OFF_RUN`, `PLANNED_OFF`, `PLANNED_ON`, `NO_SAVING` | Why the current quarter is what it is; values are the lower-case names. |
+| `Reason(code: ReasonCode, text: str)` | The code plus a sentence naming the numbers. |
+| `ScheduledQuarter(start: datetime, price: float, state: LoadState)` | One planned quarter; `start` in UTC. |
+| `LoadSchedule(state: LoadState, reason: Reason, plan: tuple[ScheduledQuarter, ...], saving_percent: float \| None, always_on_cost: float \| None = None, planned_cost: float \| None = None, saving: float \| None = None, history_short: bool = False, proven: bool = True)` | The answer; the money fields are set only when `power_kw` is given; `proven` is False when a solve stopped at the node budget. |
+| `main() -> None` | Showcase: a small schedule built by hand. |
+
+### `src/energy_optimization/interruptible/scheduler.py`
+
+The scheduler: a shortest path over the quarter boundaries of the priced horizon, with
+the sliding windows as side constraints, solved as a MILP by HiGHS through
+`scipy.optimize.milp` in two levels (cost, then fewest off quarters, earlier first). Off
+arcs carry the rebound of the off period on the on-quarters after it; the limits, the
+minimum saving and the end-of-horizon rule decide which arcs exist. History is a
+commitment: an off run in progress continues to its minimum, history that already breaks
+a limit is accepted and the quarters it constrains are on. Deterministic: one thread, a
+fixed node budget (`NODE_LIMIT`), no time limit; a solve HiGHS reports infeasible or
+without a point is retried once with presolve off. The module is named `scheduler`, not
+`schedule`, so the re-exported function does not shadow it.
+
+| Signature | Description |
+|---|---|
+| `NODE_LIMIT: int` | Branch-and-bound nodes allowed per level solve (8000). |
+| `schedule(snapshot: LoadSnapshot) -> LoadSchedule` | Plan the load; `SolverError` when a solve has no point (or status 2) after its one retry with presolve off, or at once on a status other than 0, 1 or a node-budget 4 when it has a point. |
+| `main() -> None` | Showcase: a fridge across an evening price peak, then the same load with the override on. |
 
 ## Tests: `tests/`
 
@@ -322,6 +416,49 @@ output, and rejection of missing, unknown, wrongly typed, huge, null-on-defaulte
 invalid fields with the exact dotted path; the literal round-1 key sets of snapshot and
 decision dicts; the rejection of `memory`, the 15 round-2 settings and the round-2
 decision keys, each naming that field; and the `main` showcase.
+
+### `tests/test_common.py`
+
+Covers `src/energy_optimization/common.py` (T10, T15): the moved names are the same objects
+from `common`, `ev.model`, `ev.quarters`, `ev.optimize`, `ev` and `interruptible`, and the
+private helper aliases in `ev.model` and `ev.quarters` are the `common` helpers; every name
+in both `__all__` lists imports; `ConfigError` and `SolverError` (base class,
+`field`/`status`, `message`, unchanged `str`); the validation helpers' edges (`fail`'s context
+prefix, `check_number`/`check_whole` on bools, huge ints, NaN and numpy scalars,
+`check_aware` with an offset-less tzinfo); `to_utc` across an odd offset and the fall-back
+fold; the grid helpers and price types; and the `main` showcase.
+
+### `tests/test_interruptible_model.py`
+
+Covers `src/energy_optimization/interruptible/model.py` (T7, T8): `Limits` range checks
+before cross-checks and the field each names, integral floats, bools and fractions per field,
+`history_needed`; `Load` bounds for `rebound`, `min_saving_percent` and `power_kw`;
+`LoadSnapshot` history normalisation, the index named in a bad entry, unordered history
+refused, `force_on`, naive `now`, wrong `load` and `prices`; the `LoadState` members and values; and the `main` showcase.
+
+### `tests/test_interruptible_result.py`
+
+Covers `src/energy_optimization/interruptible/result.py`: the exact `ReasonCode` members and
+values, `LoadSchedule` defaults and plan normalisation, frozenness, comparison by value, and the `main` showcase.
+
+### `tests/test_interruptible_schedule.py`
+
+Covers `src/energy_optimization/interruptible/scheduler.py` (T1-T9, T11-T14, T16): two
+`hypothesis` properties checked by an oracle written in the test file from the concept's
+rules (T1: no limit broken, counting history; T2: the plan equals the brute-force cheapest,
+then fewest off, then earliest off, with history, rebound and minimum saving); flat prices at
+r = 1 and the run-in-progress readings of A3 (T3); each history boundary for X, the window
+and N (T4); the override (T5); the figures, including the forced continuation longer than the
+horizon (the defect this step found) and negative or zero always-on cost (T6); history
+length, older history changing nothing and a huge window (T8); purity, determinism and the
+spied `milp` options (T9); the minimum saving at its inclusive boundary (T11); the
+end-of-horizon rule (T12); a 192-quarter horizon within 10 s on five seeds (T13); the reason
+table and its precedence, including no price for the current quarter, an unpriced gap ending
+the horizon, and prices that start after or end before now (T14); the solver retry and
+failure statuses through a spy that patches the `scheduler` module (T16); a naive `now`
+refused with `ConfigError` naming `now` (T7); `N = 0` behaving as `N = 1`; hand-checked
+plans, with unsorted price intervals read in time order and prices beyond a gap ignored; and
+the `main` showcase.
 
 ### `tests/test_guard_git.py`
 

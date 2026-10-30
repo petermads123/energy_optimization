@@ -1,9 +1,19 @@
 # energy_optimization
 
-Energy optimization for a household, starting with smart EV charging: a generic,
-pure-Python decision core that decides when, who and at how many amps the chargers behind
-one shared grid connection may charge, within per-phase safety limits. Built to be called
-from a Home Assistant / AppDaemon app, which gathers the input and executes the actions.
+Energy optimization for a household: pure-Python decision cores that take one complete
+snapshot and return what to do now. Built to be called from a Home Assistant / AppDaemon
+app, which gathers the input and executes the actions.
+
+## What is in the package
+
+- `energy_optimization.ev` decides when, who and at how many amps the EV chargers behind
+  one shared grid connection may charge, within per-phase safety limits.
+- `energy_optimization.interruptible` plans interruptible loads (a fridge, a water heater,
+  a pump) that may be switched off for bounded periods: off in the expensive quarters, on
+  in the rest, within a maximum off run, a share of off time per rolling window, a
+  minimum on time after an off period and a minimum off block.
+- `energy_optimization.common` is what both share: the price types, `ConfigError`,
+  `SolverError` and the quarter-hour grid helpers.
 
 ## Install as a dependency
 
