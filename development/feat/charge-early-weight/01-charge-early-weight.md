@@ -8,7 +8,7 @@
 | Feature | `feat/charge-early-weight` (the folder) |
 | Round | `1` |
 | Branch | `feat/charge-early-weight` |
-| Version | `minor` — a small addition to existing planning behaviour; step 9 adds `0.1.0 → 0.2.0` (from main today) |
+| Version | `minor` — a small addition to existing planning behaviour; 0.1.0 → 0.2.0 |
 | Started | `2026-11-08` |
 
 ## Progress
