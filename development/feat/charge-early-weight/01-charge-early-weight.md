@@ -1,6 +1,6 @@
 # Charge-early weight
 
-<!-- claude-plan step=7 status=active -->
+<!-- claude-plan step=8 status=active -->
 
 
 | Field | Value |
@@ -21,7 +21,7 @@
 | 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | done |
 | 6 | Concept check | `/concept-check` | in `/build` | done |
-| 7 | Ship | `/ship` | in `/build` | pending |
+| 7 | Ship | `/ship` | in `/build` | done |
 | 8 | Recommend | `/recommend` | with the user | pending |
 | 9 | Pull request | `/create-pr` | with the user | pending |
 | 10 | Review | `/watch-pr` | on the pull request | pending |
@@ -313,8 +313,8 @@ Drift found, and what was done about it: none. Out of scope respected (interrupt
 
 | Field | Value |
 |---|---|
-| Commits | |
-| Pushed to | |
+| Commits | `70193e1` Concept: charge-early weight; `6753dde` Plan: charge-early weight (draft); `4eda09a` Plan: apply critic findings 4 and 5 (draft); `7b8636f` Plan: apply critic findings; premium on positive prices only; `ef67081` Plan accepted: charge-early weight; `006c7b4` Add waiting premium to planned-tier pricing; `cd74f2a` WIP step 4: verify, optimize call sites and STRUCTURE.md; `bdd5c39` WIP step 5: waiting-premium tests; `43564c9` Test: charge-early weight; `7d764df` Concept check: charge-early weight; plus the final `Ship: Charge-early weight` commit. Steps 1 to 6 each left a commit; none missing. Diff review: 10 files (4 source, 4 test, STRUCTURE.md, plan file), no scratch files or data. Gates on the whole tree: ruff check, ruff format --check, mypy clean; `python -m pytest` 1998 passed. |
+| Pushed to | `origin/feat/charge-early-weight` |
 
 ---
 
