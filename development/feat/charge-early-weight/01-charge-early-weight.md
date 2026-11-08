@@ -1,6 +1,6 @@
 # Charge-early weight
 
-<!-- claude-plan step=5 status=active -->
+<!-- claude-plan step=6 status=active -->
 
 
 | Field | Value |
@@ -19,7 +19,7 @@
 | 2 | Plan | `/plan` | with the user, unless the critique is clean | done |
 | 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | done |
-| 5 | Test | `/test` | in `/build` | pending |
+| 5 | Test | `/test` | in `/build` | done |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
@@ -245,8 +245,39 @@ Built as planned. Notes: `main()` of `optimize.py` gained a third case with a pr
 
 | Intent | Test names | Result |
 |---|---|---|
+| T1 | existing suite unchanged apart from the three surface-pinning tests (`test_snapshot_to_dict_has_exactly_round_1_keys`, `test_the_dataclass_fields_are_round_ones_and_the_demands[Settings]`, `test_the_optimiser_and_capacity_signatures[optimize]`), each updated to include the new field/parameter, the no-defaults assertion kept; `test_decide_a_zero_premium_decides_exactly_as_one_left_out`; `test_optimize_a_premium_of_minus_zero_is_the_raw_path`; one-off differential below | pass |
+| T2 | `test_optimize_a_premium_flips_now_against_later_at_the_a2_boundaries` (10 cases: 8 and 96 quarters at +1.5%/+2.5% and 10%/30%, premium 0 later in all four, two break-even ties keep now); `test_optimize_the_first_quarter_is_never_weighted`; `test_optimize_a_premium_counts_quarters_from_the_one_containing_now`; through `decide`: `test_decide_a_premium_moves_a_planned_car_between_now_and_later_by_the_a2_numbers` (8 cases, `min_block_quarters=1`, a price on every quarter; the 96-quarter cases run on the 25-hour fall-back day because a ready time is under 24 h away) | pass |
+| T3 | `test_optimize_non_positive_prices_are_not_weighted_and_decide_alike_at_every_premium` (2 gaps x 3 premiums x 5 sign cases); `test_optimize_a_plan_over_non_positive_quarters_is_the_same_at_any_premium`; `test_optimize_a_later_negative_price_is_not_pushed_down_by_the_weight` (fails if negatives are weighted); `test_optimize_a_tiny_positive_premium_leaves_the_exact_path_with_the_same_plan` | pass |
+| T4 | `test_optimize_without_a_planned_demand_ignores_the_premium`; `test_optimize_with_planned_cars_only_they_and_the_spare_car_move_with_the_premium` (smart-off and charge-now fixed, spare = room minus the planned car's quarter-0 current, the planned car moving 0 to 16 A); `test_optimize_planned_cars_still_share_the_first_quarter_evenly_at_a_premium`; `test_optimize_two_cars_with_different_deadlines_weigh_the_same_horizon_index`; `test_decide_a_snapshot_without_a_planned_car_decides_the_same_at_any_premium`; `test_decide_with_planned_cars_the_other_tiers_keep_their_allocations` | pass |
+| T5 | `test_optimize_the_price_cap_is_judged_on_raw_prices_whatever_the_premium`; `test_optimize_a_quarter_above_the_cap_still_counts_as_above_it_when_forced`; `test_optimize_a_weight_that_pushes_a_price_over_the_cap_does_not_exceed_it`; `test_decide_the_cap_event_and_planned_prices_use_raw_prices_at_a_premium`; `test_decide_the_cap_event_still_fires_on_a_raw_price_above_it_at_a_premium` | pass |
+| T6 | `test_settings_refuse_a_waiting_premium_outside_zero_to_one_naming_it` (16 values); `test_settings_accept_a_waiting_premium_from_zero_to_one_stored_as_float`; `test_settings_waiting_premium_defaults_to_zero_and_is_the_last_field`; `test_settings_waiting_premium_is_frozen`; `test_settings_name_an_earlier_bad_field_before_a_bad_premium`; `test_settings_waiting_premium_error_names_the_value`; `test_optimize_rejects_a_bad_premium_naming_it` (9 values, `ValueError` with `match=`); `test_optimize_accepts_any_finite_non_negative_premium_even_above_one`; `test_optimize_checks_the_premium_after_the_empty_and_repeated_id_checks` | pass |
+| T7 | `test_the_waiting_premium_round_trips_through_dicts_and_json_text`; `test_the_waiting_premium_is_in_the_dict_as_zero_when_unset`; `test_an_omitted_waiting_premium_decodes_as_zero`; `test_an_integer_waiting_premium_decodes_as_a_float`; `test_a_bad_waiting_premium_is_refused_with_its_dotted_path` (12 values, null included: `reader.given` does refuse null, as planned); `test_a_misspelt_waiting_premium_key_is_still_an_unknown_field`; `test_the_decision_dict_gains_no_key_from_the_waiting_premium` | pass |
+| T8 | `test_optimize_a_premium_decision_is_deterministic_and_does_not_mutate_inputs`; `test_optimize_a_premium_leaves_the_solver_options_as_before`; `test_optimize_a_premium_solves_on_the_exact_path_when_the_weighted_prices_share_a_grid` and `..._tolerance_path_without_a_tick_grid` (a spy on `_price_ticks` shows each path taken); `test_decide_passes_the_waiting_premium_on_to_optimize` (spy); `test_decide_a_premium_decision_does_not_depend_on_the_hash_seed` (seeds 0, 1, 12345); `test_decide_a_premium_decision_is_the_same_on_repeated_runs`; `test_decide_a_premium_calls_the_solver_with_the_same_options`; `test_decide_a_premium_decision_survives_the_codec_round_trip`; `test_optimize_a_premium_keeps_the_earlier_quarter_on_flat_prices`; `test_optimize_a_premium_survives_a_48_hour_horizon_of_large_prices` | pass |
+| T9 | `test_optimize_a_premium_weights_the_utc_index_across_the_fall_back_night`; `test_decide_a_premium_weights_the_utc_quarter_across_the_fall_back_night` (the same +1.5% case that wins now by the UTC index, 8 quarters, and would lose by wall-clock hours, 4) | pass |
+| T10 | `level_tuple` takes `premium` and weights P5's cost by `p * (1 + premium * t / 4)` for `p > 0`; `test_optimize_matches_a_brute_force_enumeration_level_by_level` now draws the premium from {0, 0.01, 1.0} and prices from {0.1, 0.1002, 0.11, 0.2, 0.5, 0.0, -0.1}; the general oracle rarely meets a plan the premium moves (mutating `optimize` to ignore the premium passed it), so `test_optimize_weighted_plan_equals_the_enumeration_where_the_premium_flips_plans` (small needs, a price on every quarter, ample room, one or two cars of different deadlines) was added and fails under that mutation | pass |
+
+Mutation checks run by hand against the source, each caught: the premium ignored by `_stage_plan`, by `decide`, quarter 0 weighted as `t + 1`, the hours per quarter taken as 1, the premium path entered only above 0.5, negatives weighted.
+
+**T1 differential (one-off, not in the suite).** `origin/main` (`2c188c5`) in a temporary git worktree under `/tmp`, this branch in the working tree; 60 000 snapshots from the seeded generator `random_snapshot(random.Random(seed))` of `tests/test_ev_decide.py`, seeds 0 to 59 999, each decided on the branch and, from the same dict, on `main`; decisions compared as `decision_to_dict` JSON (sorted keys):
+
+| Group | Seeds | Premium on the branch | Same | Different |
+|---|---|---|---|---|
+| omitted (key deleted from the dict) | 0 to 29 999 | omitted (decodes as 0.0) | 30 000 | 0 |
+| 0.0 (set explicitly on `Settings`) | 30 000 to 59 999 | 0.0 | 30 000 | 0 |
+
+Total 60 000 of 60 000 identical (3 of them were a `SolverError` on both sides, with the same message). The worktree was removed afterwards. Also, 600 further snapshots at a premium of 1e-12 against 0 gave identical decisions (no continuity break observed, so nothing for `DEVELOPMENT.md`).
+
+Result: `ruff check .`, `ruff format --check .`, `mypy` clean; `pytest` 1998 passed.
+
+Bugs found: none. The code and the plan agree that `reader.given` refuses a null premium (tested), and `optimize` raises a bare `ValueError` (tested with `match=`).
 
 Edge cases considered and deliberately skipped, with reasons:
+
+- A zero price being "strictly unweighted" as separate from the `p > 0` test: `0 * (1 + x)` is 0, so `>` against `>=` cannot be told apart by any plan; zero is in the non-positive cases anyway.
+- `numpy.int64` and `Decimal` as an `optimize` premium (refused by the `int | float` check) against `Settings`' `_number`: the two layers' type tolerance is not part of the concept; `np.float64` is tested as accepted.
+- An unpriced middle quarter keeping its horizon index: no discriminating hand case was found (the index comes from the cell tuple); covered by the oracle, whose prices are missing on 30% of quarters.
+- A run of the 3/7/10 charger timing seeds at a premium (plan Risk "Speed"): not run; the differential's 60 000 premium-0 decides took about 15 minutes per 15 000 on a shared core and the premium-0 timing tests are unchanged. Left for step 8 if the owner cares.
+- The deadline-relative reading of the horizon index for two cars: identical by construction (every window starts at now), so the hand test and the oracle's two-car cases stand in for it.
 
 ---
 

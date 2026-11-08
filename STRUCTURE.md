@@ -329,8 +329,11 @@ asserting the `ConfigError.field` — a missing budget, threshold or fallback pa
 `None`, bools and non-finite or huge numbers, fields that do not belong to a kind,
 duplicate phases given as a list, an unloadable timezone, naive timestamps, overlapping or
 misaligned price intervals (judged in UTC, including across the fall-back fold), snapshot
-cross-links — plus the accepted boundaries, normalisation to tuples, ints and floats, and
-the `main` showcase.
+cross-links — plus the accepted boundaries, normalisation to tuples, ints and floats, the
+waiting premium (T6: negative, NaN, infinite, bool, string, `None`, list, bytes and
+above-1.0 values refused naming `waiting_premium_per_hour`, 0, -0.0, an int, 1.0 and 1e-12
+accepted and stored as a float, the default 0.0 as the last field, frozen, an earlier bad
+field named first), and the `main` showcase.
 
 ### `tests/test_ev_result.py`
 
@@ -382,7 +385,18 @@ follows the amended P5 and P6 and generates three-phase demands; a fractional `m
 on an adjustable `Demand` is refused and accepted when the demand is on/off or always off; the
 private tick helper's grid detection and its give-ups (grids finer than 1e-7, more than
 10^7 ticks, all-zero prices), and a first quarter dearer by one tick getting no extra amp
-while equal prices still split freely; and the `main` showcase.
+while equal prices still split freely; the waiting premium (T2-T6, T8-T10: the A2 flip boundaries at 8 and 96 quarters
+with break-even ties, quarter 0 never weighted, the index counted from the quarter
+containing `now` and in UTC across the fall-back night, non-positive prices unweighted at
+every premium, a tiny premium keeping the plan, no planned car meaning identical
+outcomes, smart-off and charge-now allocations unchanged with spare taking what the
+planned cars leave, the progressive fill unchanged, two deadlines sharing the horizon
+index, the price cap and `PlannedQuarter.price` on raw prices, the validation table and
+its order after the empty-demands and repeated-id checks, -0.0 on the raw path, the exact
+and tolerance cost paths both used, solver options unchanged, a 48-hour horizon, and the
+brute-force oracle `level_tuple` taking a premium in 0, 0.01 and 1.0 over prices
+including zero and negative, plus a second oracle test built so the premium often moves
+the plan); and the `main` showcase.
 
 ### `tests/test_ev_allocation.py`
 
@@ -407,7 +421,7 @@ nights (including an unplanned finish landing exactly on the spring-forward tran
 a planned expected finish ending in or at the repeated hour of the fall-back night and at
 the spring-forward transition, `reaches_target` across the fold, a trickle of current (including a reserved
 charger's tiny measured draw) giving `None` and surviving the codec round trip, no state
-between interleaved snapshots, the solver's failure statuses raising `SolverError` from `decide` (including a later level stopping without a point, the retry's status and message being the ones reported rather than the first attempt's, and a status 4 below the node limit raising whatever its message), node-budget stops (stubbed and real) adding `PLAN_NOT_PROVEN_OPTIMAL` last and round-tripping the codec, the solver call spied, decisions equal under permuted chargers, states and sessions, planned fractional on/off chargers, the fallback capping only the first planned quarter, a ready time inside the current quarter, tiny needs planned in the ready-time quarter (or now with a one-quarter block), two planned cars tied at a user limit leaving the rest to the other, two cars forced into an unpriced current quarter sharing it in plan, the hash-seed check through the planned fill, the first-ranked planned car charging first on equal prices and a plan below its max staying normal, a mid-quarter ready time credited the whole quarter (pinned, not endorsed), unpriced and empty price series, the price-cap event boundary, the tiers' waiting reason codes and stale prices sharing evenly (T4-T7), the two step-6 snapshots HiGHS called infeasible without presolve (explicit literals), a fractional on/off charger staying off under a lower user limit, a zero limit or the fallback cap, the tier invariant not counting a charger the fallback cap keeps off, and the public surface equal to round 1's plus `SolverError`, `PLAN_NOT_PROVEN_OPTIMAL` and `optimize`'s names (exports, removed modules and names, dataclass fields, signatures, enum members); and the `main` showcase.
+between interleaved snapshots, the solver's failure statuses raising `SolverError` from `decide` (including a later level stopping without a point, the retry's status and message being the ones reported rather than the first attempt's, and a status 4 below the node limit raising whatever its message), node-budget stops (stubbed and real) adding `PLAN_NOT_PROVEN_OPTIMAL` last and round-tripping the codec, the solver call spied, decisions equal under permuted chargers, states and sessions, planned fractional on/off chargers, the fallback capping only the first planned quarter, a ready time inside the current quarter, tiny needs planned in the ready-time quarter (or now with a one-quarter block), two planned cars tied at a user limit leaving the rest to the other, two cars forced into an unpriced current quarter sharing it in plan, the hash-seed check through the planned fill, the first-ranked planned car charging first on equal prices and a plan below its max staying normal, a mid-quarter ready time credited the whole quarter (pinned, not endorsed), unpriced and empty price series, the price-cap event boundary, the tiers' waiting reason codes and stale prices sharing evenly (T4-T7), the two step-6 snapshots HiGHS called infeasible without presolve (explicit literals), a fractional on/off charger staying off under a lower user limit, a zero limit or the fallback cap, the tier invariant not counting a charger the fallback cap keeps off, and the public surface equal to round 1's plus `SolverError`, `PLAN_NOT_PROVEN_OPTIMAL`, `optimize`'s names and `waiting_premium_per_hour` (exports, removed modules and names, dataclass fields, signatures, enum members); the waiting premium through `decide` (T2, T4, T5, T8, T9: passed on to `optimize` as its last argument, a planned car moving between now and later by the A2 numbers at 8 and 96 quarters, 0 and an omitted premium deciding alike, snapshots without a planned car deciding identically at any premium, the other tiers keeping their allocations, the cap event and plan prices on raw prices, the UTC quarter index across the fall-back night, the codec round trip, hash seeds, repeated runs and unchanged solver options); and the `main` showcase.
 
 ### `tests/test_ev_codec.py`
 
@@ -415,7 +429,11 @@ Covers `src/energy_optimization/ev/codec.py` (T2, T19): JSON round trips of snap
 prices, odd offsets, `None` measurements, every enum, parameter types kept), plain-type
 output, and rejection of missing, unknown, wrongly typed, huge, null-on-defaulted and
 invalid fields with the exact dotted path; the literal round-1 key sets of snapshot and
-decision dicts; the rejection of `memory`, the 15 round-2 settings and the round-2
+decision dicts (the settings set carrying `waiting_premium_per_hour`); the premium (T7)
+round-tripping through dicts and JSON text, present as 0.0 when unset, an omitted key
+decoding as 0.0, an int decoding as a float, null, strings, bools, lists, dicts, NaN, inf
+and out-of-range values refused with the path `settings.waiting_premium_per_hour`, a
+misspelt key still unknown, and the decision dict gaining no key; the rejection of `memory`, the 15 round-2 settings and the round-2
 decision keys, each naming that field; and the `main` showcase.
 
 ### `tests/test_common.py`
