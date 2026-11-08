@@ -99,7 +99,7 @@ None.
 
 Obvious design, so no fork: the weight reaches exactly one place. `Settings` gains
 `waiting_premium_per_hour` (float, default 0.0). `decide` passes it to `optimize` as a new
-trailing parameter with default 0.0. In `_stage_plan` only level P5's cost objective
+required trailing parameter (`optimize` has no defaults by design, and `decide` always passes it). In `_stage_plan` only level P5's cost objective
 (`_minimise_price`) reads weighted prices: the price of the cell in horizon quarter `t` is
 `p + (w · t / 4) · |p|` (`t` is the index in the horizon, whose index 0 is the quarter
 containing `now`; `w · t / 4` is the weight times the hours since that quarter began). P2 (unpriced), P3 (price cap), P4 (blocks), the
@@ -137,7 +137,7 @@ No new module: the change is one field, one parameter and one objective line.
 | Signature | Module | Purpose | Covers |
 |---|---|---|---|
 | `Settings(..., max_measurement_age: timedelta = timedelta(seconds=60), waiting_premium_per_hour: float = 0.0)` (new last field) | `ev/model.py` | Premium per hour of waiting, as a fraction of the price: a planned quarter `h` hours after the start of the current quarter costs `price + w·h·|price|`. Float; ints accepted; refuses bools, NaN, inf, a negative value and a value above 1.0, naming `waiting_premium_per_hour`. | A1, A2, A3, A6 |
-| `optimize(demands: Sequence[Demand], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], now_capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str, waiting_premium_per_hour: float = 0.0) -> Outcome` | `ev/optimize.py` | The planner's lowest-price level minimises the weighted cost; `ValueError` naming `waiting_premium_per_hour` if it is not a finite number ≥ 0 (checked after the empty-demands return, with the other `ValueError`s); no upper bound here, that is `Settings`' | A1–A5 |
+| `optimize(demands: Sequence[Demand], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], now_capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str, waiting_premium_per_hour: float) -> Outcome` | `ev/optimize.py` | The planner's lowest-price level minimises the weighted cost; `ValueError` naming `waiting_premium_per_hour` if it is not a finite number ≥ 0 (checked after the empty-demands return, with the other `ValueError`s); no upper bound here, that is `Settings`' | A1–A5 |
 | `decide(snapshot: Snapshot) -> Decision` (signature unchanged) | `ev/decide.py` | Passes the setting on | A2, A4 |
 | `snapshot_to_dict`, `snapshot_from_dict` (signatures unchanged) | `ev/codec.py` | `settings` dict gains the key `waiting_premium_per_hour`; the decoder accepts it omitted (0.0), refuses null, strings and out-of-range values with the path `settings.waiting_premium_per_hour` | A6 |
 
@@ -147,7 +147,7 @@ No new module: the change is one field, one parameter and one objective line.
    docstring as the owner's price of waiting (a delay is taken only if it saves more than
    its premium); validate with `_number`, then refuse a value `< 0` or `> 1.0`; store the
    float with `_set`.
-2. `optimize.py`: add the trailing parameter and its docstring (`Args`, `Raises`); validate it
+2. `optimize.py`: add the required trailing parameter and its docstring (`Args`, `Raises`); validate it
    after the empty-demands return; thread it through `_stage_plan` to `_minimise_price`.
 3. `_minimise_price`: when the premium is 0 build the price list exactly as today. Otherwise
    replace each cell's price by `p + (premium · t / 4) · abs(p)` with `t` the horizon index
@@ -157,21 +157,24 @@ No new module: the change is one field, one parameter and one objective line.
 5. `codec.py`: add the key to `_SETTINGS_FIELDS` (converter `_num`) and to `snapshot_to_dict`.
 6. `STRUCTURE.md`: the `Settings` row, the `optimize` row and Description, the codec
    paragraph, and the test descriptions for the four test files.
-7. Update the tests that pin the surface (dataclass fields, `optimize` parameters, the
-   settings key set in `snapshot_to_dict` output), then add the new tests.
+7. Update the tests that pin the surface (dataclass fields, the `optimize` parameter list in
+   `test_the_optimiser_and_capacity_signatures`, whose no-defaults assertion stays, the settings
+   key set in `snapshot_to_dict` output) and every direct `optimize` call (the `run` helper in
+   `tests/test_ev_optimize.py`, the direct calls, `main()`'s two calls), then add the new tests.
 
 ### Test intents
 
 | # | Must prove | Covers |
 |---|---|---|
-| T1 | At premium 0 and omitted, `optimize` and `decide` equal today's results: the existing suite is unchanged apart from surface-pinning tests, and a generated-snapshot differential against the module at `origin/main` (run in a subprocess or by a frozen copy of the old objective) gives identical decisions | A1 |
-| T2 | `optimize` with `min_block_quarters=1`, a one-quarter need and two priced quarters: at 0.01 per hour and a gap of 8 quarters, now wins at +1.5% and loses at +2.5%; with 96 quarters, now wins when the later price is 10% lower and loses when it is 30% lower; premium 0 picks the later quarter in all four; also through `decide` for a planned car | A2 |
+| T1 | At premium 0 and omitted, `optimize` and `decide` equal today's results: the existing suite is unchanged apart from surface-pinning tests, and a one-off differential at step 5 (not a suite test, which would compare the code with itself after merge): `origin/main` in a temporary worktree and this branch both run 2 × 30 000 generated snapshots through `decide` with the field omitted and at 0.0, counts pasted into section 5 for step 6 to cite; the permanent guard is the unchanged existing suite | A1 |
+| T2 | `optimize` with `min_block_quarters=1`, a one-quarter need and two priced quarters: at 0.01 per hour and a gap of 8 quarters, now wins at +1.5% and loses at +2.5%; with 96 quarters, now wins when the later price is 10% lower and loses when it is 30% lower; premium 0 picks the later quarter in all four; also through `decide` for a planned car (`min_block_quarters=1`, a price on every quarter of the horizon) | A2 |
 | T3 | Negative prices: equal negative prices give now; a later price 1% more negative loses at 0.01 per hour and wins at 0; prices of mixed sign and a zero price behave as `p + w·h·|p|` says (hand-checked) | A3 |
 | T4 | Snapshots without a planned car (smart off, charge now, spare, fixed, unavailable) give identical allocations and status for premiums 0, 0.01 and 1.0; two planned cars of different deadlines are weighted by the same horizon index, and quarter 0's choice between cars is unchanged by the premium | A4 |
 | T5 | With a price cap and a premium: `price_cap_exceeded`, the `PRICE_CAP_EXCEEDED` event and the P3 level use raw prices (a quarter above the cap is still avoided though the weight would push its neighbour above the cap), and every `PlannedQuarter.price` equals the raw price of its quarter | A5 |
 | T6 | `Settings` validation table: negative, NaN, ±inf, bools, strings, 1.0 accepted, 1.0000001 refused, 0 and an int accepted, each naming `waiting_premium_per_hour`; `optimize` raises `ValueError` for negative, NaN, inf and bool (not for 5.0) | A6 |
 | T7 | Codec: round trip with a premium, omitted key decodes to 0.0, null/string/huge/out-of-range refused with path `settings.waiting_premium_per_hour`, and the dict output carries the key | A6 |
 | T8 | Determinism: a snapshot with a premium decides identically on repeated runs and under several `PYTHONHASHSEED`s; the spied `milp` calls show one thread, the node budget, presolve as before; a premium on a price series that has no tick grid (the tolerance path) and one whose weighted values share a grid (the exact path) both solve | A6 |
+| T10 | The brute-force oracle (`level_tuple` in `tests/test_ev_optimize.py`) takes a premium in {0, 0.01, 1.0} on its P5 level, so the weighted level is proved in general, including two cars with different deadlines sharing the horizon index | A1–A3 |
 | T9 | DST: with the fall-back night in the horizon, the weight follows the UTC quarter index, so the repeated hour is weighted by elapsed quarters, not by wall-clock hour | A2, A6 |
 
 ### Risks
