@@ -1,6 +1,6 @@
 # Charge-early weight
 
-<!-- claude-plan step=4 status=active -->
+<!-- claude-plan step=5 status=active -->
 
 
 | Field | Value |
@@ -18,7 +18,7 @@
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user, unless the critique is clean | done |
 | 3 | Implement | `/implement` | in `/build` | done |
-| 4 | Verify | `/verify` | in `/build` | pending |
+| 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
 | 7 | Ship | `/ship` | in `/build` | pending |
@@ -229,12 +229,13 @@ Built as planned. Notes: `main()` of `optimize.py` gained a third case with a pr
 
 | Check | Result |
 |---|---|
-| `ruff check .` | |
-| `ruff format --check .` | |
-| `mypy` | |
-| Plan completeness | every signature in the Public API table exists as written |
-| `STRUCTURE.md` | in sync |
-| `python -m <package>.<module>` | |
+| `ruff check .` | All checks passed! |
+| `ruff format --check .` | 68 files already formatted |
+| `mypy` | Success: no issues found in 35 source files (after threading `0.0` through the 6 direct `optimize` calls in `tests/test_ev_optimize.py`: `_share`, `run`, the empty-demands call, the naive-now/unknown-zone call, and the two generated-snapshot calls; no assertion changed) |
+| `pytest` | 1840 passed, 3 failed: `test_snapshot_to_dict_has_exactly_round_1_keys`, `test_the_dataclass_fields_are_round_ones_and_the_demands[Settings-fields1]`, `test_the_optimiser_and_capacity_signatures[optimize-names0]`. All three pin the old surface (the new field/parameter is the extra item); left for step 5 per the brief |
+| Plan completeness | every signature in the Public API table exists as written: `Settings.waiting_premium_per_hour: float = 0.0` (last field), `optimize(..., timezone: str, waiting_premium_per_hour: float)` required, `decide` unchanged and passes it on, codec key in `_SETTINGS_FIELDS` and `snapshot_to_dict`. No missing, deviating or unplanned surface |
+| `STRUCTURE.md` | in sync; structure-auditor's three source drifts applied (Settings row, optimize row, cost-level sentence, `main` row); the four test-file descriptions are step 5's |
+| `python -m <package>.<module>` | the eight `ev` modules run with exit 0; `optimize`'s showcase prints the third case (premium 0.5), in the required form (named inputs, call, print). `RuntimeWarning` on re-exported modules is expected |
 
 ---
 

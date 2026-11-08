@@ -64,7 +64,7 @@ def caps(l1: float = 25.0, l2: float = 25.0, l3: float = 25.0) -> dict[Phase, fl
 
 
 def _share(claims: list[Demand], capacity: dict[Phase, float]) -> dict[str, float]:
-    outcome = optimize(claims, NOW, {}, capacity, capacity, 230.0, 2, None, "UTC")
+    outcome = optimize(claims, NOW, {}, capacity, capacity, 230.0, 2, None, "UTC", 0.0)
     return outcome.allocations
 
 
@@ -292,6 +292,7 @@ def run(
         block,
         cap,
         "Europe/Copenhagen",
+        0.0,
     )
 
 
@@ -928,7 +929,7 @@ def test_outcome_is_frozen_and_holds_its_three_fields() -> None:
 def test_optimize_of_no_demands_returns_before_any_check() -> None:
     naive = datetime(2026, 1, 1)  # noqa: DTZ001 - deliberately naive
 
-    outcome = optimize([], naive, {}, {}, {}, 230.0, 2, None, "Mars/Base")
+    outcome = optimize([], naive, {}, {}, {}, 230.0, 2, None, "Mars/Base", 0.0)
 
     assert outcome == Outcome({}, {}, True)
 
@@ -947,7 +948,7 @@ def test_optimize_rejects_a_naive_now_and_an_unknown_zone(
     demand = Demand("a", L1, Tier.CHARGE_NOW, 6, 16, 16)
 
     with pytest.raises(error):
-        optimize([demand], now, {}, CAP25, CAP25, 230.0, 2, None, timezone)
+        optimize([demand], now, {}, CAP25, CAP25, 230.0, 2, None, timezone, 0.0)
 
 
 @pytest.mark.parametrize(
@@ -1315,6 +1316,7 @@ def test_optimize_never_breaks_a_limit(rng: random.Random) -> None:
         rng.randint(1, 4),
         rng.choice([None, 0.4]),
         "Europe/Copenhagen",
+        0.0,
     )
     clipped_later = {p: max(0.0, capacity.get(p, 0.0)) for p in Phase}
     clipped_now = {p: max(0.0, now_capacity.get(p, 0.0)) for p in Phase}
@@ -1518,7 +1520,7 @@ def test_optimize_matches_a_brute_force_enumeration_level_by_level(
     first = {p: float(rng.choice(amps)) for p in Phase}
 
     outcome = optimize(
-        demands, NOW, prices, later, first, 230.0, block, cap, "Europe/Copenhagen"
+        demands, NOW, prices, later, first, 230.0, block, cap, "Europe/Copenhagen", 0.0
     )
 
     windows = [len(quarter_starts(NOW, d.deadline)) for d in demands]  # type: ignore[arg-type]  # PLANNED has a deadline
