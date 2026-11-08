@@ -309,6 +309,11 @@ class Settings:
         default_energy_need_kwh: Need used when a session gives none.
         max_price_age: How old the price series may be.
         max_measurement_age: How old phase measurements may be.
+        waiting_premium_per_hour: The owner's price of waiting, as a fraction of the
+            price per hour (0.01 is 1% per hour): a delay is taken only if it saves
+            more than its premium. A planned quarter `h` hours after the start of the
+            current quarter costs `price * (1 + w * h)` when the price is positive and
+            `price` otherwise. 0 to 1.
     """
 
     phase_budget: float
@@ -321,6 +326,7 @@ class Settings:
     default_energy_need_kwh: float = 30.0
     max_price_age: timedelta = timedelta(minutes=60)
     max_measurement_age: timedelta = timedelta(seconds=60)
+    waiting_premium_per_hour: float = 0.0
 
     def __post_init__(self) -> None:
         """Validate the settings."""
@@ -360,6 +366,12 @@ class Settings:
             age = getattr(self, name)
             if not isinstance(age, timedelta) or age <= timedelta(0):
                 raise _fail(name, f"must be a positive timedelta, got {age!r}")
+        premium = _number("waiting_premium_per_hour", self.waiting_premium_per_hour)
+        if not 0.0 <= premium <= 1.0:
+            raise _fail(
+                "waiting_premium_per_hour", f"must be between 0 and 1, got {premium}"
+            )
+        _set(self, "waiting_premium_per_hour", premium)
 
 
 @dataclass(frozen=True)

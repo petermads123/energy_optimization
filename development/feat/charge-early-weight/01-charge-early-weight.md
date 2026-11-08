@@ -1,6 +1,6 @@
 # Charge-early weight
 
-<!-- claude-plan step=3 status=active -->
+<!-- claude-plan step=4 status=active -->
 
 
 | Field | Value |
@@ -17,7 +17,7 @@
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
 | 2 | Plan | `/plan` | with the user, unless the critique is clean | done |
-| 3 | Implement | `/implement` | in `/build` | pending |
+| 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | pending |
 | 5 | Test | `/test` | in `/build` | pending |
 | 6 | Concept check | `/concept-check` | in `/build` | pending |
@@ -218,6 +218,8 @@ Accepted: by the user, 2026-11-08
 > Written in step 3. Only deviations from the plan above, each with its reason. "Built as
 > planned" is a complete and good entry. On a fix round, also the reproduction test's red
 > run, pasted here before the fix was written — step 6 cites it.
+
+Built as planned. Notes: `main()` of `optimize.py` gained a third case with a premium of 0.5; `STRUCTURE.md`'s test descriptions and the existing tests' `optimize` calls (6 call sites in `tests/test_ev_optimize.py`, mypy reports them) are left for step 5, as the plan's step 7 of the guide is test work.
 
 ---
 

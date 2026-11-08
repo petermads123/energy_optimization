@@ -32,7 +32,7 @@ from energy_optimization.common import SolverError as SolverError
 
 from .model import Phase
 from .planning import SessionPlan, energy_per_quarter_kwh
-from .quarters import floor_to_quarter, quarter_starts
+from .quarters import QUARTER, floor_to_quarter, quarter_starts
 from .result import PlannedQuarter
 
 NODE_LIMIT = 8000
@@ -564,12 +564,18 @@ def _minimise_price(
     horizon: Sequence[datetime],
     prices: Mapping[datetime, float],
     whole: bool,
+    premium: float,
 ) -> None:
     """Minimise and hold the cost of the plan (level P5, first part).
 
     The cost is minimised in whole ticks of the price grid when the prices have one and
     every current is whole, so the hold is exact: a plan that is dearer by one tick is
     never let through by the solver's tolerance. Otherwise it is held to a tolerance.
+
+    With a positive `premium` the cost is of the weighted prices: the price of horizon
+    quarter `t` is `p * (1 + premium * t / 4)` when `p > 0` and `p` otherwise, where `t`
+    counts quarters from the one containing now. With 0 the raw prices are used as they
+    are.
     """
     cells = [
         (n, t, i)
@@ -577,10 +583,21 @@ def _minimise_price(
         for t, i in enumerate(c.i)
         if horizon[t] in prices
     ]
-    ticks = _price_ticks([prices[horizon[t]] for _, t, _ in cells]) if whole else None
+    if premium > 0:
+        hours = QUARTER / timedelta(hours=1)
+        values = [
+            p * (1 + premium * t * hours) if (p := prices[horizon[t]]) > 0 else p
+            for _, t, _ in cells
+        ]
+    else:
+        values = [prices[horizon[t]] for _, t, _ in cells]
+    ticks = _price_ticks(values) if whole else None
     if ticks is None:
         problem.minimise(
-            {i: prices[horizon[t]] * columns[n].energy for n, t, i in cells}
+            {
+                i: value * columns[n].energy
+                for (n, _, i), value in zip(cells, values, strict=True)
+            }
         )
         return
     problem.minimise(
@@ -725,9 +742,12 @@ def _stage_plan(
     voltage: float,
     min_block_quarters: int,
     price_cap: float | None,
+    premium: float,
     run: _Run,
 ) -> dict[str, list[float]]:
     """Plan the `PLANNED` demands over their windows (levels P1 to P7).
+
+    Only P5's cost objective reads `premium`; every other level uses raw prices.
 
     Returns:
         The current of every demand in every quarter of its window.
@@ -809,7 +829,7 @@ def _stage_plan(
         d.min_current != d.max_current or float(d.min_current).is_integer()
         for d in demands
     )
-    _minimise_price(problem, demands, columns, horizon, prices, whole)
+    _minimise_price(problem, demands, columns, horizon, prices, whole, premium)
     # P5, second part, and P6. An unpriced first quarter keeps only what the need
     # forces (its total is minimised and held); the cars on now share it as a priced one.
     _on_now_and_even(
@@ -869,6 +889,7 @@ def optimize(
     min_block_quarters: int,
     price_cap: float | None,
     timezone: str,
+    waiting_premium_per_hour: float,
 ) -> Outcome:
     """Solve the lexicographic model.
 
@@ -892,6 +913,12 @@ def optimize(
             avoided.
         price_cap: Price above which quarters are avoided, None for off.
         timezone: IANA name; only sets the zone of `PlannedQuarter.start`.
+        waiting_premium_per_hour: A fraction of the price per hour (0.01 is 1% per
+            hour). The planner's lowest-price level compares plans with the price of
+            the planned quarter `k` quarters after the one containing `now` raised to
+            `price * (1 + w * k / 4)` when it is positive; zero and negative prices,
+            the other levels, the price cap and `PlannedQuarter.price` use the raw
+            prices. No upper bound here; `Settings` limits it to 1.
 
     Returns:
         The first-quarter current of every demand, a plan for every `PLANNED` demand
@@ -908,7 +935,8 @@ def optimize(
             rounding leaves a current outside its limits or a phase over its capacity
             (carrying status 0, the solver's "optimal", with a message naming the charger
             or phase).
-        ValueError: If `now` is naive or a charger id is repeated.
+        ValueError: If `now` is naive, a charger id is repeated, or
+            `waiting_premium_per_hour` is not a finite number of at least 0.
         ZoneInfoNotFoundError: If `timezone` is not a known zone.
     """
     if not demands:
@@ -916,6 +944,16 @@ def optimize(
     ids = [d.charger_id for d in demands]
     if len(set(ids)) != len(ids):
         raise ValueError(f"charger ids must be unique, got {ids}")
+    if (
+        isinstance(waiting_premium_per_hour, bool)
+        or not isinstance(waiting_premium_per_hour, int | float)
+        or not math.isfinite(waiting_premium_per_hour)
+        or waiting_premium_per_hour < 0
+    ):
+        raise _bad(
+            "waiting_premium_per_hour",
+            f"must be a finite number ≥ 0, got {waiting_premium_per_hour!r}",
+        )
     zone = ZoneInfo(timezone)
     start = floor_to_quarter(now)
     run = _Run()
@@ -955,6 +993,7 @@ def optimize(
             voltage,
             min_block_quarters,
             price_cap,
+            waiting_premium_per_hour,
             run,
         )
         for d in planned:
@@ -1065,6 +1104,7 @@ def main() -> None:
     min_block_quarters = 2
     price_cap = None  # None, or a price such as 0.25
     timezone = "Europe/Copenhagen"
+    waiting_premium_per_hour = 0.0  # a fraction of the price per hour, 0 to 1
 
     outcome = optimize(
         demands,
@@ -1076,6 +1116,7 @@ def main() -> None:
         min_block_quarters,
         price_cap,
         timezone,
+        waiting_premium_per_hour,
     )
 
     print(f"proven optimal: {outcome.proven}")
@@ -1102,10 +1143,33 @@ def main() -> None:
         min_block_quarters,
         price_cap,
         timezone,
+        waiting_premium_per_hour,
     )
 
     for charger_id, plan in outcome.plans.items():
         print(f"no room, {charger_id}: reachable {plan.reachable}")
+
+    # A premium for waiting: later quarters cost more, so the cars charge earlier.
+    capacity = {Phase.L1: 20.0, Phase.L2: 20.0, Phase.L3: 20.0}
+    now_capacity = {Phase.L1: 20.0, Phase.L2: 20.0, Phase.L3: 20.0}
+    waiting_premium_per_hour = 0.5  # a fraction of the price per hour, 0 to 1
+
+    outcome = optimize(
+        demands,
+        now,
+        prices,
+        capacity,
+        now_capacity,
+        voltage,
+        min_block_quarters,
+        price_cap,
+        timezone,
+        waiting_premium_per_hour,
+    )
+
+    for charger_id, plan in outcome.plans.items():
+        first = plan.quarters[0].start.strftime("%H:%M") if plan.quarters else "-"
+        print(f"premium {waiting_premium_per_hour}, {charger_id}: starts {first}")
 
 
 if __name__ == "__main__":
