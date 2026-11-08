@@ -1,6 +1,6 @@
 # Charge-early weight
 
-<!-- claude-plan step=2 status=active -->
+<!-- claude-plan step=3 status=active -->
 
 
 | Field | Value |
@@ -16,7 +16,7 @@
 | # | Step | Skill | Runs | Status |
 |---|---|---|---|---|
 | 1 | Conceptualize | `/conceptualize` | with the user | done |
-| 2 | Plan | `/plan` | with the user, unless the critique is clean | pending |
+| 2 | Plan | `/plan` | with the user, unless the critique is clean | done |
 | 3 | Implement | `/implement` | in `/build` | pending |
 | 4 | Verify | `/verify` | in `/build` | pending |
 | 5 | Test | `/test` | in `/build` | pending |
@@ -208,6 +208,8 @@ No new module: the change is one field, one parameter and one objective line.
 4. `optimize` default contradicts the no-defaults surface test. **Applied:** the parameter is required; the no-defaults assertion stays.
 5. A1 differential form open. **Applied:** a one-off differential at step 5, not a suite test.
 Extras applied: T2 uses `min_block_quarters=1` and prices on every quarter; T10 extends the brute-force oracle.
+
+Accepted: by the user, 2026-11-08
 
 ---
 
