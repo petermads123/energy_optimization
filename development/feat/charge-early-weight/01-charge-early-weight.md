@@ -1,6 +1,6 @@
 # Charge-early weight
 
-<!-- claude-plan step=6 status=active -->
+<!-- claude-plan step=7 status=active -->
 
 
 | Field | Value |
@@ -20,7 +20,7 @@
 | 3 | Implement | `/implement` | in `/build` | done |
 | 4 | Verify | `/verify` | in `/build` | done |
 | 5 | Test | `/test` | in `/build` | done |
-| 6 | Concept check | `/concept-check` | in `/build` | pending |
+| 6 | Concept check | `/concept-check` | in `/build` | done |
 | 7 | Ship | `/ship` | in `/build` | pending |
 | 8 | Recommend | `/recommend` | with the user | pending |
 | 9 | Pull request | `/create-pr` | with the user | pending |
@@ -288,9 +288,14 @@ Edge cases considered and deliberately skipped, with reasons:
 
 | # | Criterion | Met | Evidence |
 |---|---|---|---|
-| A1 | | | |
+| A1 | yes | Full suite on the branch: 1998 passed (`python -m pytest`), ruff and mypy clean. Section 5's differential: 60 000 of 60 000 decisions identical to `main` (30 000 field omitted, 30 000 at 0.0). Re-checked here: 150 seeds (0 to 149) through `decide` on a `main` worktree and on the branch with the key deleted, 150 of 150 identical. Code: at premium 0 `_minimise_price` builds the raw list exactly as before (`optimize.py` `if premium > 0 ... else`). |
+| A2 | yes | Direct probe through `optimize` (one-quarter need, `min_block_quarters=1`, price on every quarter, w = 0.01): 8 quarters, later +1.5% gives now, +2.5% gives later; 96 quarters, later 10% lower gives now, 30% lower gives later; at w = 0 all four give later. Tests: `test_optimize_a_premium_flips_now_against_later_at_the_a2_boundaries`, `test_decide_a_premium_moves_a_planned_car_between_now_and_later_by_the_a2_numbers`. |
+| A3 | yes | Only `p > 0` is weighted (`optimize.py` `_minimise_price`). Probe: later more negative wins at w = 0.01 as at 0 (and the less negative later quarter loses at both); zero now beats positive later at both. Tests: `test_optimize_non_positive_prices_are_not_weighted_and_decide_alike_at_every_premium`, `test_optimize_a_later_negative_price_is_not_pushed_down_by_the_weight`; step 5 mutation "negatives weighted" caught. |
+| A4 | yes | Weight reaches only `_minimise_price` via `_stage_plan`; `Demand` and the quarter-0 tier code untouched in the diff. Tests: `test_optimize_without_a_planned_demand_ignores_the_premium`, `test_optimize_with_planned_cars_only_they_and_the_spare_car_move_with_the_premium`, `test_optimize_planned_cars_still_share_the_first_quarter_evenly_at_a_premium`, `test_decide_a_snapshot_without_a_planned_car_decides_the_same_at_any_premium`. |
+| A5 | yes | Weighted values live only inside `_minimise_price`; P3 cap, `_session_plan` and `PlannedQuarter.price` read raw prices (diff shows no other consumer). Tests: `test_optimize_the_price_cap_is_judged_on_raw_prices_whatever_the_premium`, `test_decide_the_cap_event_and_planned_prices_use_raw_prices_at_a_premium`. |
+| A6 | yes | `Settings` refuses negative, NaN, inf, bool, above-1.0 naming the field (`test_settings_refuse_a_waiting_premium_outside_zero_to_one_naming_it`, 16 values); codec round trip and omitted key decoding as 0.0 (`test_the_waiting_premium_round_trips_through_dicts_and_json_text`, `test_an_omitted_waiting_premium_decodes_as_zero`); determinism across hash seeds and repeats and unchanged solver options (`test_decide_a_premium_decision_does_not_depend_on_the_hash_seed`, `test_decide_a_premium_calls_the_solver_with_the_same_options`). All in the 1998 passing. |
 
-Drift found, and what was done about it:
+Drift found, and what was done about it: none. Out of scope respected (interruptible, `common`, other tiers, `Demand`, tick detection and tolerance path untouched; no per-charger weight). Connections: `Settings` to `decide` to `optimize` to P5, plus codec. Surface: exactly one new field and one new required `optimize` parameter. Showcase: `python -m energy_optimization.ev.optimize` runs, prints the new premium 0.5 case in the named-inputs form. STRUCTURE.md: structure-auditor reported it matching; spot-checked Settings, optimize, codec and test descriptions.
 
 ### Earlier rounds still hold
 
