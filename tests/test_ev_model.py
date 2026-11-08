@@ -1,5 +1,6 @@
 """Tests for energy_optimization.ev.model (T1): every invalid input names its field."""
 
+import dataclasses
 import math
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, time, timedelta, timezone
@@ -696,6 +697,101 @@ def test_settings_defaults_match_the_concept() -> None:
     assert result.default_energy_need_kwh == 30.0
     assert result.max_price_age == timedelta(minutes=60)
     assert result.max_measurement_age == timedelta(seconds=60)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        -0.01,
+        -1,
+        -1e-12,
+        1.0000001,
+        2,
+        1e300,
+        10**400,
+        math.nan,
+        math.inf,
+        -math.inf,
+        True,
+        False,
+        "0.01",
+        None,
+        [0.01],
+        b"0",
+    ],
+    ids=[
+        "negative",
+        "minus-one",
+        "tiny-negative",
+        "just-above-one",
+        "two",
+        "huge",
+        "huge-int",
+        "nan",
+        "inf",
+        "-inf",
+        "true",
+        "false",
+        "string",
+        "none",
+        "list",
+        "bytes",
+    ],
+)
+def test_settings_refuse_a_waiting_premium_outside_zero_to_one_naming_it(
+    value: object,
+) -> None:
+    assert field_of(lambda: settings(waiting_premium_per_hour=value)) == (
+        "waiting_premium_per_hour"
+    )
+
+
+@pytest.mark.parametrize("value", [0, 0.0, -0.0, 1, 1.0, 0.5, 0.01, 1e-12])
+def test_settings_accept_a_waiting_premium_from_zero_to_one_stored_as_float(
+    value: float,
+) -> None:
+    result = settings(waiting_premium_per_hour=value)
+
+    assert result.waiting_premium_per_hour == value
+    assert isinstance(result.waiting_premium_per_hour, float)
+
+
+def test_settings_waiting_premium_defaults_to_zero_and_is_the_last_field() -> None:
+    result = settings()
+
+    assert result.waiting_premium_per_hour == 0.0
+    assert [f.name for f in dataclasses.fields(Settings)][-1] == (
+        "waiting_premium_per_hour"
+    )
+    assert settings(waiting_premium_per_hour=0.01) == settings(
+        waiting_premium_per_hour=0.01
+    )
+    assert settings(waiting_premium_per_hour=0.01) != settings()
+
+
+def test_settings_waiting_premium_is_frozen() -> None:
+    result = settings(waiting_premium_per_hour=0.01)
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.waiting_premium_per_hour = 0.5  # type: ignore[misc]  # frozen on purpose
+
+
+def test_settings_name_an_earlier_bad_field_before_a_bad_premium() -> None:
+    assert (
+        field_of(
+            lambda: settings(
+                max_measurement_age=timedelta(0), waiting_premium_per_hour=-1
+            )
+        )
+        == "max_measurement_age"
+    )
+
+
+def test_settings_waiting_premium_error_names_the_value() -> None:
+    with pytest.raises(ConfigError, match="1.5") as caught:
+        settings(waiting_premium_per_hour=1.5)
+
+    assert str(caught.value).startswith("waiting_premium_per_hour: ")
 
 
 def test_settings_unknown_timezone_error_is_a_config_error_not_a_lookup_error() -> None:

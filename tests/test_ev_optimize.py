@@ -281,6 +281,7 @@ def run(
     block: int = 1,
     cap: float | None = None,
     now: datetime = NOW,
+    premium: float = 0.0,
 ) -> Outcome:
     return optimize(
         demands,
@@ -292,7 +293,7 @@ def run(
         block,
         cap,
         "Europe/Copenhagen",
-        0.0,
+        premium,
     )
 
 
@@ -1380,6 +1381,11 @@ def _tau(t: int, n: int, count: int, total: int, is_priced: bool) -> int:
     return (t + 1) * (count - n) if is_priced else (total - t) * (n + 1)
 
 
+def _weighted(price: float, t: int, premium: float) -> float:
+    """The oracle's weighted price: positive prices only, written out from the concept."""
+    return price * (1 + premium * t / 4) if price > 0 else price
+
+
 def level_tuple(
     demands: list[Demand],
     grid: list[list[float]],
@@ -1387,8 +1393,13 @@ def level_tuple(
     block: int,
     cap: float | None,
     total: int,
+    premium: float = 0.0,
 ) -> tuple[float, ...]:
-    """The levels P1 to P7 of one assignment, written out from the plan's model."""
+    """The levels P1 to P7 of one assignment, written out from the plan's model.
+
+    P5's cost reads the weighted price `p * (1 + premium * t / 4)` for `p > 0` and `p`
+    otherwise, `t` being the quarter's index in the horizon.
+    """
     levels: list[float] = []
     energy = [energy_per_quarter_kwh(1.0, len(d.phases), 230.0) for d in demands]
     delivered = [e * sum(row) for e, row in zip(energy, grid, strict=True)]
@@ -1428,7 +1439,7 @@ def level_tuple(
         levels.append(float(short))
     levels.append(
         sum(
-            prices[q(t)] * e * i
+            _weighted(prices[q(t)], t, premium) * e * i
             for e, row in zip(energy, grid, strict=True)
             for t, i in enumerate(row)
             if q(t) in prices
@@ -1511,16 +1522,28 @@ def test_optimize_matches_a_brute_force_enumeration_level_by_level(
         )
         levels.append(sizes[kind])
     prices = {
-        q(t): rng.choice([0.1, 0.2, 0.5]) for t in range(horizon) if rng.random() > 0.3
+        q(t): rng.choice([0.1, 0.1002, 0.11, 0.2, 0.5, 0.0, -0.1])
+        for t in range(horizon)
+        if rng.random() > 0.3
     }
     block = rng.randint(1, 3)
     cap = rng.choice([None, 0.3])
     amps = [0, 6, 7, 10, 12, 13, 14, 16, 20]
     later = {p: float(rng.choice(amps)) for p in Phase}
     first = {p: float(rng.choice(amps)) for p in Phase}
+    premium = rng.choice([0.0, 0.01, 1.0])
 
     outcome = optimize(
-        demands, NOW, prices, later, first, 230.0, block, cap, "Europe/Copenhagen", 0.0
+        demands,
+        NOW,
+        prices,
+        later,
+        first,
+        230.0,
+        block,
+        cap,
+        "Europe/Copenhagen",
+        premium,
     )
 
     windows = [len(quarter_starts(NOW, d.deadline)) for d in demands]  # type: ignore[arg-type]  # PLANNED has a deadline
@@ -1531,7 +1554,9 @@ def test_optimize_matches_a_brute_force_enumeration_level_by_level(
     for grid in itertools.product(*options):
         if not _feasible(demands, grid, later, first, energy):
             continue
-        key = level_tuple(demands, [list(r) for r in grid], prices, block, cap, total)
+        key = level_tuple(
+            demands, [list(r) for r in grid], prices, block, cap, total, premium
+        )
         if best is None or _lex_less(key, best):
             best = key
     assert best is not None
@@ -1541,7 +1566,68 @@ def test_optimize_matches_a_brute_force_enumeration_level_by_level(
         [shape(outcome, d.charger_id).get(q(t), 0.0) for t in range(w)]
         for d, w in zip(demands, windows, strict=True)
     ]
-    got = level_tuple(demands, found, prices, block, cap, total)
+    got = level_tuple(demands, found, prices, block, cap, total, premium)
+    assert got == pytest.approx(best, abs=1e-6)
+
+
+@settings(deadline=None, max_examples=60, derandomize=True)
+@given(st.randoms(use_true_random=False))
+def test_optimize_weighted_plan_equals_the_enumeration_where_the_premium_flips_plans(
+    rng: random.Random,
+) -> None:
+    # The general oracle rarely meets a case where the premium moves a plan; here the
+    # needs are small, prices exist on every quarter and room is ample, so it often does.
+    count = rng.choice([1, 2])
+    horizon = rng.randint(3, 5)
+    demands = [
+        Demand(
+            f"d{n}",
+            rng.choice([L1, ALL]),
+            Tier.PLANNED,
+            6,
+            7,
+            7,
+            need_kwh=rng.choice([0.3, 0.7]),
+            deadline=q(horizon if n == 0 else rng.randint(2, horizon)),
+        )
+        for n in range(count)
+    ]
+    prices = {
+        q(t): rng.choice([0.1, 0.1002, 0.11, 0.15, 0.2, 0.0, -0.1])
+        for t in range(horizon)
+    }
+    block = rng.randint(1, 2)
+    premium = rng.choice([0.01, 1.0])
+    ample = {p: 30.0 for p in Phase}
+
+    outcome = optimize(
+        demands, NOW, prices, ample, ample, 230.0, block, None, "UTC", premium
+    )
+
+    windows = [len(quarter_starts(NOW, d.deadline)) for d in demands]  # type: ignore[arg-type]  # PLANNED has a deadline
+    energy = [energy_per_quarter_kwh(1.0, len(d.phases), 230.0) for d in demands]
+    best: tuple[float, ...] | None = None
+    options = [_assignments(LEVELS_ADJUSTABLE, w) for w in windows]
+    for grid in itertools.product(*options):
+        if not _feasible(demands, grid, ample, ample, energy):
+            continue
+        key = level_tuple(
+            demands,
+            [list(r) for r in grid],
+            prices,
+            block,
+            None,
+            max(windows),
+            premium,
+        )
+        if best is None or _lex_less(key, best):
+            best = key
+    assert best is not None
+    found = [
+        [shape(outcome, d.charger_id).get(q(t), 0.0) for t in range(w)]
+        for d, w in zip(demands, windows, strict=True)
+    ]
+    got = level_tuple(demands, found, prices, block, None, max(windows), premium)
     assert got == pytest.approx(best, abs=1e-6)
 
 
@@ -2750,3 +2836,462 @@ def test_optimize_limits_hold_to_the_solver_tolerance_and_the_documented_slack(
 
     assert tuple(outcome.allocations[n] for n in "abc") == expected
     assert sum(outcome.allocations.values()) <= room + 1e-6
+
+
+# --- the waiting premium (T2-T6, T8, T9, T10) ---------------------------------------
+
+PREMIUMS = [0.0, 0.01, 1.0]
+
+
+def flip_prices(
+    now_price: float, gap: int, later_price: float = 1.0
+) -> dict[datetime, float]:
+    """Prices on every quarter up to `gap`: now, dear in between, `later_price` at `gap`."""
+    values = [now_price] + [10.0] * (gap - 1) + [later_price]
+    return priced(*values)
+
+
+def charges_at(outcome: Outcome) -> list[int]:
+    """The horizon indexes (from NOW) of the quarters the car "a" charges in."""
+    return sorted(int((start - NOW) / QUARTER) for start in shape(outcome))
+
+
+def one_quarter_car(gap: int) -> Demand:
+    return planned(need=E16, quarters=gap + 1)
+
+
+@pytest.mark.parametrize(
+    ("gap", "excess", "premium", "expected"),
+    [
+        (8, 0.015, 0.01, [0]),
+        (8, 0.025, 0.01, [8]),
+        (96, 0.10, 0.01, [0]),
+        (96, 0.30, 0.01, [96]),
+        (8, 0.015, 0.0, [8]),
+        (8, 0.025, 0.0, [8]),
+        (96, 0.10, 0.0, [96]),
+        (96, 0.30, 0.0, [96]),
+        (8, 0.02, 0.01, [0]),  # break-even: 1.02 against 1 * 1.02, the earlier wins
+        (96, 0.24, 0.01, [0]),  # break-even again, at a day out
+    ],
+    ids=[
+        "8q-1.5pc-premium",
+        "8q-2.5pc-premium",
+        "96q-10pc-premium",
+        "96q-30pc-premium",
+        "8q-1.5pc-none",
+        "8q-2.5pc-none",
+        "96q-10pc-none",
+        "96q-30pc-none",
+        "8q-break-even",
+        "96q-break-even",
+    ],
+)
+def test_optimize_a_premium_flips_now_against_later_at_the_a2_boundaries(
+    gap: int, excess: float, premium: float, expected: list[int]
+) -> None:
+    outcome = run(
+        [one_quarter_car(gap)],
+        flip_prices(1.0 + excess, gap),
+        block=1,
+        premium=premium,
+    )
+
+    assert charges_at(outcome) == expected
+    assert outcome.allocations == {"a": 16.0 if expected == [0] else 0.0}
+
+
+def test_optimize_the_first_quarter_is_never_weighted() -> None:
+    # Were quarter 0 weighted by t + 1 the dear now would lose to the later quarter.
+    outcome = run(
+        [one_quarter_car(1)], priced(5.0, 4.9), premium=1.0, capacity=caps(16, 16, 16)
+    )
+
+    assert charges_at(outcome) == [0]
+    assert run([one_quarter_car(1)], priced(5.0, 4.9)).allocations == {"a": 0.0}
+
+
+def test_optimize_a_premium_counts_quarters_from_the_one_containing_now() -> None:
+    # now is seven minutes into quarter 0: the next quarter is one quarter out (factor
+    # 1.25 at a premium of 1), not 8 minutes out (which would be 1.13 and let it win).
+    now = NOW + timedelta(minutes=7)
+    prices = priced(1.0, 0.85)
+
+    weighted = run([one_quarter_car(1)], prices, now=now, premium=1.0)
+    raw = run([one_quarter_car(1)], prices, now=now)
+
+    assert charges_at(weighted) == [0]
+    assert charges_at(raw) == [1]
+
+
+def test_optimize_a_premium_weights_the_utc_index_across_the_fall_back_night() -> None:
+    # 00:00 UTC is 02:00 CEST; 02:00 UTC is 03:00 CET, one wall-clock hour (4 quarters)
+    # later but eight quarters on the UTC grid. The weight follows the UTC index.
+    now = datetime(2026, 10, 25, 0, 0, tzinfo=UTC)
+    prices = {
+        now + QUARTER * t: p for t, p in enumerate(flip_prices(1.015, 8).values())
+    }
+    demand = Demand(
+        "a", L1, Tier.PLANNED, 6, 16, 16, need_kwh=E16, deadline=now + QUARTER * 9
+    )
+
+    weighted = run([demand], prices, now=now, premium=0.01)
+    raw = run([demand], prices, now=now)
+
+    assert weighted.allocations == {"a": 16.0}
+    assert raw.allocations == {"a": 0.0}
+    assert [
+        int((s - now) / QUARTER) for s in shape(raw)
+    ] == [8]  # fmt: skip
+
+
+@pytest.mark.parametrize("gap", [4, 96])
+@pytest.mark.parametrize("premium", PREMIUMS)
+@pytest.mark.parametrize(
+    ("now_price", "later_price", "later_wins"),
+    [
+        (1.0, -0.5, True),
+        (-0.5, 1.0, False),
+        (0.01, 0.0, True),
+        (0.0, 0.0, False),
+        (-0.5, -0.5, False),
+    ],
+    ids=[
+        "negative-later-beats-positive-now",
+        "negative-now-beats-positive-later",
+        "zero-later-beats-positive-now",
+        "zero-tie-keeps-now",
+        "negative-tie-keeps-now",
+    ],
+)
+def test_optimize_non_positive_prices_are_not_weighted_and_decide_alike_at_every_premium(
+    gap: int, premium: float, now_price: float, later_price: float, later_wins: bool
+) -> None:
+    outcome = run(
+        [one_quarter_car(gap)],
+        flip_prices(now_price, gap, later_price),
+        premium=premium,
+    )
+
+    assert charges_at(outcome)[-1 if later_wins else 0] == (gap if later_wins else 0)
+
+
+@pytest.mark.parametrize("premium", [0.01, 1.0])
+def test_optimize_a_plan_over_non_positive_quarters_is_the_same_at_any_premium(
+    premium: float,
+) -> None:
+    prices = priced(0.0, -1.0, -3.0, 0.0, -2.0, 0.0)
+    demand = planned(need=2 * E16, quarters=6)
+
+    baseline = run([demand], prices)
+    weighted = run([demand], prices, premium=premium)
+
+    assert shape(weighted) == shape(baseline)
+    assert weighted.plans["a"] == baseline.plans["a"]
+    assert weighted.allocations == baseline.allocations
+
+
+@pytest.mark.parametrize("premium", [0.01, 1.0])
+def test_optimize_a_later_negative_price_is_not_pushed_down_by_the_weight(
+    premium: float,
+) -> None:
+    # The three most negative raw quarters are q0, q1 and q2 (the bound allows three
+    # quarters of 16 A). Weighting negatives would make the far -0.40 look like -1.2
+    # and take q0's place.
+    prices = priced(-0.5, -0.49, -0.48, 10.0, 10.0, 10.0, 10.0, 10.0, -0.40)
+    demand = planned(need=2 * E16, quarters=9)
+
+    weighted = run([demand], prices, premium=premium)
+    baseline = run([demand], prices)
+
+    assert shape(weighted) == shape(baseline)
+    assert 8 not in charges_at(weighted)
+
+
+def test_optimize_a_tiny_positive_premium_leaves_the_exact_path_with_the_same_plan() -> (
+    None
+):
+    prices = priced(0.30, 0.25, 0.20, 0.25, 0.30, 0.20)
+    demand = planned(need=2 * E16, quarters=6)
+
+    assert shape(run([demand], prices, premium=1e-12)) == shape(run([demand], prices))
+
+
+@pytest.mark.parametrize("premium", PREMIUMS)
+def test_optimize_without_a_planned_demand_ignores_the_premium(premium: float) -> None:
+    demands = [
+        Demand("s", L1, Tier.SMART_OFF, 6, 8, 8),
+        Demand("c", L1, Tier.CHARGE_NOW, 6, 8, 8),
+        Demand("x", L1, Tier.SPARE, 6, 30, 30),
+    ]
+    room = caps(40, 40, 40)
+
+    outcome = run(demands, priced(0.1, 1.0), room, room, premium=premium)
+    baseline = run(demands, priced(0.1, 1.0), room, room)
+
+    assert outcome == baseline
+    assert outcome.allocations == {"s": 8.0, "c": 8.0, "x": 24.0}
+
+
+@pytest.mark.parametrize("premium", PREMIUMS)
+def test_optimize_with_planned_cars_only_they_and_the_spare_car_move_with_the_premium(
+    premium: float,
+) -> None:
+    # Now costs 0.12 and the next quarter 0.10: weighted by 1.25 the next quarter is
+    # 0.125, so the planned car is on now at a premium of 1 and waits at 0.
+    demands = [
+        Demand("s", L1, Tier.SMART_OFF, 6, 8, 8),
+        Demand("c", L1, Tier.CHARGE_NOW, 6, 8, 8),
+        planned("a", need=E16, quarters=4),
+        Demand("x", L1, Tier.SPARE, 6, 30, 30),
+    ]
+    room = caps(40, 40, 40)
+
+    outcome = run(demands, priced(0.12, 0.10, 0.5, 0.5), room, room, premium=premium)
+
+    assert outcome.allocations["s"] == 8.0
+    assert outcome.allocations["c"] == 8.0
+    assert outcome.allocations["a"] == (16.0 if premium == 1.0 else 0.0)
+    assert outcome.allocations["x"] == 24.0 - outcome.allocations["a"]
+
+
+def test_optimize_planned_cars_still_share_the_first_quarter_evenly_at_a_premium() -> (
+    None
+):
+    demands = [planned("a", need=2 * E16, quarters=3), planned("b", need=2 * E16)]
+    prices = priced(0.2, 0.2, 0.2, 0.2)
+    room = caps(16, 16, 16)
+
+    outcome = run(demands, prices, room, room, premium=1.0)
+
+    assert outcome.allocations == {"a": 8.0, "b": 8.0}
+
+
+def test_optimize_two_cars_with_different_deadlines_weigh_the_same_horizon_index() -> (
+    None
+):
+    # q10 costs 0.99 raw but 0.99 * 1.025 = 1.01475 weighted: dearer than q0 at 1.0.
+    prices = priced(1.0, *([5.0] * 9), 0.99)
+    cars = [planned("a", need=E16, quarters=4), planned("b", need=E16, quarters=12)]
+    room = caps(32, 32, 32)
+
+    weighted = run(cars, prices, room, room, premium=0.01)
+    raw = run(cars, prices, room, room)
+
+    assert [int((s - NOW) / QUARTER) for s in shape(weighted, "b")] == [0]
+    assert [int((s - NOW) / QUARTER) for s in shape(raw, "b")] == [10]
+    assert [int((s - NOW) / QUARTER) for s in shape(weighted, "a")] == [0]
+
+
+def test_optimize_the_price_cap_is_judged_on_raw_prices_whatever_the_premium() -> None:
+    # Raw: q0 1.05 is above the cap, q1 0.99 is not. Weighted by 1.25, q1 would be
+    # 1.2375 and above it too, and the cheaper q0 would win: it must not.
+    prices = priced(1.05, 0.99)
+    demand = planned(need=E16, quarters=2)
+
+    weighted = run([demand], prices, cap=1.0, premium=1.0)
+
+    assert charges_at(weighted) == [1]
+    assert weighted.plans["a"].price_cap_exceeded is False
+    assert [q_.price for q_ in weighted.plans["a"].quarters] == [0.99]
+
+
+def test_optimize_a_quarter_above_the_cap_still_counts_as_above_it_when_forced() -> (
+    None
+):
+    prices = priced(1.05, 0.99)
+    demand = planned(need=2 * E16, quarters=2)
+
+    outcome = run([demand], prices, cap=1.0, premium=1.0)
+
+    assert outcome.plans["a"].price_cap_exceeded is True
+    assert [q_.price for q_ in outcome.plans["a"].quarters] == [1.05, 0.99]
+
+
+def test_optimize_a_weight_that_pushes_a_price_over_the_cap_does_not_exceed_it() -> (
+    None
+):
+    prices = priced(0.9, 0.95)
+    demand = planned(need=2 * E16, quarters=2)
+
+    outcome = run([demand], prices, cap=1.0, premium=1.0)  # 0.95 * 1.25 = 1.19
+
+    assert outcome.plans["a"].price_cap_exceeded is False
+    assert [q_.price for q_ in outcome.plans["a"].quarters] == [0.9, 0.95]
+
+
+@pytest.mark.parametrize(
+    "premium",
+    [
+        -0.01,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        True,
+        False,
+        "0.5",
+        None,
+        [0.5],
+    ],
+    ids=["negative", "nan", "inf", "-inf", "true", "false", "str", "none", "list"],
+)
+def test_optimize_rejects_a_bad_premium_naming_it(premium: object) -> None:
+    demand = Demand("a", L1, Tier.CHARGE_NOW, 6, 16, 16)
+
+    with pytest.raises(ValueError, match="waiting_premium_per_hour"):
+        optimize(
+            [demand],
+            NOW,
+            {},
+            CAP25,
+            CAP25,
+            230.0,
+            2,
+            None,
+            "UTC",
+            premium,  # type: ignore[arg-type]  # deliberately wrong
+        )
+
+
+@pytest.mark.parametrize("premium", [0, 0.0, -0.0, 1, 5.0, np.float64(0.5)])
+def test_optimize_accepts_any_finite_non_negative_premium_even_above_one(
+    premium: float,
+) -> None:
+    demand = Demand("a", L1, Tier.CHARGE_NOW, 6, 16, 16)
+
+    outcome = optimize([demand], NOW, {}, CAP25, CAP25, 230.0, 2, None, "UTC", premium)
+
+    assert outcome.allocations == {"a": 16.0}
+
+
+def test_optimize_checks_the_premium_after_the_empty_and_repeated_id_checks() -> None:
+    nan = float("nan")
+    twin = [Demand("a", L1, Tier.CHARGE_NOW, 6, 16, 16)] * 2
+
+    assert optimize([], NOW, {}, {}, {}, 230.0, 2, None, "UTC", nan) == Outcome(
+        {}, {}, True
+    )
+    with pytest.raises(ValueError, match="unique"):
+        optimize(twin, NOW, {}, CAP25, CAP25, 230.0, 2, None, "UTC", nan)
+
+
+def test_optimize_a_premium_of_minus_zero_is_the_raw_path() -> None:
+    prices = priced(0.1234567, 0.2, 0.15, 0.3)
+    demand = planned(need=E16, quarters=4)
+
+    assert run([demand], prices, premium=-0.0) == run([demand], prices)
+    assert run([demand], prices, premium=0) == run([demand], prices)
+
+
+def test_optimize_a_premium_decision_is_deterministic_and_does_not_mutate_inputs() -> (
+    None
+):
+    prices = priced(0.1234567, 0.2, 0.15, 0.3, 0.1, 0.12)
+    before = dict(prices)
+    demand = planned(need=2 * E16, quarters=6)
+
+    first = run([demand], prices, premium=0.37)
+    second = run([demand], prices, premium=0.37)
+
+    assert first == second
+    assert prices == before
+
+
+def test_optimize_a_premium_solves_on_the_exact_path_when_the_weighted_prices_share_a_grid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 1.0 weighted at 0.04 per hour is 1 + 0.01 k: whole hundredths.
+    seen: list[list[int] | None] = []
+    real = optimize_module._price_ticks
+
+    def spy(values: object) -> list[int] | None:
+        result = real(values)  # type: ignore[arg-type]  # the module's own argument
+        seen.append(result)
+        return result
+
+    monkeypatch.setattr(optimize_module, "_price_ticks", spy)
+
+    outcome = run(
+        [planned(need=E16, quarters=4)], priced(1.0, 1.0, 1.0, 1.0), premium=0.04
+    )
+
+    assert seen and seen[-1] is not None
+    assert charges_at(outcome) == [0]
+
+
+def test_optimize_a_premium_solves_on_the_tolerance_path_without_a_tick_grid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[list[int] | None] = []
+    real = optimize_module._price_ticks
+
+    def spy(values: object) -> list[int] | None:
+        result = real(values)  # type: ignore[arg-type]  # the module's own argument
+        seen.append(result)
+        return result
+
+    monkeypatch.setattr(optimize_module, "_price_ticks", spy)
+    prices = priced(0.1234567, 0.1234567, 0.1234567, 0.1234567)
+
+    outcome = run([planned(need=E16, quarters=4)], prices, premium=0.37)
+
+    assert seen and seen[-1] is None
+    assert charges_at(outcome) == [0]
+    assert outcome.proven is True
+
+
+def test_optimize_a_premium_leaves_the_solver_options_as_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = optimize_module.milp
+    seen: list[dict[str, object]] = []
+
+    def spy(*args: object, **kwargs: object) -> object:
+        options = kwargs["options"]
+        assert isinstance(options, dict)
+        seen.append(dict(options))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(optimize_module, "milp", spy)
+
+    run(
+        [planned(), Demand("c", L1, Tier.CHARGE_NOW, 6, 16, 16)],
+        priced(1, 2, 3, 4),
+        premium=0.37,
+    )
+
+    assert seen
+    for options in seen:
+        assert options == {
+            "node_limit": NODE_LIMIT,
+            "mip_rel_gap": 0.0,
+            "presolve": True,
+            "threads": 1,
+        }
+
+
+def test_optimize_a_premium_keeps_the_earlier_quarter_on_flat_prices() -> None:
+    outcome = run(
+        [planned(need=2 * E16, quarters=6)], priced(*([0.5] * 6)), premium=0.5
+    )
+
+    assert charges_at(outcome) == [0, 1]
+
+
+def test_optimize_a_premium_survives_a_48_hour_horizon_of_large_prices() -> None:
+    prices = {q(t): 400.0 + t for t in range(192)}
+    demand = Demand(
+        "a",
+        L1,
+        Tier.PLANNED,
+        6,
+        16,
+        16,
+        need_kwh=4 * E16,
+        deadline=NOW + timedelta(hours=48),
+    )
+
+    outcome = run([demand], prices, block=2, premium=1.0)
+
+    assert shape(outcome) == {q(t): 16.0 for t in range(4)}
+    assert outcome.proven is True
