@@ -4,7 +4,7 @@ Energy optimization for a household: pure-Python decision cores that take one co
 snapshot and return what to do now. Built to be called from a Home Assistant / AppDaemon
 app, which gathers the input and executes the actions.
 
-**Version:** 0.1.1
+**Version:** 0.1.2
 
 ## What is in the package
 
