@@ -1,15 +1,17 @@
 # Development notes
 
 Development-side open questions and things to fix later: what the code does not do yet, a
-question nobody can answer yet, an idea that fell short of a recommendation. Not a design
+question nobody can answer yet, an idea that fell short of a critical extra. Not a design
 document and not a changelog.
 
-**Adding an entry:** a heading, the date and the branch/round it came from, the item itself,
-and its next step or where it is configured. **Resolving an entry:** the change that
-resolves it deletes it — this file only ever shows what is still open. Step 8 of every round
-ends by cleaning it: entries the branch resolved are removed, duplicates are merged, and
-only open items are left. Before an entry is deleted or renamed, anything that points at it
-by heading is updated in the same change.
+**Adding an entry:** when `/finish` lists a non-critical extra the user wants kept, or a
+round defers something, add a heading with the date and the branch it came from, the item
+itself and its next step. **Resolving an entry:** the change that resolves it deletes it, so
+this file only ever shows what is still open. A feature's `/feature` concept stage reads it
+for items the feature could take with it.
+
+Entries below dated before November 2026 come from the previous pipeline; "step 5", "step 6"
+and the section numbers point into the numbered plan files under `development/`.
 
 ## Example AppDaemon app and HA usage guide
 
