@@ -126,7 +126,7 @@ ints.
 | `ChargerState(charger_id: str, car_connected: bool, current_setting: float, paused: bool, measured_power_w: float \| None = None, available: bool = True)` | A charger's state now. |
 | `Session(charger_id: str, ready_time: time, energy_need_kwh: float \| None = None, soc_percent: float \| None = None, target_soc_percent: float \| None = None, battery_capacity_kwh: float \| None = None, delivered_kwh: float = 0.0, charge_now: bool = False, smart_charging: bool = True, user_current_limit: int \| None = None, plugged_in_at: datetime \| None = None)` | The car on one charger; `ready_time` is naive local time. |
 | `PhaseCurrents(measured_at: datetime, l1: float \| None, l2: float \| None, l3: float \| None)`; `get(self, phase: Phase) -> float \| None` | Measured current per phase for the whole connection. |
-| `Settings(phase_budget: float, phase_threshold: float, fallback_current: int, timezone: str, voltage: float = 230.0, min_block_quarters: int = 2, price_cap: float \| None = None, default_energy_need_kwh: float = 30.0, max_price_age: timedelta = timedelta(minutes=60), max_measurement_age: timedelta = timedelta(seconds=60))` | Installation settings; budget, threshold, fallback and timezone are required. |
+| `Settings(phase_budget: float, phase_threshold: float, fallback_current: int, timezone: str, voltage: float = 230.0, min_block_quarters: int = 2, price_cap: float \| None = None, default_energy_need_kwh: float = 30.0, max_price_age: timedelta = timedelta(minutes=60), max_measurement_age: timedelta = timedelta(seconds=60), waiting_premium_per_hour: float = 0.0)` | Installation settings; budget, threshold, fallback and timezone are required. `waiting_premium_per_hour` is the owner's price of waiting as a fraction of the price per hour (0.01 is 1% per hour), 0 to 1 inclusive, applied to positive prices in the planned tier only. |
 | `Snapshot(now: datetime, settings: Settings, chargers: tuple[Charger, ...], states: tuple[ChargerState, ...], sessions: tuple[Session, ...], prices: PriceSeries, phase_currents: PhaseCurrents \| None = None)` | One call's input; cross-checks ids between chargers, states and sessions. |
 | `main() -> None` | Showcase: build a snapshot, then trigger a `ConfigError`. |
 
@@ -195,7 +195,7 @@ The optimiser: one mixed-integer program solved by HiGHS through `scipy.optimize
 level by level (lexicographically). It plans every quarter from now to each car's ready
 time and shares quarter 0 tier by tier on what the tiers above leave: smart charging off,
 charge now, planned cars, then spare capacity. Quarter-0-only tiers are solved on small
-models before and after the planning model. Within the planning model the cost level is held exactly in whole ticks of the price grid when every price is a whole multiple of a tick of at least 1e-7 and every current is whole, and to a tolerance otherwise. As many planned cars as possible are on now, the better-ranked first, and they share the first quarter by progressive filling in every tier (when no car can rise with the others, the leftover goes one amp at a time to the lowest, ties in ranking order: round 1's `share`). An unpriced first quarter carries only the energy the need forces. Deterministic: one thread, a fixed node budget
+models before and after the planning model. Within the planning model the cost level minimises the price weighted by `waiting_premium_per_hour` (positive prices only, by horizon index from the quarter containing `now`; at premium 0 the raw prices exactly), and is held exactly in whole ticks of the grid of those values when every value is a whole multiple of a tick of at least 1e-7 and every current is whole, and to a tolerance otherwise. As many planned cars as possible are on now, the better-ranked first, and they share the first quarter by progressive filling in every tier (when no car can rise with the others, the leftover goes one amp at a time to the lowest, ties in ranking order: round 1's `share`). An unpriced first quarter carries only the energy the need forces. Deterministic: one thread, a fixed node budget
 per solve (`NODE_LIMIT`), never a wall-clock limit; all time arithmetic in UTC. No greedy
 fallback: a solve that HiGHS reports infeasible (status 2, with or without a point) or that returns no point at all (any status) is retried once with presolve off, and the retry's result is the one judged: a second failure raises `SolverError`, while a result with a point and any other status (a node-budget stop is kept as not proven; a status 3 or 4 below the limit raises) is never retried.
 
@@ -206,8 +206,8 @@ fallback: a solve that HiGHS reports infeasible (status 2, with or without a poi
 | `class Tier(IntEnum)`: `SMART_OFF = 0`, `CHARGE_NOW = 1`, `PLANNED = 2`, `SPARE = 3` | Which precedence stage a demand belongs to. |
 | `Demand(charger_id: str, phases: frozenset[Phase], tier: Tier, min_current: float, max_current: float, now_max_current: float, need_kwh: float = 0.0, deadline: datetime \| None = None)` | One charger asking for current, given in ranking order. `min_current == max_current` is on/off at exactly that current in every tier; otherwise it runs in whole amps, so a fractional `min_current` is refused unless both maxima are below it (off in every quarter). A maximum below `min_current` means off in those quarters. Validates itself with `ValueError` naming the field (`tier` must be a `Tier`; `deadline` must be aware and is required for `PLANNED`). |
 | `Outcome(allocations: dict[str, float], plans: dict[str, SessionPlan], proven: bool)` | Quarter-0 current of every demand, a plan per `PLANNED` demand. `proven` is False when any solve (a level, or a probe that decides a level) stopped at the node budget with a point; for a retried solve the retry's result counts, so a first attempt without a point followed by a proven retry leaves it True. |
-| `optimize(demands: Sequence[Demand], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], now_capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str) -> Outcome` | Solve the lexicographic model; `SolverError` when a solve fails (infeasible or no point: only after its one retry with presolve off fails too, carrying the retry's status and message; a status 3 or 4 below the limit with a point: at once), `ValueError` for a naive `now` or a repeated charger id, `ZoneInfoNotFoundError` for an unknown `timezone`; empty `demands` returns before those checks; a limit broken by rounding raises `SolverError` with status 0. |
-| `main() -> None` | Showcase: a charge-now car, two planned cars and a spare-capacity car on one phase, then a phase with no room. |
+| `optimize(demands: Sequence[Demand], now: datetime, prices: Mapping[datetime, float], capacity: Mapping[Phase, float], now_capacity: Mapping[Phase, float], voltage: float, min_block_quarters: int, price_cap: float \| None, timezone: str, waiting_premium_per_hour: float = 0.0) -> Outcome` | Solve the lexicographic model. The planned tier's lowest-price level compares plans with each positive price `k` quarters after the one containing `now` raised to `price * (1 + w * k / 4)` (zero and negative prices, the other levels, the price cap and `PlannedQuarter.price` use raw prices); `SolverError` when a solve fails (infeasible or no point: only after its one retry with presolve off fails too, carrying the retry's status and message; a status 3 or 4 below the limit with a point: at once), `ValueError` for a naive `now`, a repeated charger id or a `waiting_premium_per_hour` that is a bool, not a number, not finite or below 0 (no upper bound here; `Settings` caps it at 1), `ZoneInfoNotFoundError` for an unknown `timezone`; empty `demands` returns before those checks; a limit broken by rounding raises `SolverError` with status 0. |
+| `main() -> None` | Showcase: a charge-now car, two planned cars and a spare-capacity car on one phase, then a phase with no room, then the first case again with a waiting premium of 0.5 per hour. |
 
 ### `src/energy_optimization/ev/decide.py`
 
@@ -230,7 +230,8 @@ Snapshot and decision to and from plain JSON-compatible dicts. Keys are field na
 go by value, datetimes are ISO 8601 with offset, `time` is `time.isoformat()`, `timedelta`
 is seconds, phase sets are sorted lists. Decoding rejects missing, unknown and wrongly
 typed fields with a `ConfigError` whose `field` is a dotted path such as
-`chargers[1].max_current`.
+`chargers[1].max_current`. `settings.waiting_premium_per_hour` is written always and may be omitted
+on decoding (0.0).
 
 | Signature | Description |
 |---|---|
@@ -316,8 +317,11 @@ asserting the `ConfigError.field` — a missing budget, threshold or fallback pa
 `None`, bools and non-finite or huge numbers, fields that do not belong to a kind,
 duplicate phases given as a list, an unloadable timezone, naive timestamps, overlapping or
 misaligned price intervals (judged in UTC, including across the fall-back fold), snapshot
-cross-links — plus the accepted boundaries, normalisation to tuples, ints and floats, and
-the `main` showcase.
+cross-links — plus the accepted boundaries, normalisation to tuples, ints and floats, the
+waiting premium (T6: negative, NaN, infinite, bool, string, `None`, list, bytes and
+above-1.0 values refused naming `waiting_premium_per_hour`, 0, -0.0, an int, 1.0 and 1e-12
+accepted and stored as a float, the default 0.0 as the last field, frozen, an earlier bad
+field named first), and the `main` showcase.
 
 ### `tests/test_ev_result.py`
 
@@ -369,7 +373,18 @@ follows the amended P5 and P6 and generates three-phase demands; a fractional `m
 on an adjustable `Demand` is refused and accepted when the demand is on/off or always off; the
 private tick helper's grid detection and its give-ups (grids finer than 1e-7, more than
 10^7 ticks, all-zero prices), and a first quarter dearer by one tick getting no extra amp
-while equal prices still split freely; and the `main` showcase.
+while equal prices still split freely; the waiting premium (T2-T6, T8-T10: the A2 flip boundaries at 8 and 96 quarters
+with break-even ties, quarter 0 never weighted, the index counted from the quarter
+containing `now` and in UTC across the fall-back night, non-positive prices unweighted at
+every premium, a tiny premium keeping the plan, no planned car meaning identical
+outcomes, smart-off and charge-now allocations unchanged with spare taking what the
+planned cars leave, the progressive fill unchanged, two deadlines sharing the horizon
+index, the price cap and `PlannedQuarter.price` on raw prices, the validation table and
+its order after the empty-demands and repeated-id checks, -0.0 on the raw path, the exact
+and tolerance cost paths both used, solver options unchanged, a 48-hour horizon, and the
+brute-force oracle `level_tuple` taking a premium in 0, 0.01 and 1.0 over prices
+including zero and negative, plus a second oracle test built so the premium often moves
+the plan); and the `main` showcase.
 
 ### `tests/test_ev_allocation.py`
 
@@ -394,7 +409,7 @@ nights (including an unplanned finish landing exactly on the spring-forward tran
 a planned expected finish ending in or at the repeated hour of the fall-back night and at
 the spring-forward transition, `reaches_target` across the fold, a trickle of current (including a reserved
 charger's tiny measured draw) giving `None` and surviving the codec round trip, no state
-between interleaved snapshots, the solver's failure statuses raising `SolverError` from `decide` (including a later level stopping without a point, the retry's status and message being the ones reported rather than the first attempt's, and a status 4 below the node limit raising whatever its message), node-budget stops (stubbed and real) adding `PLAN_NOT_PROVEN_OPTIMAL` last and round-tripping the codec, the solver call spied, decisions equal under permuted chargers, states and sessions, planned fractional on/off chargers, the fallback capping only the first planned quarter, a ready time inside the current quarter, tiny needs planned in the ready-time quarter (or now with a one-quarter block), two planned cars tied at a user limit leaving the rest to the other, two cars forced into an unpriced current quarter sharing it in plan, the hash-seed check through the planned fill, the first-ranked planned car charging first on equal prices and a plan below its max staying normal, a mid-quarter ready time credited the whole quarter (pinned, not endorsed), unpriced and empty price series, the price-cap event boundary, the tiers' waiting reason codes and stale prices sharing evenly (T4-T7), the two step-6 snapshots HiGHS called infeasible without presolve (explicit literals), a fractional on/off charger staying off under a lower user limit, a zero limit or the fallback cap, the tier invariant not counting a charger the fallback cap keeps off, and the public surface equal to round 1's plus `SolverError`, `PLAN_NOT_PROVEN_OPTIMAL` and `optimize`'s names (exports, removed modules and names, dataclass fields, signatures, enum members); and the `main` showcase.
+between interleaved snapshots, the solver's failure statuses raising `SolverError` from `decide` (including a later level stopping without a point, the retry's status and message being the ones reported rather than the first attempt's, and a status 4 below the node limit raising whatever its message), node-budget stops (stubbed and real) adding `PLAN_NOT_PROVEN_OPTIMAL` last and round-tripping the codec, the solver call spied, decisions equal under permuted chargers, states and sessions, planned fractional on/off chargers, the fallback capping only the first planned quarter, a ready time inside the current quarter, tiny needs planned in the ready-time quarter (or now with a one-quarter block), two planned cars tied at a user limit leaving the rest to the other, two cars forced into an unpriced current quarter sharing it in plan, the hash-seed check through the planned fill, the first-ranked planned car charging first on equal prices and a plan below its max staying normal, a mid-quarter ready time credited the whole quarter (pinned, not endorsed), unpriced and empty price series, the price-cap event boundary, the tiers' waiting reason codes and stale prices sharing evenly (T4-T7), the two step-6 snapshots HiGHS called infeasible without presolve (explicit literals), a fractional on/off charger staying off under a lower user limit, a zero limit or the fallback cap, the tier invariant not counting a charger the fallback cap keeps off, and the public surface equal to round 1's plus `SolverError`, `PLAN_NOT_PROVEN_OPTIMAL`, `optimize`'s names and `waiting_premium_per_hour` (exports, removed modules and names, dataclass fields, signatures, enum members); the waiting premium through `decide` (T2, T4, T5, T8, T9: passed on to `optimize` as its last argument, a planned car moving between now and later by the A2 numbers at 8 and 96 quarters, 0 and an omitted premium deciding alike, snapshots without a planned car deciding identically at any premium, the other tiers keeping their allocations, the cap event and plan prices on raw prices, the UTC quarter index across the fall-back night, the codec round trip, hash seeds, repeated runs and unchanged solver options); and the `main` showcase.
 
 ### `tests/test_ev_codec.py`
 
@@ -402,7 +417,11 @@ Covers `src/energy_optimization/ev/codec.py` (T2, T19): JSON round trips of snap
 prices, odd offsets, `None` measurements, every enum, parameter types kept), plain-type
 output, and rejection of missing, unknown, wrongly typed, huge, null-on-defaulted and
 invalid fields with the exact dotted path; the literal round-1 key sets of snapshot and
-decision dicts; the rejection of `memory`, the 15 round-2 settings and the round-2
+decision dicts (the settings set carrying `waiting_premium_per_hour`); the premium (T7)
+round-tripping through dicts and JSON text, present as 0.0 when unset, an omitted key
+decoding as 0.0, an int decoding as a float, null, strings, bools, lists, dicts, NaN, inf
+and out-of-range values refused with the path `settings.waiting_premium_per_hour`, a
+misspelt key still unknown, and the decision dict gaining no key; the rejection of `memory`, the 15 round-2 settings and the round-2
 decision keys, each naming that field; and the `main` showcase.
 
 ### `tests/test_common.py`

@@ -377,6 +377,7 @@ _SETTINGS_FIELDS: dict[str, _Converter[object]] = {
     "default_energy_need_kwh": _num,
     "max_price_age": _seconds,
     "max_measurement_age": _seconds,
+    "waiting_premium_per_hour": _num,
 }
 
 
@@ -435,6 +436,7 @@ def snapshot_to_dict(snapshot: Snapshot) -> dict[str, object]:
             "default_energy_need_kwh": settings.default_energy_need_kwh,
             "max_price_age": settings.max_price_age.total_seconds(),
             "max_measurement_age": settings.max_measurement_age.total_seconds(),
+            "waiting_premium_per_hour": settings.waiting_premium_per_hour,
         },
         "chargers": [
             {

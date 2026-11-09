@@ -1062,6 +1062,7 @@ def test_snapshot_to_dict_has_exactly_round_1_keys() -> None:
         "default_energy_need_kwh",
         "max_price_age",
         "max_measurement_age",
+        "waiting_premium_per_hour",
     }
     nested = json.loads(json.dumps(data))
     assert set(nested["chargers"][0]) == {
@@ -1131,6 +1132,105 @@ def test_a_real_decisions_keys_are_round_1_too() -> None:
     data = decision_to_dict(decide(base_snapshot()))
 
     assert set(data) == {"actions", "chargers", "available", "status", "events"}
+
+
+# --- the waiting premium (T7) -----------------------------------------------------
+
+PREMIUM_PATH: list[str | int] = ["settings", "waiting_premium_per_hour"]
+
+
+def with_premium(value: float) -> Snapshot:
+    base = base_snapshot()
+    return replace(
+        base, settings=replace(base.settings, waiting_premium_per_hour=value)
+    )
+
+
+@pytest.mark.parametrize("value", [0.0, 0.01, 0.1, 1.0, 1e-12])
+def test_the_waiting_premium_round_trips_through_dicts_and_json_text(
+    value: float,
+) -> None:
+    snapshot = with_premium(value)
+    data = snapshot_to_dict(snapshot)
+
+    assert data["settings"]["waiting_premium_per_hour"] == value  # type: ignore[index]  # nested plain dict
+    assert snapshot_from_dict(data) == snapshot
+    assert snapshot_from_dict(json.loads(json.dumps(data))) == snapshot
+
+
+def test_the_waiting_premium_is_in_the_dict_as_zero_when_unset() -> None:
+    data = snapshot_to_dict(base_snapshot())
+
+    assert data["settings"]["waiting_premium_per_hour"] == 0.0  # type: ignore[index]  # nested plain dict
+    assert isinstance(data["settings"]["waiting_premium_per_hour"], float)  # type: ignore[index]  # nested plain dict
+
+
+def test_an_omitted_waiting_premium_decodes_as_zero() -> None:
+    data = edit(encoded(), PREMIUM_PATH, DELETE)
+
+    assert "waiting_premium_per_hour" not in data["settings"]
+    assert snapshot_from_dict(data).settings.waiting_premium_per_hour == 0.0
+    assert snapshot_from_dict(data) == base_snapshot()
+
+
+def test_an_integer_waiting_premium_decodes_as_a_float() -> None:
+    result = snapshot_from_dict(edit(encoded(), PREMIUM_PATH, 1))
+
+    assert result.settings.waiting_premium_per_hour == 1.0
+    assert isinstance(result.settings.waiting_premium_per_hour, float)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "0.01",
+        True,
+        False,
+        [1],
+        {"a": 1},
+        1.5,
+        -0.1,
+        1.0000001,
+        10**400,
+        float("nan"),
+        float("inf"),
+    ],
+    ids=[
+        "null",
+        "string",
+        "true",
+        "false",
+        "list",
+        "dict",
+        "above-one",
+        "negative",
+        "just-above-one",
+        "huge-int",
+        "nan",
+        "inf",
+    ],
+)
+def test_a_bad_waiting_premium_is_refused_with_its_dotted_path(value: object) -> None:
+    data = edit(encoded(), PREMIUM_PATH, value)
+
+    assert error_of(lambda: snapshot_from_dict(data)).field == dotted(PREMIUM_PATH)
+
+
+def test_a_misspelt_waiting_premium_key_is_still_an_unknown_field() -> None:
+    data = encoded()
+    data["settings"]["waiting_premium"] = 0.01
+
+    assert (
+        error_of(lambda: snapshot_from_dict(data)).field == "settings.waiting_premium"
+    )
+
+
+def test_the_decision_dict_gains_no_key_from_the_waiting_premium() -> None:
+    plain = decision_to_dict(decide(base_snapshot()))
+    weighted = decision_to_dict(decide(with_premium(0.01)))
+
+    assert set(weighted) == set(plain)
 
 
 def test_main_showcase_runs_and_prints(capsys: pytest.CaptureFixture[str]) -> None:

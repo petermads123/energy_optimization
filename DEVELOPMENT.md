@@ -79,3 +79,9 @@ inputs.
 - A13's timing margin: one seed of the 192-quarter, Z = 96 case took 10.8 s on a slower container (failing the 10 s bound), 7.5 s of it level 2. Capping level 2's off count at level 1's brought it to about 5.8 s. Next step: measure on the Raspberry Pi before relying on a short call cadence.
 - `NO_SAVING`'s text ("no off period saves enough") also covers an off run in progress that the plan ends now with nothing later worth taking, which reads loosely. Next step: reword, or add a reason code, if a caller shows the text to users.
 - `MAX_OFF_RUN`'s text names the off run as seen within the look-back, so a longer hand-switched run reads as `history_needed` quarters. Next step: none unless the figure is shown to users.
+
+## `feat/charge-early-weight` round 1 notes
+
+2026-11-08, from round 1's step 5 record (`development/feat/charge-early-weight/01-charge-early-weight.md`, section 5).
+
+- With a waiting premium above 0 the planner's cost hold runs on the tolerance path unless the weighted prices happen to share a tick grid, so a call may be slower than at premium 0; the 3/7/10-charger timing seeds were run only at premium 0. Next step: time them at a premium on the target hardware (Raspberry Pi) together with the off-grid timing entry above.

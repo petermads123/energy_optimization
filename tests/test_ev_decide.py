@@ -2987,6 +2987,7 @@ def test_the_round_two_names_are_gone(module: str, name: str) -> None:
                 "default_energy_need_kwh",
                 "max_price_age",
                 "max_measurement_age",
+                "waiting_premium_per_hour",
             ),
         ),
         (Decision, ("actions", "chargers", "available", "status", "events")),
@@ -3026,6 +3027,7 @@ def test_the_dataclass_fields_are_round_ones_and_the_demands(
                 "min_block_quarters",
                 "price_cap",
                 "timezone",
+                "waiting_premium_per_hour",
             ],
         ),
         (phase_capacity, ["snapshot", "fresh"]),
@@ -3037,7 +3039,16 @@ def test_the_optimiser_and_capacity_signatures(
     parameters = inspect.signature(function).parameters  # type: ignore[arg-type]  # parametrized callables
 
     assert list(parameters) == names
-    assert all(p.default is inspect.Parameter.empty for p in parameters.values())
+    # No parameter has a default, except `optimize`'s waiting premium, which is optional
+    # so that callers written before it keep working.
+    defaults = {
+        name: p.default
+        for name, p in parameters.items()
+        if p.default is not inspect.Parameter.empty
+    }
+    assert defaults == (
+        {"waiting_premium_per_hour": 0.0} if function is optimize else {}
+    )
 
 
 @pytest.mark.parametrize("enum", [ReasonCode, EventKind, Status])
@@ -4110,3 +4121,260 @@ def test_the_tier_invariant_does_not_count_a_charger_the_fallback_cap_keeps_off(
 
     assert allocations(result) == {"x": 0.0, "y": 4.0}
     assert_invariants(snapshot, result)
+
+
+# --- the waiting premium through decide (T2, T4, T5, T8, T9) -------------------------
+
+
+def with_premium(snapshot: Snapshot, premium: float) -> Snapshot:
+    return replace(
+        snapshot, settings=replace(snapshot.settings, waiting_premium_per_hour=premium)
+    )
+
+
+def quarter_series(values: list[float], start: datetime = NOW) -> PriceSeries:
+    intervals = tuple(
+        PriceInterval(start + QUARTER * k, start + QUARTER * (k + 1), price)
+        for k, price in enumerate(values)
+    )
+    return PriceSeries(intervals, start)
+
+
+def flip_snapshot(gap: int, excess: float, ready: time, now: datetime) -> Snapshot:
+    """One planned car needing one quarter; now costs 1 + excess, `gap` quarters on 1.0."""
+    values = [10.0] * 4 * 25
+    values[0] = 1.0 + excess
+    values[gap] = 1.0
+    return snap(
+        [adj()],
+        sessions=[sess(ready=ready, need=E16)],
+        prices=quarter_series(values, now),
+        now=now,
+        min_block_quarters=1,
+    )
+
+
+def test_decide_passes_the_waiting_premium_on_to_optimize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `energy_optimization.ev.decide` is the function once the package re-exports it.
+    decide_module = sys.modules["energy_optimization.ev.decide"]
+    seen: list[tuple[object, ...]] = []
+    real = decide_module.optimize
+
+    def spy(*args: object) -> object:
+        seen.append(args)
+        return real(*args)  # type: ignore[arg-type]  # the module's own arguments
+
+    monkeypatch.setattr(decide_module, "optimize", spy)
+    base = snap([adj()], sessions=[sess()], prices=hourly([0.2, 0.1]))
+
+    decide(base)
+    decide(with_premium(base, 0.01))
+
+    assert [call[-1] for call in seen] == [0.0, 0.01]
+    assert all(len(call) == 10 for call in seen)
+
+
+@pytest.mark.parametrize(
+    ("gap", "excess", "premium", "now"),
+    [
+        (8, 0.015, 0.01, True),
+        (8, 0.025, 0.01, False),
+        (96, 0.10, 0.01, True),
+        (96, 0.30, 0.01, False),
+        (8, 0.015, 0.0, False),
+        (8, 0.025, 0.0, False),
+        (96, 0.10, 0.0, False),
+        (96, 0.30, 0.0, False),
+    ],
+    ids=[
+        "8q-1.5pc",
+        "8q-2.5pc",
+        "96q-10pc",
+        "96q-30pc",
+        "8q-1.5pc-none",
+        "8q-2.5pc-none",
+        "96q-10pc-none",
+        "96q-30pc-none",
+    ],
+)
+def test_decide_a_premium_moves_a_planned_car_between_now_and_later_by_the_a2_numbers(
+    gap: int, excess: float, premium: float, now: bool
+) -> None:
+    # 07:00 local is 36 quarters from 22:00. A ready time is under 24 h away, so quarter
+    # 96 needs the 25-hour day of the fall-back night: 22:00 CEST on the 24th to 22:00
+    # CET on the 25th is 100 quarters.
+    start, ready = (
+        (NOW, time(7, 0))
+        if gap == 8
+        else (datetime(2026, 10, 24, 20, 0, tzinfo=UTC), time(22, 0))
+    )
+    snapshot = with_premium(flip_snapshot(gap, excess, ready, start), premium)
+
+    item = by_id(decide(snapshot))["a"]
+
+    if now:
+        assert (item.allocation, item.reason.code) == (16.0, ReasonCode.IN_PLAN)
+    else:
+        assert (item.allocation, item.reason.code) == (
+            0.0,
+            ReasonCode.PLANNED_LATER,
+        )
+        assert [q.start.astimezone(UTC) for q in item.plan] == [start + QUARTER * gap]
+
+
+def test_decide_a_zero_premium_decides_exactly_as_one_left_out() -> None:
+    base = mixed_snapshot()
+
+    assert decide(with_premium(base, 0.0)) == decide(base)
+    assert (
+        snapshot_from_dict(
+            {
+                **snapshot_to_dict(base),
+                "settings": {
+                    k: v
+                    for k, v in snapshot_to_dict(base)["settings"].items()  # type: ignore[attr-defined]  # nested plain dict
+                    if k != "waiting_premium_per_hour"
+                },
+            }
+        )
+        == base
+    )
+
+
+@pytest.mark.parametrize("premium", [0.01, 0.5, 1.0])
+def test_decide_a_snapshot_without_a_planned_car_decides_the_same_at_any_premium(
+    premium: float,
+) -> None:
+    chargers = [adj("o"), adj("n"), fixed("f", L3, 8.0), pump("u", L2)]
+    states = [
+        idle("o", 6.0, False),
+        idle("n"),
+        idle("f", 8.0, False, power=1800.0),
+        idle("u", available=False),
+    ]
+    sessions = [sess("o", smart_charging=False), now_session("n"), sess("u")]
+    base = snap(chargers, states, sessions, hourly([0.3, 0.1, 0.2, 0.4] * 6))
+
+    assert decide(with_premium(base, premium)) == decide(base)
+
+
+@pytest.mark.parametrize("premium", [0.01, 1.0])
+def test_decide_with_planned_cars_the_other_tiers_keep_their_allocations(
+    premium: float,
+) -> None:
+    base = mixed_snapshot()
+
+    plain = by_id(decide(base))
+    weighted = by_id(decide(with_premium(base, premium)))
+
+    for charger_id in ("s", "f"):
+        assert weighted[charger_id].allocation == plain[charger_id].allocation
+        assert weighted[charger_id].reason == plain[charger_id].reason
+
+
+def test_decide_the_cap_event_and_planned_prices_use_raw_prices_at_a_premium() -> None:
+    # 0.95 raw is under the cap of 1.0 though 0.95 * 1.25 = 1.19 is not.
+    base = snap(
+        [adj()],
+        sessions=[sess(ready=time(22, 30), need=2 * E16)],
+        prices=quarter_series([0.9, 0.95]),
+        price_cap=1.0,
+        min_block_quarters=1,
+    )
+
+    result = decide(with_premium(base, 1.0))
+
+    assert EventKind.PRICE_CAP_EXCEEDED not in kinds(result)
+    assert [q.price for q in by_id(result)["a"].plan] == [0.9, 0.95]
+
+
+def test_decide_the_cap_event_still_fires_on_a_raw_price_above_it_at_a_premium() -> (
+    None
+):
+    base = snap(
+        [adj()],
+        sessions=[sess(ready=time(22, 30), need=2 * E16)],
+        prices=quarter_series([1.05, 0.9]),
+        price_cap=1.0,
+        min_block_quarters=1,
+    )
+
+    result = decide(with_premium(base, 1.0))
+
+    assert EventKind.PRICE_CAP_EXCEEDED in kinds(result)
+    assert [q.price for q in by_id(result)["a"].plan] == [1.05, 0.9]
+
+
+def test_decide_a_premium_weights_the_utc_quarter_across_the_fall_back_night() -> None:
+    # 02:00 UTC is 03:00 CET: an hour later on the wall clock but 8 quarters on the grid.
+    start = datetime(2026, 10, 25, 0, 0, tzinfo=UTC)
+    values = [10.0] * 12
+    values[0] = 1.015
+    values[8] = 1.0
+    base = snap(
+        [adj()],
+        sessions=[sess(ready=time(4, 0), need=E16)],
+        prices=quarter_series(values, start),
+        now=start,
+        min_block_quarters=1,
+    )
+
+    weighted = by_id(decide(with_premium(base, 0.01)))["a"]
+    raw = by_id(decide(base))["a"]
+
+    assert weighted.allocation == 16.0
+    assert raw.allocation == 0.0
+    assert [q.start.astimezone(UTC) for q in raw.plan] == [start + QUARTER * 8]
+
+
+def test_decide_a_premium_decision_survives_the_codec_round_trip() -> None:
+    snapshot = with_premium(mixed_snapshot(), 0.37)
+
+    assert decide(snapshot_from_dict(snapshot_to_dict(snapshot))) == decide(snapshot)
+    assert decision_from_dict(decision_to_dict(decide(snapshot))) == decide(snapshot)
+
+
+def test_decide_a_premium_decision_does_not_depend_on_the_hash_seed() -> None:
+    payload = json.dumps(snapshot_to_dict(with_premium(mixed_snapshot(), 0.37)))
+
+    outputs = {run_with_hash_seed(seed, payload) for seed in ("0", "1", "12345")}
+
+    assert len(outputs) == 1
+    assert json.loads(outputs.pop())["chargers"]
+
+
+def test_decide_a_premium_decision_is_the_same_on_repeated_runs() -> None:
+    snapshot = with_premium(mixed_snapshot(), 0.37)
+
+    assert decide(snapshot) == decide(snapshot)
+
+
+def test_decide_a_premium_calls_the_solver_with_the_same_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = optimize_module.milp
+    seen: list[dict[str, object]] = []
+
+    def spy(*args: object, **kwargs: object) -> object:
+        options = kwargs["options"]
+        assert isinstance(options, dict)
+        seen.append(dict(options))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(optimize_module, "milp", spy)
+
+    decide(with_premium(mixed_snapshot(), 0.37))
+
+    assert seen
+    assert all(
+        options
+        == {
+            "node_limit": optimize_module.NODE_LIMIT,
+            "mip_rel_gap": 0.0,
+            "presolve": True,
+            "threads": 1,
+        }
+        for options in seen
+    )

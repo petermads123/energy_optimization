@@ -585,6 +585,7 @@ def decide(snapshot: Snapshot) -> Decision:
         settings.min_block_quarters,
         settings.price_cap,
         settings.timezone,
+        settings.waiting_premium_per_hour,
     )
     for item in items:
         if item.charger.id in outcome.allocations:
