@@ -409,7 +409,8 @@ def selection(project_dir: Path, changed: Iterable[str]) -> Selection:
     for path, place in places.items():
         if place == "test":
             choose(path, "changed")
-        elif place == "config":
+    for path, place in places.items():
+        if place == "config":
             label = PurePosixPath(path).name
             for file in sorted(tests):
                 if any(path in s or label in s for s in strings_of.get(file, ())):

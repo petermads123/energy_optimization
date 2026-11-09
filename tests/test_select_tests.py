@@ -309,6 +309,12 @@ def test_config_file_selects_the_tests_that_name_it(repo: Path) -> None:
     assert select_tests(repo, [".gitignore"]) == []
 
 
+def test_a_changed_test_is_reported_as_changed_first(repo: Path) -> None:
+    write(repo, {"tests/test_unrelated.py": 'NAME = "settings.json"\n'})
+    chosen = selection(repo, [".claude/settings.json", "tests/test_unrelated.py"])
+    assert chosen.reason == "tests/test_unrelated.py (changed)"
+
+
 def test_nothing_changed_selects_nothing(repo: Path) -> None:
     assert selection(repo, []).summary() == "no tests apply: nothing changed"
 
