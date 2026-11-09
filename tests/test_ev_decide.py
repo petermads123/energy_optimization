@@ -3039,7 +3039,16 @@ def test_the_optimiser_and_capacity_signatures(
     parameters = inspect.signature(function).parameters  # type: ignore[arg-type]  # parametrized callables
 
     assert list(parameters) == names
-    assert all(p.default is inspect.Parameter.empty for p in parameters.values())
+    # No parameter has a default, except `optimize`'s waiting premium, which is optional
+    # so that callers written before it keep working.
+    defaults = {
+        name: p.default
+        for name, p in parameters.items()
+        if p.default is not inspect.Parameter.empty
+    }
+    assert defaults == (
+        {"waiting_premium_per_hour": 0.0} if function is optimize else {}
+    )
 
 
 @pytest.mark.parametrize("enum", [ReasonCode, EventKind, Status])

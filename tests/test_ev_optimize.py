@@ -297,6 +297,24 @@ def run(
     )
 
 
+def test_optimize_without_a_premium_equals_a_premium_of_zero() -> None:
+    demand = planned("p", need=2 * energy_per_quarter_kwh(10.0, 1, 230.0))
+    prices = priced(3, 1, 2, 1)
+    args = (
+        [demand],
+        NOW,
+        prices,
+        caps(16, 16, 16),
+        caps(16, 16, 16),
+        230.0,
+        1,
+        None,
+        "Europe/Copenhagen",
+    )
+
+    assert optimize(*args) == optimize(*args, 0.0)
+
+
 def shape(outcome: Outcome, charger_id: str = "a") -> dict[datetime, float]:
     """The plan of a charger as {UTC quarter start: current}."""
     return {

@@ -889,7 +889,7 @@ def optimize(
     min_block_quarters: int,
     price_cap: float | None,
     timezone: str,
-    waiting_premium_per_hour: float,
+    waiting_premium_per_hour: float = 0.0,
 ) -> Outcome:
     """Solve the lexicographic model.
 
@@ -914,7 +914,7 @@ def optimize(
         price_cap: Price above which quarters are avoided, None for off.
         timezone: IANA name; only sets the zone of `PlannedQuarter.start`.
         waiting_premium_per_hour: A fraction of the price per hour (0.01 is 1% per
-            hour). The planner's lowest-price level compares plans with the price of
+            hour); optional, 0.0 by default. The planner's lowest-price level compares plans with the price of
             the planned quarter `k` quarters after the one containing `now` raised to
             `price * (1 + w * k / 4)` when it is positive; zero and negative prices,
             the other levels, the price cap and `PlannedQuarter.price` use the raw
