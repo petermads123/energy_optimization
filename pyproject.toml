@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "energy_optimization"
-version = "0.1.0"
+version = "0.1.1"
 description = "Household energy optimization: pure decision cores for smart EV charging and interruptible loads"
 authors = [
   { name = "Peter Mads Pedersen", email = "petermads123@hotmail.com" }
@@ -52,6 +52,8 @@ ignore = ["E501", "N806", "N803"]
 "__init__.py" = ["F401"]
 # D100/D103: tests do not need module or function docstrings.
 "tests/**" = ["D100", "D103"]
+# A fix's reproduction lives in its diagnosis folder until the fix round moves it into tests/.
+"development/**/test_*.py" = ["D100", "D103"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
