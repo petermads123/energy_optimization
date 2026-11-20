@@ -3,6 +3,21 @@
 One entry per version, newest first: what changed, then the files it touched. `/finish`
 writes each entry in the commit that opens the pull request.
 
+## 0.2.1 — 2026-11-20
+
+Test runs now report their progress live, as in template 0.2.4. A small pytest plugin,
+`pytest_progress.py`, loaded for every run by `-p pytest_progress` in `pyproject.toml`'s `addopts`, keeps
+`.pytest_cache/progress.json` current while tests run: how many were collected, how many are
+done, passed, failed and skipped, the test running now, and whether the run has finished. The
+`feature-band` mod (0.3.0) reads it and draws a bar above the round and step bars, so step 7
+of a round and the final check show where they are. Nothing in the agents or workflows
+changes: any pytest run in the repo writes the file, it is ignored by git, and a file that
+cannot be written never fails a run.
+
+Files:
+- `.claude/hooks/pytest_progress.py`, `tests/test_pytest_progress.py`
+- `CLAUDE.md`, `STRUCTURE.md`, `README.md`, `DEVLOG.md`, `pyproject.toml`
+
 ## 0.2.0 — 2026-11-09
 
 The EV planner can now prefer charging early. A new setting, `Settings.waiting_premium_per_hour` (0 to 1, default 0), adds a premium per hour of waiting to positive prices of planned quarters, so a slightly dearer early quarter can beat a cheaper late one; zero and negative prices are unweighted and only the planner's lowest-price level is affected. `optimize` takes it as an optional last argument, `decide` passes the setting on, and the codec writes the key and accepts it omitted. With 0 every decision is identical to before.
