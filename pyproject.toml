@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "energy_optimization"
-version = "0.2.0"
+version = "0.2.1"
 description = "Household energy optimization: pure decision cores for smart EV charging and interruptible loads"
 authors = [
   { name = "Peter Mads Pedersen", email = "petermads123@hotmail.com" }
@@ -61,7 +61,9 @@ convention = "google"
 # --- Pytest Configuration ---
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v"
+# -p pytest_progress: the plugin in .claude/hooks/ that writes a run's live progress to
+# .pytest_cache/progress.json, which the feature-band mod draws as a bar.
+addopts = "-v -p pytest_progress"
 # Import the package from src/, so `pytest` works on a fresh clone before
 # `pip install -e ".[dev]"` has been run. The hooks are added for the same
 # reason they can import each other at runtime: Python puts a script's own
